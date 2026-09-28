@@ -342,38 +342,8 @@ class Win32Timer : public Win32Handle<Timer> {
   std::function<void()> callback_;
 };
 
-namespace {
-HANDLE CreateBestWaitableTimer(bool manual_reset) {
-  constexpr DWORD kCreateWaitableTimerManualReset = 0x00000001;
-  constexpr DWORD kCreateWaitableTimerHighResolution = 0x00000002;
-
-  using CreateWaitableTimerExWFn =
-      HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-
-  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-  auto create_ex =
-      kernel32
-          ? reinterpret_cast<CreateWaitableTimerExWFn>(
-                GetProcAddress(kernel32, "CreateWaitableTimerExW"))
-          : nullptr;
-
-  if (create_ex) {
-    DWORD flags =
-        (manual_reset ? kCreateWaitableTimerManualReset : 0) |
-        kCreateWaitableTimerHighResolution;
-
-    if (HANDLE handle = create_ex(nullptr, nullptr, flags, TIMER_ALL_ACCESS)) {
-      return handle;
-    }
-  }
-
-  // Fallback for older Windows builds or systems that reject high-res timers.
-  return CreateWaitableTimerW(nullptr, manual_reset ? TRUE : FALSE, nullptr);
-}
-}  // namespace
-
 std::unique_ptr<Timer> Timer::CreateManualResetTimer() {
-  HANDLE handle = CreateBestWaitableTimer(true);
+  HANDLE handle = CreateWaitableTimer(NULL, TRUE, NULL);
   if (handle) {
     return std::make_unique<Win32Timer>(handle);
   } else {
@@ -383,7 +353,7 @@ std::unique_ptr<Timer> Timer::CreateManualResetTimer() {
 }
 
 std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
-  HANDLE handle = CreateBestWaitableTimer(false);
+  HANDLE handle = CreateWaitableTimer(NULL, FALSE, NULL);
   if (handle) {
     return std::make_unique<Win32Timer>(handle);
   } else {
@@ -514,4 +484,3 @@ void Thread::Exit(int exit_code) {
 }
 
 }  // namespace rex::thread
-
