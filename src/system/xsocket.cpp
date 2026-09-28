@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <cstring>
 
 #include <rex/kernel/xam/module.h>
@@ -115,7 +116,19 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
-  int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  // REX_XNET_BIND_IP pins INADDR_ANY binds to one local address, so two
+  // instances on one PC (e.g. 127.0.0.1 and 127.0.0.2) can share a port.
+  N_XSOCKADDR_IN bind_name = *name;
+  if (uint32_t(bind_name.sin_addr) == 0) {
+    if (const char* bind_ip = std::getenv("REX_XNET_BIND_IP"); bind_ip && *bind_ip) {
+      const uint32_t addr = inet_addr(bind_ip);
+      if (addr != INADDR_NONE) {
+        bind_name.sin_addr = ntohl(addr);
+        REXSYS_INFO("XSocket::Bind: pinning port {} to {}", uint16_t(bind_name.sin_port), bind_ip);
+      }
+    }
+  }
+  int ret = bind(native_handle_, (sockaddr*)&bind_name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
