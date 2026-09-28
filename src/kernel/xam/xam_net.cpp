@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstdlib>
+#include <chrono>
+#include <atomic>
 #include <cstring>
 #include <thread>
 
@@ -1165,6 +1167,38 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
   return ret;
 }
 
+namespace {
+// Once-per-second UDP traffic summary, used to diagnose online input delay.
+struct BurstNetStats {
+  std::atomic<uint32_t> recv_calls{0}, recv_ok{0}, recv_empty{0}, recv_bytes{0};
+  std::atomic<uint32_t> send_calls{0}, send_bytes{0};
+  std::atomic<int64_t> window_start_ms{0};
+};
+BurstNetStats g_burst_net_stats;
+
+void BurstNetStatsTick() {
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  int64_t start = g_burst_net_stats.window_start_ms.load();
+  if (start == 0) {
+    g_burst_net_stats.window_start_ms.compare_exchange_strong(start, now_ms);
+    return;
+  }
+  if (now_ms - start < 1000 ||
+      !g_burst_net_stats.window_start_ms.compare_exchange_strong(start, now_ms)) {
+    return;
+  }
+  REXKRNL_WARN(
+      "[BurstNetStats] {}ms: recvfrom calls={} ok={} empty={} bytes={} | sendto calls={} "
+      "bytes={}",
+      now_ms - start, g_burst_net_stats.recv_calls.exchange(0),
+      g_burst_net_stats.recv_ok.exchange(0), g_burst_net_stats.recv_empty.exchange(0),
+      g_burst_net_stats.recv_bytes.exchange(0), g_burst_net_stats.send_calls.exchange(0),
+      g_burst_net_stats.send_bytes.exchange(0));
+}
+}  // namespace
+
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
                           u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -1182,16 +1216,14 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
 
-  static uint32_t burst_udp_recvfrom_call_log_count = 0;
-  const uint32_t call_index = burst_udp_recvfrom_call_log_count++;
-
-  if (call_index < 160 || ret >= 0) {
-    const int wsa_error = ret == -1 ? WSAGetLastError() : 0;
-
-    REXKRNL_WARN(
-        "[BurstUDP] recvfrom-call socket={:08X} bytes={} flags={:08X} ret={} err={}",
-        socket_handle, buf_len, flags, ret, wsa_error);
+  g_burst_net_stats.recv_calls++;
+  if (ret > 0) {
+    g_burst_net_stats.recv_ok++;
+    g_burst_net_stats.recv_bytes += static_cast<uint32_t>(ret);
+  } else {
+    g_burst_net_stats.recv_empty++;
   }
+  BurstNetStatsTick();
 
   static uint32_t burst_udp_recv_log_count = 0;
   if (ret > 0 && burst_udp_recv_log_count++ < 120) {
@@ -1250,6 +1282,12 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
 
   N_XSOCKADDR_IN native_to(to_ptr);
   const int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+
+  g_burst_net_stats.send_calls++;
+  if (ret > 0) {
+    g_burst_net_stats.send_bytes += static_cast<uint32_t>(ret);
+  }
+  BurstNetStatsTick();
 
   static uint32_t burst_udp_send_log_count = 0;
   const bool burst_input_packet = buf_len >= 250 && buf_len <= 400;
