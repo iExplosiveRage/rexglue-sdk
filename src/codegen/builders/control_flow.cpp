@@ -168,7 +168,11 @@ bool build_bctr(BuilderContext& ctx) {
     }
 
     ctx.println("\tdefault:");
-    ctx.println("\t\t__builtin_trap(); // Switch case out of range");
+    // Not every bctr is a jump table: some are indirect tail calls through a
+    // function-pointer table (e.g. Burst Limit sub_82139868). Dispatch those
+    // instead of trapping.
+    ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
+    ctx.println("\t\treturn;");
     ctx.println("\t}}");
 
     ctx.reset_switch_table();
