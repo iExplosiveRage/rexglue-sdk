@@ -66,14 +66,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
-  uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-    }
+  if (user_index == 0) {
+    REXKRNL_DEBUG("[BurstLive2] user 0 -> Xbox LIVE sign-in state 2");
+    return 2;
   }
-  return signin_state;
+  return 0;
 }
 
 typedef struct {
@@ -371,19 +368,10 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
 }
 
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {
-  // checking all users?
-  if (user_index != 0xFF) {
-    if (user_index >= 4) {
-      return X_ERROR_INVALID_PARAMETER;
-    }
-
-    if (user_index) {
-      return X_ERROR_NO_SUCH_USER;
-    }
+  if (out_value) {
+    *out_value = 1;
   }
-
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  REXKRNL_DEBUG("[BurstLive2] privilege granted: user={} mask={:08X}", user_index, mask);
   return X_ERROR_SUCCESS;
 }
 

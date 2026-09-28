@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -95,11 +99,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0010: {
       assert_true(!buffer_length || buffer_length == 28);
-      // Sequence:
-      // - XamSessionCreateHandle
-      // - XamSessionRefObjByHandle
-      // - [this]
-      // - CloseHandle
+
       uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 8);
@@ -109,10 +109,91 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
 
       REXKRNL_DEBUG(
-          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
-          "{:08X})",
+          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, {:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+
+      // Bit 0 means this side is hosting. When joining, the game has already
+      // copied the host XSESSION_INFO from XSessionSearchEx, so preserve it.
+      if ((flags & 0x01u) == 0) {
+        REXKRNL_WARN(
+            "[BurstSession] join-side: preserving search XSESSION_INFO "
+            "(flags={:08X}, info={:08X})",
+            flags, session_info_ptr);
+        return X_E_SUCCESS;
+      }
+
+      auto session_info = memory_->TranslateVirtual(session_info_ptr);
+      auto nonce_out = memory_->TranslateVirtual(nonce_ptr);
+
+      if (!session_info || !nonce_out) {
+        REXKRNL_WARN("[BurstSession] invalid output pointer(s): info={:08X} nonce={:08X}",
+                     session_info_ptr, nonce_ptr);
+        return X_E_FAIL;
+      }
+
+      uint8_t ip[4] = {127, 0, 0, 1};
+      const char* configured_ip = std::getenv("REX_XNET_IP");
+
+      unsigned p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+      if (configured_ip &&
+          std::sscanf(configured_ip, "%u.%u.%u.%u", &p0, &p1, &p2, &p3) == 4 &&
+          p0 <= 255 && p1 <= 255 && p2 <= 255 && p3 <= 255) {
+        ip[0] = static_cast<uint8_t>(p0);
+        ip[1] = static_cast<uint8_t>(p1);
+        ip[2] = static_cast<uint8_t>(p2);
+        ip[3] = static_cast<uint8_t>(p3);
+      } else {
+        REXKRNL_WARN("[BurstSession] REX_XNET_IP missing or invalid; using loopback.");
+      }
+
+      // XSESSION_INFO:
+      // +0x00 XNKID session ID        (preserved for now)
+      // +0x08 XNADDR host address     (0x24 bytes)
+      // +0x2C XNKEY exchange key      (preserved for now)
+      // XNKID: 8 raw big-endian bytes. 0xAE marks an Xbox LIVE peer session.
+      // It is deterministic from the host Radmin IP so the client can rebuild it later.
+      session_info[0x00] = 0xAE;
+      session_info[0x01] = ip[0];
+      session_info[0x02] = ip[1];
+      session_info[0x03] = ip[2];
+      session_info[0x04] = ip[3];
+      session_info[0x05] = 0x52;  // R
+      session_info[0x06] = 0x58;  // X
+      session_info[0x07] = 0x01;
+
+      // XNKEY identity exchange key: bytes 00..0F, same basic shape Xenia uses.
+      for (uint32_t i = 0; i < 16; ++i) {
+        session_info[0x2C + i] = static_cast<uint8_t>(i);
+      }
+
+      REXKRNL_WARN(
+          "[BurstSession] sessionID=AE{:02X}{:02X}{:02X}{:02X}525801 (online identity key)",
+          static_cast<uint32_t>(ip[0]), static_cast<uint32_t>(ip[1]),
+          static_cast<uint32_t>(ip[2]), static_cast<uint32_t>(ip[3]));
+
+      std::memset(session_info + 0x08, 0, 0x24);
+
+      // XNADDR.ina and XNADDR.inaOnline are already network-order bytes.
+      std::memcpy(session_info + 0x08, ip, 4);
+      std::memcpy(session_info + 0x0C, ip, 4);
+      memory::store_and_swap<uint16_t>(session_info + 0x10, 3074);
+
+      session_info[0x12] = 0x02;
+      session_info[0x13] = 0x52;
+      session_info[0x14] = ip[1];
+      session_info[0x15] = ip[2];
+      session_info[0x16] = ip[3];
+      session_info[0x17] = 0x01;
+
+      static uint64_t next_nonce = 0x42555253544C0001ull;
+      const uint64_t nonce = next_nonce++;
+      memory::store_and_swap<uint64_t>(nonce_out, nonce);
+
+      REXKRNL_WARN(
+          "[BurstSession] host XNADDR={}.{}.{}.{}:{} nonce={:016X}",
+          ip[0], ip[1], ip[2], ip[3], 3074, nonce);
+
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -197,7 +278,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     case 0x000B001C: {
       assert_true(!buffer_length || buffer_length == 36);
 
-      // session_search
       uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
@@ -207,12 +287,87 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
       uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
-      //
       uint32_t num_users = memory::load_and_swap<uint32_t>(buffer + 32);
 
       REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr, num_users);
+
+      constexpr uint32_t kHeaderSize = 0x08;
+      constexpr uint32_t kResultSize = 0x5C;
+      constexpr uint32_t kMinimumSize = kHeaderSize + kResultSize;
+
+      auto results = memory_->TranslateVirtual(search_results_ptr);
+      const char* host_ip = std::getenv("REX_XNET_SEARCH_IP");
+
+      if (!results || results_buffer_size < kMinimumSize) {
+        REXKRNL_WARN("[BurstSearch] invalid result buffer: ptr={:08X} size={}",
+                     search_results_ptr, results_buffer_size);
+        return X_E_FAIL;
+      }
+
+      std::memset(results, 0, results_buffer_size);
+
+      // Only inject a test lobby when explicitly enabled at launch.
+      if (!host_ip) {
+        memory::store_and_swap<uint32_t>(results + 0x00, 0);
+        memory::store_and_swap<uint32_t>(results + 0x04, 0);
+        return X_E_SUCCESS;
+      }
+
+      unsigned p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+      if (std::sscanf(host_ip, "%u.%u.%u.%u", &p0, &p1, &p2, &p3) != 4 ||
+          p0 > 255 || p1 > 255 || p2 > 255 || p3 > 255) {
+        REXKRNL_WARN("[BurstSearch] invalid REX_XNET_SEARCH_IP: {}", host_ip);
+        return X_E_FAIL;
+      }
+
+      uint8_t ip[4] = {
+          static_cast<uint8_t>(p0), static_cast<uint8_t>(p1),
+          static_cast<uint8_t>(p2), static_cast<uint8_t>(p3)};
+
+      // XSESSION_SEARCHRESULT_HEADER.
+      memory::store_and_swap<uint32_t>(results + 0x00, 1);
+      memory::store_and_swap<uint32_t>(results + 0x04, search_results_ptr + kHeaderSize);
+
+      uint8_t* result = results + kHeaderSize;
+
+      // XSESSION_INFO.sessionID: online session, deterministic from host IP.
+      result[0x00] = 0xAE;
+      result[0x01] = ip[0];
+      result[0x02] = ip[1];
+      result[0x03] = ip[2];
+      result[0x04] = ip[3];
+      result[0x05] = 0x52;
+      result[0x06] = 0x58;
+      result[0x07] = 0x01;
+
+      // XSESSION_INFO.hostAddress / XNADDR.
+      std::memcpy(result + 0x08, ip, 4);
+      std::memcpy(result + 0x0C, ip, 4);
+      memory::store_and_swap<uint16_t>(result + 0x10, 3074);
+
+      result[0x12] = 0x02;
+      result[0x13] = 0x52;
+      result[0x14] = ip[1];
+      result[0x15] = ip[2];
+      result[0x16] = ip[3];
+      result[0x17] = 0x01;
+
+      // XSESSION_INFO.keyExchangeKey.
+      for (uint32_t i = 0; i < 16; ++i) {
+        result[0x2C + i] = static_cast<uint8_t>(i);
+      }
+
+      // XSESSION_SEARCHRESULT slot data.
+      memory::store_and_swap<uint32_t>(result + 0x3C, 1); // open public
+      memory::store_and_swap<uint32_t>(result + 0x40, 0); // open private
+      memory::store_and_swap<uint32_t>(result + 0x44, 1); // filled public
+      memory::store_and_swap<uint32_t>(result + 0x48, 0); // filled private
+
+      REXKRNL_WARN(
+          "[BurstSearch] injected one lobby: {}.{}.{}.{}:3074 result={:08X}",
+          ip[0], ip[1], ip[2], ip[3], search_results_ptr + kHeaderSize);
 
       return X_E_SUCCESS;
     }
@@ -330,7 +485,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
 
-      return X_E_SUCCESS;
+      REXKRNL_WARN("[BurstLiveStats] XUserReadStats unavailable; returning logon-not-logged-on");
+      return 0x80151802u;
     }
     case 0x000B0025: {
       assert_true(!buffer_length || buffer_length == 20);
