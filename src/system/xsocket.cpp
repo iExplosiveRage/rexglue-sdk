@@ -116,19 +116,37 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  sockaddr_in native_name = {};
+  native_name.sin_family = name->sin_family;
+  native_name.sin_port = name->sin_port;
+  native_name.sin_addr.s_addr = htonl(name->sin_addr);
+
   // REX_XNET_BIND_IP pins INADDR_ANY binds to one local address, so two
   // instances on one PC (e.g. 127.0.0.1 and 127.0.0.2) can share a port.
-  N_XSOCKADDR_IN bind_name = *name;
-  if (uint32_t(bind_name.sin_addr) == 0) {
+  if (native_name.sin_addr.s_addr == 0) {
     if (const char* bind_ip = std::getenv("REX_XNET_BIND_IP"); bind_ip && *bind_ip) {
       const uint32_t addr = inet_addr(bind_ip);
       if (addr != INADDR_NONE) {
-        bind_name.sin_addr = ntohl(addr);
-        REXSYS_INFO("XSocket::Bind: pinning port {} to {}", uint16_t(bind_name.sin_port), bind_ip);
+        native_name.sin_addr.s_addr = addr;
       }
     }
   }
-  int ret = bind(native_handle_, (sockaddr*)&bind_name, name_len);
+
+  int ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&native_name), name_len);
+
+  const uint32_t ip_host = ntohl(native_name.sin_addr.s_addr);
+  const int error = ret < 0 ? WSAGetLastError() : 0;
+
+  REXSYS_WARN(
+      "[BurstWire] bind {}.{}.{}.{}:{} ret={} err={}",
+      (ip_host >> 24) & 0xFF,
+      (ip_host >> 16) & 0xFF,
+      (ip_host >> 8) & 0xFF,
+      ip_host & 0xFF,
+      ntohs(native_name.sin_port),
+      ret,
+      error);
+
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -219,6 +237,18 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
     *from_len = nfromlen;
   }
 
+  static uint32_t burst_wire_recv_log_count = 0;
+  if (ret > 0 && burst_wire_recv_log_count++ < 120) {
+    const uint32_t ip_host = ntohl(nfrom.sin_addr.s_addr);
+    REXSYS_WARN(
+        "[BurstWire] recvfrom bytes={} <- {}.{}.{}.{}:{}",
+        ret,
+        (ip_host >> 24) & 0xFF,
+        (ip_host >> 16) & 0xFF,
+        (ip_host >> 8) & 0xFF,
+        ip_host & 0xFF,
+        ntohs(nfrom.sin_port));
+  }
   return ret;
 }
 
@@ -246,8 +276,25 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
     nto.sin_port = to->sin_port;
   }
 
-  return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                to ? (sockaddr*)&nto : nullptr, to_len);
+  const int ret =
+      sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+             to ? (sockaddr*)&nto : nullptr, to_len);
+
+  static uint32_t burst_wire_send_log_count = 0;
+  if (to && burst_wire_send_log_count++ < 120) {
+    const uint32_t ip_host = ntohl(nto.sin_addr.s_addr);
+    REXSYS_WARN(
+        "[BurstWire] sendto bytes={} -> {}.{}.{}.{}:{} ret={}",
+        buf_len,
+        (ip_host >> 24) & 0xFF,
+        (ip_host >> 16) & 0xFF,
+        (ip_host >> 8) & 0xFF,
+        ip_host & 0xFF,
+        ntohs(nto.sin_port),
+        ret);
+  }
+
+  return ret;
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {
