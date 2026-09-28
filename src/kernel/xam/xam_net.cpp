@@ -14,7 +14,6 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
@@ -33,7 +32,6 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
-#include <rex/system/thread_state.h>
 #include <rex/system/xtypes.h>
 
 #if REX_PLATFORM_WIN32
@@ -303,159 +301,17 @@ u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_
                              ppc_ptr_t<XSOCKADDR_IN> from_addr,
                              ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
                              mapped_void completion_routine_ptr) {
-  REXKRNL_WARN(
-      "[BurstAsyncRecv] enter socket={:08X} buffers={} has_buffers={} has_overlapped={}",
-      socket, buffer_count, buffers_ptr ? 1 : 0, overlapped_ptr ? 1 : 0);
+  if (overlapped_ptr) {
+    // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
+    //    overlapped_ptr->event_handle);
 
-  struct BurstRecvBuffer {
-    uint32_t guest_address;
-    uint32_t length;
-  };
-
-  auto socket_object = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket);
-  if (!socket_object) {
-    XThread::SetLastError(0x2736);  // WSAENOTSOCK
-    return -1;
+    // if (evt) {
+    //  //evt->Set(0, false);
+    //}
   }
 
-  if (!buffers_ptr || !buffer_count || !overlapped_ptr ||
-      !overlapped_ptr->event_handle) {
-    XThread::SetLastError(10022);  // WSAEINVAL
-    return -1;
-  }
-
-  std::vector<BurstRecvBuffer> buffers;
-  uint32_t total_size = 0;
-
-  for (uint32_t i = 0; i < buffer_count; ++i) {
-    const uint32_t length = buffers_ptr[i].len;
-    const uint32_t address = buffers_ptr[i].buf_ptr;
-
-    if (!length || !address) {
-      continue;
-    }
-
-    buffers.push_back({address, length});
-    total_size += length;
-  }
-
-  if (buffers.empty() || !total_size) {
-    XThread::SetLastError(0x271E);  // WSAEFAULT
-    return -1;
-  }
-
-  const uint32_t event_handle = overlapped_ptr->event_handle;
-  const uint32_t recv_flags = flags_ptr ? flags_ptr.value() : 0;
-  const auto native_socket = socket_object->native_handle();
-
-  overlapped_ptr->internal = 0x00000103u;  // STATUS_PENDING
-  overlapped_ptr->internal_high = 0;
-
-  xboxkrnl::xeNtClearEvent(event_handle);
-
-  REXKRNL_WARN(
-      "[BurstAsyncRecv] queued socket={:08X} buffers={} capacity={} event={:08X}",
-      socket, buffer_count, total_size, event_handle);
-
-  std::thread([native_socket, socket, buffers = std::move(buffers), total_size,
-               recv_flags, num_bytes_recv, from_addr, overlapped_ptr,
-               event_handle]() mutable {
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(native_socket, &readfds);
-
-#if REX_PLATFORM_WIN32
-    const int select_nfds = 0;
-#else
-    const int select_nfds = static_cast<int>(native_socket) + 1;
-#endif
-
-    const int ready = select(select_nfds, &readfds, nullptr, nullptr, nullptr);
-
-    if (ready <= 0) {
-      const int error = ready == SOCKET_ERROR ? WSAGetLastError() : 0;
-
-      overlapped_ptr->internal = error ? error : 1;
-      overlapped_ptr->internal_high = 0;
-
-      REXKRNL_WARN(
-          "[BurstAsyncRecv] select failed socket={:08X} ret={} err={}",
-          socket, ready, error);
-
-      xboxkrnl::xeNtSetEvent(event_handle, nullptr);
-      return;
-    }
-
-    std::vector<uint8_t> packet(total_size);
-
-    sockaddr_in sender = {};
-    int sender_len = sizeof(sender);
-
-    const int received = recvfrom(
-        native_socket, reinterpret_cast<char*>(packet.data()),
-        static_cast<int>(packet.size()), static_cast<int>(recv_flags),
-        reinterpret_cast<sockaddr*>(&sender), &sender_len);
-
-    if (received <= 0) {
-      const int error = WSAGetLastError();
-
-      overlapped_ptr->internal = error;
-      overlapped_ptr->internal_high = 0;
-
-      REXKRNL_WARN(
-          "[BurstAsyncRecv] recvfrom failed socket={:08X} ret={} err={}",
-          socket, received, error);
-
-      xboxkrnl::xeNtSetEvent(event_handle, nullptr);
-      return;
-    }
-
-    uint32_t copied = 0;
-
-    for (const auto& buffer : buffers) {
-      if (copied >= static_cast<uint32_t>(received)) {
-        break;
-      }
-
-      const uint32_t remaining = static_cast<uint32_t>(received) - copied;
-      const uint32_t chunk = std::min(buffer.length, remaining);
-
-      std::memcpy(
-          REX_KERNEL_MEMORY()->TranslateVirtual(buffer.guest_address),
-          packet.data() + copied, chunk);
-
-      copied += chunk;
-    }
-
-    if (num_bytes_recv) {
-      *num_bytes_recv = static_cast<uint32_t>(received);
-    }
-
-    if (from_addr) {
-      from_addr->sin_family = sender.sin_family;
-      from_addr->sin_port = sender.sin_port;
-      from_addr->sin_addr = ntohl(sender.sin_addr.s_addr);
-      std::memset(from_addr->x_sin_zero, 0, sizeof(from_addr->x_sin_zero));
-    }
-
-    overlapped_ptr->internal = 0;
-    overlapped_ptr->internal_high = static_cast<uint32_t>(received);
-
-    const uint32_t ip = ntohl(sender.sin_addr.s_addr);
-
-    REXKRNL_WARN(
-        "[BurstAsyncRecv] complete socket={:08X} bytes={} <- {}.{}.{}.{}:{}",
-        socket, received,
-        (ip >> 24) & 0xFF,
-        (ip >> 16) & 0xFF,
-        (ip >> 8) & 0xFF,
-        ip & 0xFF,
-        ntohs(sender.sin_port));
-
-    xboxkrnl::xeNtSetEvent(event_handle, nullptr);
-  }).detach();
-
-  XThread::SetLastError(997);  // WSA_IO_PENDING
+  // we're not going to be receiving packets any time soon
+  // return error so we don't wait on that - Cancerous
   return -1;
 }
 
@@ -687,10 +543,17 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr,
 
 // Does the reverse of the above.
 // FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 raw_ip,
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr,
                                      ppc_ptr_t<XNADDR> xn_addr,
                                      mapped_void xid) {
-  if (!raw_ip || !xn_addr) {
+  if (!in_addr || !xn_addr) {
+    return 1;
+  }
+
+  uint32_t raw_ip = 0;
+  std::memcpy(&raw_ip, in_addr.host_address(), sizeof(raw_ip));
+
+  if (!raw_ip) {
     return 1;
   }
 
@@ -774,65 +637,6 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
   return 0;
 }
 
-u32 NetDll_XNetQosLookup_entry(
-    u32 caller, u32 num_remote_consoles, u32 remote_addresses_array_ptrs,
-    u32 session_ids_array_ptrs, u32 remote_keys_array_ptrs, u32 num_gateways,
-    u32 gateways_array, u32 service_ids_array, u32 probes_count,
-    u32 bits_per_second, u32 flags, u32 event_handle, mapped_u32 qos_ptr) {
-  if (!qos_ptr) {
-    return X_STATUS_INVALID_PARAMETER;
-  }
-
-  const u32 count = num_remote_consoles + num_gateways;
-  const u32 size =
-      static_cast<u32>(sizeof(XNQOS) + sizeof(XNQOSINFO) * count);
-
-  const u32 qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
-  auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
-  std::memset(qos, 0, size);
-
-  qos->count = count;
-  qos->count_pending = 0;
-
-  constexpr uint8_t kQosComplete = 0x01;
-  constexpr uint8_t kQosTargetContacted = 0x02;
-
-  const uint16_t completed_probes =
-      static_cast<uint16_t>(probes_count ? probes_count : 1);
-  constexpr u16 kReportedRttMs = 1;
-  constexpr u32 kReportedRateBps = 10000000u;
-
-  REXKRNL_WARN(
-      "[BurstXNet] QoS override rtt={}ms rate={}bps",
-      kReportedRttMs, kReportedRateBps);
-
-  for (u32 i = 0; i < count; ++i) {
-    auto& info = qos->info[i];
-    info.flags = kQosComplete | kQosTargetContacted;
-    info.probes_xmit = completed_probes;
-    info.probes_recv = completed_probes;
-    info.rtt_min_in_msecs = kReportedRttMs;
-    info.rtt_med_in_msecs = kReportedRttMs;
-    info.up_bits_per_sec = kReportedRateBps;
-    info.down_bits_per_sec = kReportedRateBps;
-  }
-
-  *qos_ptr = qos_guest;
-
-  if (event_handle) {
-    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-    assert_not_null(ev);
-    ev->Set(0, false);
-  }
-
-  REXKRNL_WARN(
-      "[BurstXNet] XNetQosLookup complete: remotes={} gateways={} "
-      "probes={} bps={} qos={:08X}",
-      num_remote_consoles, num_gateways, probes_count, bits_per_second,
-      qos_guest);
-
-  return 0;
-}
 u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   if (!qos) {
     return X_STATUS_INVALID_PARAMETER;
@@ -960,9 +764,6 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     return -1;
   }
 
-  REXKRNL_WARN(
-      "[BurstUDP] bind socket={:08X} port={}",
-      socket_handle, ntohs(native_name.sin_port));
   return 0;
 }
 
@@ -1130,13 +931,6 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
     host_exceptfds.Store(exceptfds);
   }
 
-  static uint32_t burst_select_log_count = 0;
-  if (ret > 0 && readfds && burst_select_log_count++ < 160) {
-    REXKRNL_WARN(
-        "[BurstSelect] ret={} nfds={} readfds=1 writefds={} exceptfds={}",
-        ret, nfds, writefds ? 1 : 0, exceptfds ? 1 : 0);
-  }
-
   // TODO(gibbed): modify ret to be what's actually copied to the guest fd_sets?
   return ret;
 }
@@ -1149,20 +943,7 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  const int ret = socket->Recv(buf_ptr, buf_len, flags);
-
-  static uint32_t burst_udp_recv_log_count = 0;
-  const uint32_t call_index = burst_udp_recv_log_count++;
-
-  if (call_index < 120 || ret >= 0) {
-    const int wsa_error = ret == -1 ? WSAGetLastError() : 0;
-
-    REXKRNL_WARN(
-        "[BurstUDP] recv socket={:08X} bytes={} flags={:08X} ret={} err={}",
-        socket_handle, buf_len, flags, ret, wsa_error);
-  }
-
-  return ret;
+  return socket->Recv(buf_ptr, buf_len, flags);
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -1182,29 +963,6 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
 
-  static uint32_t burst_udp_recvfrom_call_log_count = 0;
-  const uint32_t call_index = burst_udp_recvfrom_call_log_count++;
-
-  if (call_index < 160 || ret >= 0) {
-    const int wsa_error = ret == -1 ? WSAGetLastError() : 0;
-
-    REXKRNL_WARN(
-        "[BurstUDP] recvfrom-call socket={:08X} bytes={} flags={:08X} ret={} err={}",
-        socket_handle, buf_len, flags, ret, wsa_error);
-  }
-
-  static uint32_t burst_udp_recv_log_count = 0;
-  if (ret > 0 && burst_udp_recv_log_count++ < 120) {
-    const uint32_t ip_host = ntohl(native_from.sin_addr);
-    REXKRNL_WARN(
-        "[BurstUDP] recvfrom socket={:08X} bytes={} <- {}.{}.{}.{}:{}",
-        socket_handle, ret,
-        (ip_host >> 24) & 0xFF,
-        (ip_host >> 16) & 0xFF,
-        (ip_host >> 8) & 0xFF,
-        ip_host & 0xFF,
-        ntohs(native_from.sin_port));
-  }
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
     from_ptr->sin_port = native_from.sin_port;
@@ -1249,31 +1007,7 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  const int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
-
-  static uint32_t burst_udp_send_log_count = 0;
-  const bool burst_input_packet = buf_len >= 250 && buf_len <= 400;
-  if (to_ptr && burst_input_packet && burst_udp_send_log_count++ < 180) {
-    const uint32_t ip_host = ntohl(native_to.sin_addr);
-
-    uint32_t guest_lr = 0;
-    if (auto* current_thread = XThread::GetCurrentThread();
-        current_thread && current_thread->thread_state() &&
-        current_thread->thread_state()->context()) {
-      guest_lr = static_cast<uint32_t>(
-          current_thread->thread_state()->context()->lr);
-    }
-    REXKRNL_WARN(
-        "[BurstInput] sendto lr={:08X} socket={:08X} bytes={} -> {}.{}.{}.{}:{} ret={}",
-        guest_lr, socket_handle, buf_len,
-        (ip_host >> 24) & 0xFF,
-        (ip_host >> 16) & 0xFF,
-        (ip_host >> 8) & 0xFF,
-        ip_host & 0xFF,
-        ntohs(native_to.sin_port), ret);
-  }
-
-  return ret;
+  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -1397,8 +1131,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT(__imp__NetDll_XNetQosLookup,
-           rex::kernel::xam::NetDll_XNetQosLookup_entry);
+REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
