@@ -17,9 +17,11 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -80,6 +82,18 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
+REXCVAR_DEFINE_BOOL(texture_dump_enabled, false, "GPU/Texture Replacement",
+                    "Dump loaded textures to DDS files for replacement authoring")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
+                    "Inject replacement textures from disk when available")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
+                      "Texture dump folder (empty = <executable folder>/textures)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
 //     "Integer pixel width scale used for scaling the rendering resolution "
@@ -126,6 +140,14 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+static std::filesystem::path GetTextureDumpFolder() {
+  const std::string configured_texture_folder = REXCVAR_GET(texture_folder);
+  if (!configured_texture_folder.empty()) {
+    return rex::to_path(configured_texture_folder);
+  }
+  return rex::filesystem::GetExecutableFolder() / "textures";
+}
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -223,6 +245,12 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
+
+  InitTextureReplacement(GetTextureDumpFolder());
+}
+
+void TextureCache::InitTextureReplacement(const std::filesystem::path& textures_dir) {
+  replacement_ = std::make_unique<TextureReplacement>(textures_dir);
 }
 
 TextureCache::~TextureCache() {
@@ -435,9 +463,34 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+  bool uploaded_replacement = false;
+  if (texture.replacement_content_hash_ != 0 && replacement_) {
+    const TextureReplacementData* replacement =
+        replacement_->FindReplacement(texture.replacement_content_hash_);
+    if (replacement) {
+      uploaded_replacement = LoadTextureDataFromReplacementImpl(texture, *replacement);
+    }
+  }
+
+  if (!uploaded_replacement &&
+      !LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
     return false;
+  }
+
+  // Keep dumping originals too, even when a replacement was uploaded.
+  if (replacement_ && pending_load.load_base && REXCVAR_GET(texture_dump_enabled) &&
+      !texture_key.scaled_resolve) {
+    const uint32_t guest_addr = texture_key.base_page << 12;
+    const uint32_t guest_size = texture.GetGuestBaseSize();
+    if (guest_size > 0) {
+      const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
+      const uint64_t content_hash =
+          TextureReplacement::HashGuestData(guest_bytes, guest_size);
+      replacement_->DumpTexture(content_hash, texture_key.GetWidth(), texture_key.GetHeight(),
+                                texture_key.pitch, texture_key.tiled != 0, texture_key.format,
+                                texture_key.endianness, guest_bytes, guest_size);
+    }
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
@@ -744,6 +797,7 @@ void TextureCache::Texture::WatchCallback(
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
+    texture_cache_.InvalidateHashCache(key().base_page);
   }
 }
 
@@ -856,6 +910,59 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     get_host_extent(host_width, host_height, host_depth_or_array_size);
   }
 
+  // Look for a replacement using a stable hash of the original guest bytes.
+  const TextureReplacementData* replacement = nullptr;
+  texture_util::TextureGuestLayout original_guest_layout{};
+  bool has_replacement = false;
+  uint64_t replacement_content_hash = 0;
+
+  if (replacement_ && REXCVAR_GET(texture_replace_enabled) &&
+      key.base_page != 0 && !key.scaled_resolve) {
+    original_guest_layout = key.GetGuestLayout();
+    const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;
+
+    if (guest_size > 0) {
+      const uint32_t base_page = key.base_page;
+      auto cached_hash = base_page_hash_cache_.find(base_page);
+
+      if (cached_hash != base_page_hash_cache_.end()) {
+        replacement_content_hash = cached_hash->second;
+      } else {
+        const uint8_t* guest_bytes =
+            shared_memory().TranslatePhysical(key.base_page << 12);
+        replacement_content_hash =
+            TextureReplacement::HashGuestData(guest_bytes, guest_size);
+        base_page_hash_cache_.emplace(base_page, replacement_content_hash);
+      }
+
+      replacement = replacement_->FindReplacement(replacement_content_hash);
+
+      if (replacement && replacement->width > 0 && replacement->height > 0) {
+        const uint32_t max_size = GetMaxHostTextureWidthHeight(key.dimension);
+
+        if (replacement->width <= max_size && replacement->height <= max_size) {
+          const uint32_t original_width = key.GetWidth();
+          const uint32_t original_height = key.GetHeight();
+
+          key.width_minus_1 = replacement->width - 1;
+          key.height_minus_1 = replacement->height - 1;
+          key.format = xenos::TextureFormat::k_8_8_8_8;
+          key.mip_max_level = 0;
+
+          has_replacement = true;
+
+          REXGPU_DEBUG(
+              "TextureReplacement: injecting {}x{} replacement for original {}x{} "
+              "(hash {:016x})",
+              replacement->width, replacement->height,
+              original_width, original_height, replacement_content_hash);
+        } else {
+          replacement = nullptr;
+        }
+      }
+    }
+  }
+
   // Try to find an existing texture.
   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
   // previously 0, now not 0, to save memory - common case in streaming.
@@ -873,6 +980,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       return nullptr;
     }
     assert_true(new_texture->key() == key);
+
+    if (has_replacement) {
+      new_texture->replacement_content_hash_ = replacement_content_hash;
+      new_texture->OverrideGuestLayout(original_guest_layout);
+    }
+
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());

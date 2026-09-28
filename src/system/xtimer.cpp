@@ -46,6 +46,7 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
     return X_STATUS_TIMER_RESUME_IGNORED;
   }
 
+  due_time = chrono::Clock::ScaleGuestDurationFileTime(due_time);
   period_ms = chrono::Clock::ScaleGuestDurationMillis(period_ms);
   WinSystemClock::time_point due_tp;
   if (due_time < 0) {
@@ -93,3 +94,4 @@ X_STATUS XTimer::Cancel() {
 }
 
 }  // namespace rex::system
+

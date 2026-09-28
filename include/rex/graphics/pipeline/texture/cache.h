@@ -14,11 +14,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -73,6 +75,9 @@ class TextureCache {
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   }
+
+  // Initializes DDS texture dumping beside the executable.
+  void InitTextureReplacement(const std::filesystem::path& textures_dir);
 
   virtual void ClearCache();
 
@@ -207,6 +212,10 @@ class TextureCache {
     uint32_t GetGuestBaseSize() const { return guest_layout().base.level_data_extent_bytes; }
     uint32_t GetGuestMipsSize() const { return guest_layout().mips_total_extent_bytes; }
 
+    void OverrideGuestLayout(const texture_util::TextureGuestLayout& layout) {
+      guest_layout_ = layout;
+    }
+
     // For 3D-as-2D wrappers: the host texture is 2D, but guest memory tiling
     // may still need to be interpreted as 3D.
     bool force_load_3d_tiling() const { return force_load_3d_tiling_; }
@@ -237,6 +246,8 @@ class TextureCache {
     void MarkAsUsed();
 
     void LogAction(const char* action) const;
+
+    uint64_t replacement_content_hash_ = 0;
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -528,6 +539,11 @@ class TextureCache {
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
 
+  virtual bool LoadTextureDataFromReplacementImpl(
+      Texture& texture, const TextureReplacementData& data) {
+    return false;
+  }
+
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
   // post-guest-swizzle signedness.
@@ -619,6 +635,14 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+
+  // Dump-only pipeline. Replacement upload will be added separately.
+  void InvalidateHashCache(uint32_t base_page) {
+    base_page_hash_cache_.erase(base_page);
+  }
+
+  std::unique_ptr<TextureReplacement> replacement_;
+  std::unordered_map<uint32_t, uint64_t> base_page_hash_cache_;
 };
 
 }  // namespace rex::graphics

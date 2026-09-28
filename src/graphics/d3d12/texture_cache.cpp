@@ -657,6 +657,12 @@ void D3D12TextureCache::ClearCache() {
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
 
+  const uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  while (!retained_upload_buffers_.empty() &&
+         retained_upload_buffers_.front().first <= completed_submission) {
+    retained_upload_buffers_.pop_front();
+  }
+
   // ExecuteCommandLists is a full UAV and aliasing barrier.
   if (IsDrawResolutionScaled()) {
     size_t scaled_resolve_buffer_count = GetScaledResolveBufferCount();
@@ -2202,6 +2208,109 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
+    Texture& texture, const TextureReplacementData& data) {
+  D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  ID3D12Resource* resource = d3d12_texture.resource();
+
+  if (!resource || data.pixels.empty() || data.width == 0 || data.height == 0) {
+    return false;
+  }
+
+  const D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
+
+  if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      data.width != resource_desc.Width ||
+      data.height != resource_desc.Height) {
+    return false;
+  }
+
+  if (resource_desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+      resource_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+      resource_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+    return false;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  D3D12_RESOURCE_DESC footprint_desc = resource_desc;
+  if (footprint_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+    footprint_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  UINT64 upload_size = 0;
+
+  device->GetCopyableFootprints(&footprint_desc, 0, 1, 0, &footprint,
+                                nullptr, nullptr, &upload_size);
+
+  D3D12_RESOURCE_DESC buffer_desc{};
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&upload_buffer)))) {
+    REXLOG_WARN("TextureReplacement: failed to create D3D12 upload buffer");
+    return false;
+  }
+
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read{0, 0};
+
+  if (FAILED(upload_buffer->Map(0, &no_read, &mapped))) {
+    REXLOG_WARN("TextureReplacement: failed to map D3D12 upload buffer");
+    return false;
+  }
+
+  const uint32_t source_row_bytes = data.width * 4;
+  const uint32_t destination_row_bytes = footprint.Footprint.RowPitch;
+
+  uint8_t* destination =
+      static_cast<uint8_t*>(mapped) + footprint.Offset;
+  const uint8_t* source = data.pixels.data();
+
+  for (uint32_t y = 0; y < data.height; ++y) {
+    std::memcpy(destination, source, source_row_bytes);
+    source += source_row_bytes;
+    destination += destination_row_bytes;
+  }
+
+  upload_buffer->Unmap(0, nullptr);
+
+  const D3D12_RESOURCE_STATES old_state =
+      d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+
+  command_processor_.PushTransitionBarrier(
+      resource, old_state, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+
+  D3D12_TEXTURE_COPY_LOCATION destination_location{};
+  destination_location.pResource = resource;
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination_location.SubresourceIndex = 0;
+
+  D3D12_TEXTURE_COPY_LOCATION source_location{};
+  source_location.pResource = upload_buffer.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source_location.PlacedFootprint = footprint;
+
+  command_list.D3DCopyTextureRegion(
+      &destination_location, 0, 0, 0, &source_location, nullptr);
+
+  retained_upload_buffers_.emplace_back(
+      command_processor_.GetCurrentSubmission(), std::move(upload_buffer));
+
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

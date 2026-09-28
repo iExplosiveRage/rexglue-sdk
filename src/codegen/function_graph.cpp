@@ -571,7 +571,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         }
 
         // Emit comment with instruction disassembly
-        emit_println(body, "\t// {} {}", insn.opcode->name, insn.op_str);
+        emit_println(body, "\t// 0x{:08X}: {} {}", static_cast<uint32_t>(blockBase), insn.opcode->name, insn.op_str);
 
         // Check for mid-asm hook BEFORE instruction
         auto hookIt = ctx.config.midAsmHooks.find(blockBase);
