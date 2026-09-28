@@ -10,6 +10,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/version.h>
 #include <imgui.h>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -29,10 +30,28 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
 #else
-  ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(220, 75), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+    // Game FPS: guest swaps (VdSwap) per second, sampled every 0.5 s.
+    constexpr double kFpsWindowSeconds = 0.5;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t swaps = rex::perf::GetGuestSwapCount();
+    if (fps_window_start_ == std::chrono::steady_clock::time_point{}) {
+      fps_window_start_ = now;
+      fps_window_swaps_ = swaps;
+    }
+    const double elapsed = std::chrono::duration<double>(now - fps_window_start_).count();
+    if (elapsed >= kFpsWindowSeconds) {
+      guest_fps_ = static_cast<double>(swaps - fps_window_swaps_) / elapsed;
+      fps_window_start_ = now;
+      fps_window_swaps_ = swaps;
+    }
+    ImGui::Text("Game: %.1f FPS (%.2f ms)", guest_fps_,
+                guest_fps_ > 0.0 ? 1000.0 / guest_fps_ : 0.0);
+    ImGui::Text("Display: %.0f FPS", io.Framerate);
+
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {

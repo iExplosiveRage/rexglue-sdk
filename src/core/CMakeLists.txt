@@ -14,6 +14,7 @@ add_library(rexcore OBJECT
     hash.cpp
     logging.cpp
     memory.cpp
+    perf/frame_rate.cpp
     mutex.cpp
     ring_buffer.cpp
     string_buffer.cpp

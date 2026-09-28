@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
@@ -943,6 +944,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     last_frame_tick = now;
   }
 #endif
+  rex::perf::RecordGuestSwap();
   rex::perf::Profiler::Flip();
 
   // Xenia-specific VdSwap hook.

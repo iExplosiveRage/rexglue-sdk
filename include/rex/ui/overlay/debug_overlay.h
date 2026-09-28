@@ -12,6 +12,7 @@
 #pragma once
 #include <rex/ui/imgui_dialog.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 
@@ -37,6 +38,11 @@ class DebugOverlayDialog : public ImGuiDialog {
 
  private:
   FrameStatsProvider stats_provider_;
+
+  // Guest FPS, averaged over a short window so the value is readable.
+  std::chrono::steady_clock::time_point fps_window_start_{};
+  uint64_t fps_window_swaps_ = 0;
+  double guest_fps_ = 0.0;
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};
