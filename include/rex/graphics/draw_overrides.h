@@ -29,6 +29,9 @@ struct PixelShaderDrawOverride {
     std::array<float, 4> value{};
   };
   std::vector<Constant> constants;
+  // Follow the scene projection scale (field of view) on every vertex, not
+  // only perspective ones - for scene effects drawn as screen-space sprites.
+  bool scene_projection_all_vertices = false;
 };
 
 // Replaces the overrides set under `owner`; the overrides of all owners apply.

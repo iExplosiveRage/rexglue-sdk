@@ -4079,6 +4079,14 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     if (frontbuffer_width &&
         regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
       scene_projection_scale = requested_scene_projection_scale;
+      // Negative: the shader scales every vertex, not only perspective ones.
+      const Shader* pixel_shader = active_pixel_shader();
+      const rex::graphics::PixelShaderDrawOverride* draw_override =
+          pixel_shader ? rex::graphics::FindPixelShaderDrawOverride(pixel_shader->ucode_data_hash())
+                       : nullptr;
+      if (draw_override && draw_override->scene_projection_all_vertices) {
+        scene_projection_scale = -scene_projection_scale;
+      }
     }
   }
   dirty |= system_constants_.scene_projection_scale != scene_projection_scale;
