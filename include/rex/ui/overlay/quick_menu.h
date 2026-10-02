@@ -62,6 +62,10 @@ struct QuickMenuSection {
 struct QuickMenuConfig {
   std::string title = "SETTINGS";
   std::vector<QuickMenuSection> sections;
+  // Y on the controller turns this boolean cvar on or off and closes the menu,
+  // a shortcut to a mode like a free camera. Empty = none.
+  std::string quick_toggle_label;
+  std::string quick_toggle_cvar;
 };
 
 class QuickMenuDialog : public ImGuiDialog {
@@ -86,6 +90,9 @@ class QuickMenuDialog : public ImGuiDialog {
   // Text is drawn with overlay_text (its fonts must be added to the atlas).
   QuickMenuDialog(ImGuiDrawer* imgui_drawer, QuickMenuConfig config, Callbacks callbacks);
   ~QuickMenuDialog() override;
+
+  // Whether a quick menu is open (it has the controllers then). Any thread.
+  static bool IsOpen();
 
  protected:
   void OnDraw(ImGuiIO& io) override;
@@ -112,6 +119,8 @@ class QuickMenuDialog : public ImGuiDialog {
   uint16_t last_buttons_ = 0;
   // Pressed to close the menu, which happens when they're released.
   uint16_t close_buttons_ = 0;
+  // Y was pressed: toggle quick_toggle_cvar when closing.
+  bool quick_toggle_ = false;
   int repeat_direction_ = 0;
   double repeat_time_ = 0.0;
   double open_time_ = -1.0;

@@ -9,6 +9,7 @@
 #include <rex/ui/overlay/quick_menu.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +38,7 @@ constexpr uint16_t kPadLeftShoulder = 0x0100;
 constexpr uint16_t kPadRightShoulder = 0x0200;
 constexpr uint16_t kPadA = 0x1000;
 constexpr uint16_t kPadB = 0x2000;
+constexpr uint16_t kPadY = 0x8000;
 constexpr int16_t kStickThreshold = 16000;
 
 // Seconds before a held direction repeats, and between the repeats.
@@ -140,6 +142,8 @@ std::string CvarNumber(const std::string& cvar, double value) {
   return text;
 }
 
+std::atomic<int> open_menus{0};
+
 }  // namespace
 
 struct QuickMenuDialog::SharedPad {
@@ -160,9 +164,16 @@ QuickMenuDialog::QuickMenuDialog(ImGuiDrawer* imgui_drawer, QuickMenuConfig conf
       selected_item_ = shown.front();
     }
   }
+  open_menus.fetch_add(1, std::memory_order_relaxed);
 }
 
-QuickMenuDialog::~QuickMenuDialog() = default;
+QuickMenuDialog::~QuickMenuDialog() {
+  open_menus.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool QuickMenuDialog::IsOpen() {
+  return open_menus.load(std::memory_order_relaxed) > 0;
+}
 
 bool QuickMenuDialog::IsShown(const QuickMenuItem& item) const {
   if (!rex::cvar::GetFlagInfo(item.cvar)) {
@@ -381,6 +392,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
         (buttons & (kPadBack | kPadStart)) == (kPadBack | kPadStart)) {
       close_buttons_ |= kPadBack | kPadStart;
     }
+    if ((pressed & kPadY) && !config_.quick_toggle_cvar.empty()) {
+      close_buttons_ |= kPadY;
+      quick_toggle_ = true;
+    }
     // Closed once they're let go: the game takes the controllers back right
     // after, and a button still held then would reach it as a press.
     if (close_buttons_ && !(buttons & close_buttons_)) {
@@ -447,6 +462,14 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     }
   }
   if (close) {
+    if (quick_toggle_ && !close_requested_) {
+      QuickMenuItem quick_toggle;
+      quick_toggle.cvar = config_.quick_toggle_cvar;
+      if (rex::cvar::GetFlagInfo(quick_toggle.cvar)) {
+        Change(quick_toggle, 0);
+      }
+    }
+    quick_toggle_ = false;
     RequestClose();
   }
 
@@ -725,6 +748,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     };
     draw_button("A", color(22, 150, 62), "Change");
     draw_button("B", color(206, 44, 44), "Close");
+    if (!config_.quick_toggle_label.empty() &&
+        rex::cvar::GetFlagInfo(config_.quick_toggle_cvar)) {
+      draw_button("Y", color(222, 168, 18), config_.quick_toggle_label.c_str());
+    }
     const char* saved = "Saved automatically";
     DrawText(draw_list, hint_size,
              ImVec2(content_right - TextSize(hint_size, saved).x,
