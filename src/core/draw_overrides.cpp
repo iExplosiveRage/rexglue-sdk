@@ -17,6 +17,8 @@ namespace rex::graphics {
 
 namespace {
 std::atomic<float> g_scene_projection_scale{1.0f};
+std::atomic<float> g_scene_projection_roll{0.0f};
+std::atomic<bool> g_hide_hud_draws{false};
 std::mutex g_overrides_mutex;
 std::map<std::string, std::vector<PixelShaderDrawOverride>> g_overrides_by_owner;
 std::atomic<uint32_t> g_overrides_generation{0};
@@ -62,6 +64,22 @@ void SetSceneProjectionScale(float scale) {
 
 float GetSceneProjectionScale() {
   return g_scene_projection_scale.load(std::memory_order_relaxed);
+}
+
+void SetSceneProjectionRoll(float radians) {
+  g_scene_projection_roll.store(radians, std::memory_order_relaxed);
+}
+
+float GetSceneProjectionRoll() {
+  return g_scene_projection_roll.load(std::memory_order_relaxed);
+}
+
+void SetHideHudDraws(bool hide) {
+  g_hide_hud_draws.store(hide, std::memory_order_relaxed);
+}
+
+bool GetHideHudDraws() {
+  return g_hide_hud_draws.load(std::memory_order_relaxed);
 }
 
 }  // namespace rex::graphics

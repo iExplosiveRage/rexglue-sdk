@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <bit>
 #include <cstdarg>
@@ -56,6 +57,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
 
 REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
                      "Log the state of every draw for this many frames (counts down)");
+
+REXCVAR_DEFINE_INT32(gpu_debug_log_vs_constants, 0, "GPU/Debug",
+                     "With gpu_debug_log_draws, also log this many vertex shader float "
+                     "constants (from c0) for each draw");
 
 REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
                       "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
@@ -2506,6 +2511,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (log_draw_frames > 0) {
     REXGPU_INFO("DRAW ---- end of frame");
     rex::cvar::SetFlagByName("gpu_debug_log_draws", std::to_string(log_draw_frames - 1));
+    // Readable from the log file right away.
+    rex::FlushLogging();
   }
 }
 
@@ -2583,6 +2590,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      return true;
+    }
+  }
+  // App option (rex::graphics::SetHideHudDraws): leave out what's drawn over
+  // the 3D scene with the depth test on but always passing - the HUD.
+  if (is_rasterization_done && rex::graphics::GetHideHudDraws()) {
+    const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (depth_control.z_enable && depth_control.zfunc == xenos::CompareFunction::kAlways &&
+        frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
       return true;
     }
   }
@@ -2735,6 +2752,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET), uint32_t(primitive_type), index_count);
+    const int32_t vs_constant_count = std::min(REXCVAR_GET(gpu_debug_log_vs_constants), 256);
+    for (int32_t i = 0; i < vs_constant_count; ++i) {
+      const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * uint32_t(i);
+      REXGPU_INFO("DRAW   c{} = {} {} {} {}  ({:08X} {:08X} {:08X} {:08X})", i,
+                  regs.Get<float>(base), regs.Get<float>(base + 1), regs.Get<float>(base + 2),
+                  regs.Get<float>(base + 3), regs[base], regs[base + 1], regs[base + 2],
+                  regs[base + 3]);
+    }
   }
 
 
@@ -4072,26 +4097,45 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // is drawn with an always-passing depth test) into the frontbuffer-wide
   // render target. The vertex shader applies it to perspective vertices only,
   // which leaves 2D and orthographic geometry alone.
-  float scene_projection_scale = 1.0f;
+  // Field of view and roll of the 3D scene: a 2x2 transform of the clip space
+  // XY, enabled by scene_projection_scale (0 = off, negative = for every vertex
+  // rather than only perspective ones).
+  float scene_projection_scale = 0.0f;
+  float scene_projection_matrix[4] = {1.0f, 0.0f, 0.0f, 1.0f};
   const float requested_scene_projection_scale = rex::graphics::GetSceneProjectionScale();
-  if (requested_scene_projection_scale != 1.0f && normalized_depth_control.z_enable &&
+  const float requested_scene_roll = rex::graphics::GetSceneProjectionRoll();
+  if ((requested_scene_projection_scale != 1.0f || requested_scene_roll != 0.0f) &&
+      normalized_depth_control.z_enable &&
       normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
-    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
-    if (frontbuffer_width &&
-        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
-      scene_projection_scale = requested_scene_projection_scale;
-      // Negative: the shader scales every vertex, not only perspective ones.
+    const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+    if (render_info.frontbuffer_width && render_info.frontbuffer_height &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= render_info.frontbuffer_width) {
+      scene_projection_scale = 1.0f;
       const Shader* pixel_shader = active_pixel_shader();
       const rex::graphics::PixelShaderDrawOverride* draw_override =
           pixel_shader ? rex::graphics::FindPixelShaderDrawOverride(pixel_shader->ucode_data_hash())
                        : nullptr;
       if (draw_override && draw_override->scene_projection_all_vertices) {
-        scene_projection_scale = -scene_projection_scale;
+        scene_projection_scale = -1.0f;
       }
+      // Rotation in screen pixels, so clip X and Y are scaled by the aspect
+      // ratio around it.
+      const float aspect =
+          float(render_info.frontbuffer_width) / float(render_info.frontbuffer_height);
+      const float roll_cos = std::cos(requested_scene_roll) * requested_scene_projection_scale;
+      const float roll_sin = std::sin(requested_scene_roll) * requested_scene_projection_scale;
+      scene_projection_matrix[0] = roll_cos;
+      scene_projection_matrix[1] = -roll_sin / aspect;
+      scene_projection_matrix[2] = roll_sin * aspect;
+      scene_projection_matrix[3] = roll_cos;
     }
   }
   dirty |= system_constants_.scene_projection_scale != scene_projection_scale;
   system_constants_.scene_projection_scale = scene_projection_scale;
+  for (uint32_t i = 0; i < 4; ++i) {
+    dirty |= system_constants_.scene_projection_matrix[i] != scene_projection_matrix[i];
+    system_constants_.scene_projection_matrix[i] = scene_projection_matrix[i];
+  }
 
   // Point size.
   if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {

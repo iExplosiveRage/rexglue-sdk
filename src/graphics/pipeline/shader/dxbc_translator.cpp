@@ -922,18 +922,31 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
 
   dxbc::Src flags_src(LoadFlagsSystemConstant());
 
-  // Field of view option (see the position scaling below). Effects working in
-  // screen space, like soft particles fading against the scene depth, may pass
-  // a copy of the position to the pixel shader to locate the pixel in the
-  // scene textures - scale X and Y of such copies too, so they still point at
-  // the same place. Compared while the position is still exactly what the
-  // guest exported (before the W and XY/W conversions).
+  // Field of view and roll options (see the position transform below).
+  // Effects working in screen space, like soft particles fading against the
+  // scene depth, may pass a copy of the position to the pixel shader to locate
+  // the pixel in the scene textures - transform X and Y of such copies too, so
+  // they still point at the same place. Compared while the position is still
+  // exactly what the guest exported (before the W and XY/W conversions).
   dxbc::Src scene_projection_scale_src(
       LoadSystemConstant(SystemConstants::Index::kSceneProjectionScale,
                          offsetof(SystemConstants, scene_projection_scale), dxbc::Src::kXXXX));
+  // XY of `reg` times scene_projection_matrix, using ZW of `scratch`.
+  auto apply_scene_projection = [&](uint32_t reg, uint32_t scratch) {
+    constexpr uint32_t kSwizzleXXXZ = 0b10000000;
+    constexpr uint32_t kSwizzleYWWW = 0b11111101;
+    constexpr uint32_t kSwizzleZWWW = 0b11111110;
+    a_.OpMul(dxbc::Dest::R(scratch, 0b1100), dxbc::Src::R(reg, dxbc::Src::kXXXX),
+             LoadSystemConstant(SystemConstants::Index::kSceneProjectionMatrix,
+                                offsetof(SystemConstants, scene_projection_matrix), kSwizzleXXXZ));
+    a_.OpMAd(dxbc::Dest::R(reg, 0b0011), dxbc::Src::R(reg, dxbc::Src::kYYYY),
+             LoadSystemConstant(SystemConstants::Index::kSceneProjectionMatrix,
+                                offsetof(SystemConstants, scene_projection_matrix), kSwizzleYWWW),
+             dxbc::Src::R(scratch, kSwizzleZWWW));
+  };
   uint32_t interpolator_count = rex::bit_count(GetModificationInterpolatorMask());
   if (interpolator_count) {
-    a_.OpNE(temp_x_dest, scene_projection_scale_src, dxbc::Src::LF(1.0f));
+    a_.OpNE(temp_x_dest, scene_projection_scale_src, dxbc::Src::LF(0.0f));
     a_.OpIf(true, temp_x_src);
     // The same condition as for the position.
     a_.OpNE(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
@@ -952,8 +965,7 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
       a_.OpAnd(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
                dxbc::Src::R(temp, dxbc::Src::kWWWW));
       a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kYYYY));
-      a_.OpMul(dxbc::Dest::R(interpolator_temp, 0b0011), dxbc::Src::R(interpolator_temp),
-               scene_projection_scale_src.Abs());
+      apply_scene_projection(interpolator_temp, temp);
       a_.OpEndIf();
     }
     a_.OpEndIf();
@@ -1003,18 +1015,19 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
     ++ucp_clip_cull_distance_next_component_ref;
   }
 
-  // Field of view option: scale XY of perspective vertices only (W != 1), so
-  // 2D (HUD, full-screen passes) and orthographic (shadow map) geometry keep
-  // their place - or of every vertex when the scale is negative, for scene
-  // effects drawn as screen-space sprites. The command processor passes 1
-  // when it's off.
+  // Field of view and roll options: transform XY of perspective vertices only
+  // (W != 1), so 2D (HUD, full-screen passes) and orthographic (shadow map)
+  // geometry keep their place - or of every vertex when scene_projection_scale
+  // is negative, for scene effects drawn as screen-space sprites. The command
+  // processor passes 0 when it's off.
   a_.OpNE(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
           dxbc::Src::LF(1.0f));
   a_.OpLT(dxbc::Dest::R(temp, 0b0010), scene_projection_scale_src, dxbc::Src::LF(0.0f));
   a_.OpOr(temp_x_dest, temp_x_src, dxbc::Src::R(temp, dxbc::Src::kYYYY));
+  a_.OpNE(dxbc::Dest::R(temp, 0b0010), scene_projection_scale_src, dxbc::Src::LF(0.0f));
+  a_.OpAnd(temp_x_dest, temp_x_src, dxbc::Src::R(temp, dxbc::Src::kYYYY));
   a_.OpIf(true, temp_x_src);
-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0011), dxbc::Src::R(system_temp_position_),
-           scene_projection_scale_src.Abs());
+  apply_scene_projection(system_temp_position_, temp);
   a_.OpEndIf();
 
   // Apply scale for guest to host viewport and clip space conversion. Also, if
@@ -2040,6 +2053,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+
+    {"xe_scene_projection_matrix", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {

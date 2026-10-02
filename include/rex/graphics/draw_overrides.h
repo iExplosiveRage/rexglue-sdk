@@ -49,4 +49,16 @@ const PixelShaderDrawOverride* FindPixelShaderDrawOverride(uint64_t ucode_hash);
 void SetSceneProjectionScale(float scale);
 float GetSceneProjectionScale();
 
+// Roll of the 3D scene in radians (the same draws as the projection scale),
+// turning the picture around the center of the screen like a tilted camera.
+// Thread-safe.
+void SetSceneProjectionRoll(float radians);
+float GetSceneProjectionRoll();
+
+// Drops the draws made into the main render target with the depth test on but
+// set to always pass - the HUD drawn over the 3D scene - e.g. for a photo
+// mode. Thread-safe.
+void SetHideHudDraws(bool hide);
+bool GetHideHudDraws();
+
 }  // namespace rex::graphics

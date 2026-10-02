@@ -318,8 +318,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     uint32_t alpha_to_mask;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    // Multiplier for the clip space XY of perspective vertices (W != 1), for a
-    // field of view option. 1 = unchanged.
+    // Whether scene_projection_matrix applies: 0 = no, positive = to
+    // perspective vertices (W != 1), negative = to all vertices.
     float scene_projection_scale;
 
     float color_exp_bias[4];
@@ -390,6 +390,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // 2x2 transform of the clip space XY of scene vertices (field of view and
+    // roll options): x' = [0] * x + [1] * y, y' = [2] * x + [3] * y.
+    float scene_projection_matrix[4];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -442,6 +446,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kSceneProjectionMatrix,
 
       kCount,
     };
