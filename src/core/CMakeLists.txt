@@ -8,6 +8,7 @@ add_library(rexcore OBJECT
     byte_stream.cpp
     clock.cpp
     cvar.cpp
+    draw_overrides.cpp
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp

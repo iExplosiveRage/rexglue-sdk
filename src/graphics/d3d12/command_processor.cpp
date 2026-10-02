@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdarg>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -26,6 +28,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
+#include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -75,13 +78,8 @@ namespace {
 // the end of a frame. 0 = no change requested.
 std::atomic<uint32_t> g_requested_draw_resolution_scale{0};
 
-// gpu_debug_skip_pixel_shaders, parsed when it changes.
-std::mutex g_skip_pixel_shaders_mutex;
-std::vector<uint64_t> g_skip_pixel_shaders;
-std::atomic<uint32_t> g_skip_pixel_shaders_generation{0};
-
-void ParseSkipPixelShaders(std::string_view text) {
-  std::vector<uint64_t> hashes;
+void SetDebugSkippedPixelShaders(std::string_view text) {
+  std::vector<rex::graphics::PixelShaderDrawOverride> overrides;
   size_t pos = 0;
   while (pos < text.size()) {
     size_t end = text.find_first_of(", ", pos);
@@ -90,35 +88,69 @@ void ParseSkipPixelShaders(std::string_view text) {
     }
     std::string token(text.substr(pos, end - pos));
     if (!token.empty()) {
-      hashes.push_back(std::strtoull(token.c_str(), nullptr, 16));
+      rex::graphics::PixelShaderDrawOverride& draw_override = overrides.emplace_back();
+      draw_override.ucode_hash = std::strtoull(token.c_str(), nullptr, 16);
+      draw_override.skip = true;
     }
     pos = end + 1;
   }
-  std::lock_guard lock(g_skip_pixel_shaders_mutex);
-  g_skip_pixel_shaders = std::move(hashes);
-  g_skip_pixel_shaders_generation.fetch_add(1, std::memory_order_release);
+  rex::graphics::SetPixelShaderDrawOverrides("gpu_debug_skip_pixel_shaders", std::move(overrides));
 }
 
-// Called on the command processor thread only.
-bool IsPixelShaderSkipped(uint64_t ucode_hash) {
-  static std::vector<uint64_t> skipped;
-  static uint32_t skipped_generation = UINT32_MAX;
-  uint32_t generation = g_skip_pixel_shaders_generation.load(std::memory_order_acquire);
-  if (generation != skipped_generation) {
-    std::lock_guard lock(g_skip_pixel_shaders_mutex);
-    skipped = g_skip_pixel_shaders;
-    skipped_generation = generation;
+// Replaces pixel shader float constants in the register file for one draw,
+// restoring them (and invalidating the uploaded constants) when destroyed.
+class PixelShaderConstantOverrideScope {
+ public:
+  PixelShaderConstantOverrideScope(uint32_t* register_values,
+                                   const rex::graphics::PixelShaderDrawOverride* draw_override,
+                                   bool& float_constants_up_to_date)
+      : register_values_(register_values),
+        float_constants_up_to_date_(float_constants_up_to_date) {
+    if (!draw_override) {
+      return;
+    }
+    for (const auto& constant : draw_override->constants) {
+      if (constant.index >= 256) {
+        continue;
+      }
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!(constant.component_mask & (1u << i))) {
+          continue;
+        }
+        uint32_t reg = XE_GPU_REG_SHADER_CONSTANT_256_X + constant.index * 4 + i;
+        saved_.emplace_back(reg, register_values_[reg]);
+        register_values_[reg] = std::bit_cast<uint32_t>(constant.value[i]);
+      }
+    }
+    if (!saved_.empty()) {
+      float_constants_up_to_date_ = false;
+    }
   }
-  return !skipped.empty() && std::find(skipped.begin(), skipped.end(), ucode_hash) != skipped.end();
-}
+  ~PixelShaderConstantOverrideScope() {
+    if (saved_.empty()) {
+      return;
+    }
+    for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+      register_values_[it->first] = it->second;
+    }
+    float_constants_up_to_date_ = false;
+  }
+  PixelShaderConstantOverrideScope(const PixelShaderConstantOverrideScope&) = delete;
+  PixelShaderConstantOverrideScope& operator=(const PixelShaderConstantOverrideScope&) = delete;
+
+ private:
+  uint32_t* register_values_;
+  bool& float_constants_up_to_date_;
+  std::vector<std::pair<uint32_t, uint32_t>> saved_;
+};
 
 void RegisterDrawResolutionScaleCallbacks() {
   static std::once_flag registered;
   std::call_once(registered, [] {
-    ParseSkipPixelShaders(REXCVAR_GET(gpu_debug_skip_pixel_shaders));
+    SetDebugSkippedPixelShaders(REXCVAR_GET(gpu_debug_skip_pixel_shaders));
     rex::cvar::RegisterChangeCallback(
         "gpu_debug_skip_pixel_shaders",
-        [](std::string_view, std::string_view value) { ParseSkipPixelShaders(value); });
+        [](std::string_view, std::string_view value) { SetDebugSkippedPixelShaders(value); });
     for (const char* name : {"draw_resolution_scale_x", "draw_resolution_scale_y",
                              "resolution_scale", "present_effect", "present_fsr_quality_mode"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
@@ -2516,13 +2548,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return true;
   }
   D3D12Shader* pixel_shader = nullptr;
+  const rex::graphics::PixelShaderDrawOverride* pixel_shader_draw_override = nullptr;
   if (is_rasterization_done) {
     // See xenos::EdramMode for explanation why the pixel shader is only used
     // when it's kColorDepth here.
     if (edram_mode == xenos::EdramMode::kColorDepth) {
       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
-      if (pixel_shader && IsPixelShaderSkipped(pixel_shader->ucode_data_hash())) {
-        return true;
+      if (pixel_shader) {
+        // App overrides, such as switching off a game's post-processing pass.
+        pixel_shader_draw_override =
+            rex::graphics::FindPixelShaderDrawOverride(pixel_shader->ucode_data_hash());
+        if (pixel_shader_draw_override && pixel_shader_draw_override->skip) {
+          return true;
+        }
       }
       if (pixel_shader) {
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
@@ -2541,6 +2579,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  PixelShaderConstantOverrideScope pixel_shader_constant_override(
+      register_file_->values, pixel_shader ? pixel_shader_draw_override : nullptr,
+      cbuffer_binding_float_pixel_.up_to_date);
 
   if (!BeginSubmission(true)) {
     return false;
