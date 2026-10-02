@@ -1042,6 +1042,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t system_temp_position_;
   // Special exports in vertex shaders.
   uint32_t system_temp_point_size_edge_flag_kill_vertex_;
+  // Interpolators in vertex shaders (one per used interpolator, in the output
+  // order), so copies of the position can follow the field of view scale in
+  // the end of the shader.
+  uint32_t system_temps_interpolators_;
   // ROV only - 4 persistent VGPRs when writing to color targets, 2 VGPRs when
   // not:
   // X - Bit masks:

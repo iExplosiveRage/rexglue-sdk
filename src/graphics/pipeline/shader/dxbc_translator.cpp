@@ -427,11 +427,7 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
              dxbc::Src::LF(0.0f));
   }
 
-  // Zero the interpolators.
-  uint32_t interpolator_count = rex::bit_count(GetModificationInterpolatorMask());
-  for (uint32_t i = 0; i < interpolator_count; ++i) {
-    a_.OpMov(dxbc::Dest::O(out_reg_vs_interpolators_ + i), dxbc::Src::LF(0.0f));
-  }
+  // The interpolators are zeroed when their temporary registers are allocated.
 
   // Remember that x# are only accessible via mov load or store - use a
   // temporary variable if need to do any computations!
@@ -826,6 +822,11 @@ void DxbcShaderTranslator::StartTranslation() {
     // override it.
     a_.OpMov(dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
              dxbc::Src::LF(-1.0f));
+    // Zeroed, like the outputs were before, as the guest code may not write
+    // all of them.
+    system_temps_interpolators_ = interpolator_register_count
+                                      ? PushSystemTemp(0b1111, interpolator_register_count)
+                                      : UINT32_MAX;
   } else if (is_pixel_shader()) {
     if (edram_rov_used_) {
       // Will be initialized unconditionally.
@@ -921,6 +922,44 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
 
   dxbc::Src flags_src(LoadFlagsSystemConstant());
 
+  // Field of view option (see the position scaling below). Effects working in
+  // screen space, like soft particles fading against the scene depth, may pass
+  // a copy of the position to the pixel shader to locate the pixel in the
+  // scene textures - scale X and Y of such copies too, so they still point at
+  // the same place. Compared while the position is still exactly what the
+  // guest exported (before the W and XY/W conversions).
+  dxbc::Src scene_projection_scale_src(
+      LoadSystemConstant(SystemConstants::Index::kSceneProjectionScale,
+                         offsetof(SystemConstants, scene_projection_scale), dxbc::Src::kXXXX));
+  uint32_t interpolator_count = rex::bit_count(GetModificationInterpolatorMask());
+  if (interpolator_count) {
+    a_.OpNE(temp_x_dest, scene_projection_scale_src, dxbc::Src::LF(1.0f));
+    a_.OpIf(true, temp_x_src);
+    // The same condition as for the position.
+    a_.OpNE(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
+            dxbc::Src::LF(1.0f));
+    a_.OpLT(dxbc::Dest::R(temp, 0b0010), scene_projection_scale_src, dxbc::Src::LF(0.0f));
+    a_.OpOr(temp_x_dest, temp_x_src, dxbc::Src::R(temp, dxbc::Src::kYYYY));
+    a_.OpIf(true, temp_x_src);
+    // YZW of the comparison = X, Y and W.
+    constexpr uint32_t kSwizzleXXYW = 0b11010000;
+    for (uint32_t i = 0; i < interpolator_count; ++i) {
+      uint32_t interpolator_temp = system_temps_interpolators_ + i;
+      a_.OpEq(dxbc::Dest::R(temp, 0b1110), dxbc::Src::R(interpolator_temp, kSwizzleXXYW),
+              dxbc::Src::R(system_temp_position_, kSwizzleXXYW));
+      a_.OpAnd(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
+               dxbc::Src::R(temp, dxbc::Src::kZZZZ));
+      a_.OpAnd(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
+               dxbc::Src::R(temp, dxbc::Src::kWWWW));
+      a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kYYYY));
+      a_.OpMul(dxbc::Dest::R(interpolator_temp, 0b0011), dxbc::Src::R(interpolator_temp),
+               scene_projection_scale_src.Abs());
+      a_.OpEndIf();
+    }
+    a_.OpEndIf();
+    a_.OpEndIf();
+  }
+
   // Check if the shader already returns W, not 1/W, and if it doesn't, turn 1/W
   // into W. Using div rather than relaxed-precision rcp for safety.
   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_WNotReciprocal));
@@ -969,9 +1008,6 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
   // their place - or of every vertex when the scale is negative, for scene
   // effects drawn as screen-space sprites. The command processor passes 1
   // when it's off.
-  dxbc::Src scene_projection_scale_src(
-      LoadSystemConstant(SystemConstants::Index::kSceneProjectionScale,
-                         offsetof(SystemConstants, scene_projection_scale), dxbc::Src::kXXXX));
   a_.OpNE(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
           dxbc::Src::LF(1.0f));
   a_.OpLT(dxbc::Dest::R(temp, 0b0010), scene_projection_scale_src, dxbc::Src::LF(0.0f));
@@ -1025,7 +1061,11 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
     }
   }
 
-  // Write the position to the output.
+  // Write the interpolators and the position to the outputs.
+  for (uint32_t i = 0; i < interpolator_count; ++i) {
+    a_.OpMov(dxbc::Dest::O(out_reg_vs_interpolators_ + i),
+             dxbc::Src::R(system_temps_interpolators_ + i));
+  }
   a_.OpMov(dxbc::Dest::O(out_reg_vs_position_), dxbc::Src::R(system_temp_position_));
 
   // Write the point size.
@@ -1087,9 +1127,10 @@ void DxbcShaderTranslator::CompleteShaderCode() {
   a_.OpRet();
 
   if (is_vertex_shader()) {
-    // Release system_temp_position_ and
-    // system_temp_point_size_edge_flag_kill_vertex_.
-    PopSystemTemp(2);
+    // Release system_temp_position_,
+    // system_temp_point_size_edge_flag_kill_vertex_ and
+    // system_temps_interpolators_.
+    PopSystemTemp(2 + rex::bit_count(GetModificationInterpolatorMask()));
   } else if (is_pixel_shader()) {
     // Release system_temps_color_.
     uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
@@ -1422,7 +1463,7 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
       uint32_t interpolator_mask = GetModificationInterpolatorMask();
       uint32_t interpolator_bit = UINT32_C(1) << result.storage_index;
       if (interpolator_mask & interpolator_bit) {
-        dest = dxbc::Dest::O(out_reg_vs_interpolators_ +
+        dest = dxbc::Dest::R(system_temps_interpolators_ +
                              rex::bit_count(interpolator_mask & (interpolator_bit - 1)));
       }
     } break;
