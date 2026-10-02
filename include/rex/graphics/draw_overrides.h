@@ -39,4 +39,11 @@ void SetPixelShaderDrawOverrides(std::string_view owner,
 // nullptr. The pointer stays valid until the next call on the same thread.
 const PixelShaderDrawOverride* FindPixelShaderDrawOverride(uint64_t ucode_hash);
 
+// Field of view of the 3D scene: the projected X and Y of depth-tested draws
+// into the main (frontbuffer-wide) render target are multiplied by this,
+// around the center of the screen. 1 = unchanged, below 1 = wider view (like
+// a larger FOV), above 1 = zoomed in. Thread-safe.
+void SetSceneProjectionScale(float scale);
+float GetSceneProjectionScale();
+
 }  // namespace rex::graphics

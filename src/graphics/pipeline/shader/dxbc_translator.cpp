@@ -964,6 +964,18 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
     ++ucp_clip_cull_distance_next_component_ref;
   }
 
+  // Field of view option: scale XY of perspective vertices only (W != 1), so
+  // 2D (HUD, full-screen passes) and orthographic (shadow map) geometry keep
+  // their place. The command processor passes 1 when it's off.
+  a_.OpNE(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
+          dxbc::Src::LF(1.0f));
+  a_.OpIf(true, temp_x_src);
+  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0011), dxbc::Src::R(system_temp_position_),
+           LoadSystemConstant(SystemConstants::Index::kSceneProjectionScale,
+                              offsetof(SystemConstants, scene_projection_scale),
+                              dxbc::Src::kXXXX));
+  a_.OpEndIf();
+
   // Apply scale for guest to host viewport and clip space conversion. Also, if
   // the vertex shader is multipass, the NDC scale constant can be used to set
   // position to NaN to kill all primitives.
@@ -1961,8 +1973,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
 
     {"xe_alpha_to_mask", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
     {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t),
-     sizeof(uint32_t)},
+    {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+    {"xe_scene_projection_scale", ShaderRdefTypeIndex::kFloat, sizeof(float)},
 
     {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 

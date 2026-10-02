@@ -318,7 +318,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
     uint32_t alpha_to_mask;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    uint32_t padding_edram_depth_base_dwords_scaled;
+    // Multiplier for the clip space XY of perspective vertices (W != 1), for a
+    // field of view option. 1 = unchanged.
+    float scene_projection_scale;
 
     float color_exp_bias[4];
 
@@ -420,6 +422,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kAlphaToMask,
       kEdram32bppTilePitchDwordsScaled,
       kEdramDepthBaseDwordsScaled,
+      kSceneProjectionScale,
 
       kColorExpBias,
 

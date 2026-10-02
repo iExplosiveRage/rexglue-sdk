@@ -54,6 +54,9 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
+                     "Log the state of every draw for this many frames (counts down)");
+
 REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
                       "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
                       "names) whose draws are skipped, for finding which effect draws something");
@@ -2498,6 +2501,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // Between frames and outside the presenter's refresh, apply a draw
   // resolution scale changed in the settings.
   UpdateDrawResolutionScaleFromSettings();
+
+  const int32_t log_draw_frames = REXCVAR_GET(gpu_debug_log_draws);
+  if (log_draw_frames > 0) {
+    REXGPU_INFO("DRAW ---- end of frame");
+    rex::cvar::SetFlagByName("gpu_debug_log_draws", std::to_string(log_draw_frames - 1));
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -2708,6 +2717,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
   }
+
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    REXGPU_INFO(
+        "DRAW vs={:016X} ps={:016X} pitch={} msaa={} z={}/{}/{} vte={:08X} clip={:08X} "
+        "vport=({} {} {} {} {} {}) prim={} idx={}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+        uint32_t(normalized_depth_control.z_enable),
+        uint32_t(normalized_depth_control.z_write_enable),
+        uint32_t(normalized_depth_control.zfunc), regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+        regs[XE_GPU_REG_PA_CL_CLIP_CNTL], regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET), uint32_t(primitive_type), index_count);
+  }
+
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
@@ -4038,6 +4066,23 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
+
+  // Field of view option for the main 3D scene: depth-tested draws (the HUD
+  // is drawn with an always-passing depth test) into the frontbuffer-wide
+  // render target. The vertex shader applies it to perspective vertices only,
+  // which leaves 2D and orthographic geometry alone.
+  float scene_projection_scale = 1.0f;
+  const float requested_scene_projection_scale = rex::graphics::GetSceneProjectionScale();
+  if (requested_scene_projection_scale != 1.0f && normalized_depth_control.z_enable &&
+      normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (frontbuffer_width &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      scene_projection_scale = requested_scene_projection_scale;
+    }
+  }
+  dirty |= system_constants_.scene_projection_scale != scene_projection_scale;
+  system_constants_.scene_projection_scale = scene_projection_scale;
 
   // Point size.
   if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {

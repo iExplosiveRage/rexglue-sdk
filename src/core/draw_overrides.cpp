@@ -16,6 +16,7 @@
 namespace rex::graphics {
 
 namespace {
+std::atomic<float> g_scene_projection_scale{1.0f};
 std::mutex g_overrides_mutex;
 std::map<std::string, std::vector<PixelShaderDrawOverride>> g_overrides_by_owner;
 std::atomic<uint32_t> g_overrides_generation{0};
@@ -53,6 +54,14 @@ const PixelShaderDrawOverride* FindPixelShaderDrawOverride(uint64_t ucode_hash) 
     }
   }
   return nullptr;
+}
+
+void SetSceneProjectionScale(float scale) {
+  g_scene_projection_scale.store(scale, std::memory_order_relaxed);
+}
+
+float GetSceneProjectionScale() {
+  return g_scene_projection_scale.load(std::memory_order_relaxed);
 }
 
 }  // namespace rex::graphics
