@@ -367,6 +367,9 @@ class Presenter {
   }
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
+  // Re-reads the present_* cvars (effect, FSR / CAS settings, dither) so they
+  // can be changed while the game is running.
+  void RefreshGuestOutputPaintConfigFromCvarsFromUIThread();
 
   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);

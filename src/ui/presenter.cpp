@@ -40,50 +40,47 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
+// The present_* settings only change how the finished guest frame is scaled to
+// the window, so they apply live (the app re-reads them through
+// Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread). They don't
+// change the resolution the game renders at - that's draw_resolution_scale.
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax);
 
 REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
                      "UI/Presenter", "Maximum chained FSR EASU passes")
-    .range(1, int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax))
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(1, int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax));
 
 REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax);
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
-    "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
-    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    "fsr2/fsr3 only: auto, nativeaa, quality, balanced, performance, ultra_performance. "
+    "Does not change the game's render resolution (use draw_resolution_scale for that)")
+    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear"});
 #endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
-                    "Enable output dithering in the final present pass")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Enable output dithering in the final present pass");
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
-                    "Allow overscan cutoff based on safe area settings")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Allow overscan cutoff based on safe area settings");
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
@@ -659,7 +656,18 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
+  if (guest_output_paint_config_.GetAllowOverscanCutoff() != new_config.GetAllowOverscanCutoff()) {
+    modified = true;
+    request_repaint = true;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
+  if (guest_output_paint_config_.GetFsrMaxUpsamplingPasses() !=
+      new_config.GetFsrMaxUpsamplingPasses()) {
+    modified = true;
+    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
+      request_repaint = true;
+    }
+  }
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
     modified = true;
@@ -711,6 +719,14 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       }
     }
   }
+}
+
+void Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread() {
+  GuestOutputPaintConfig new_config = BuildGuestOutputPaintConfigFromCVar();
+  if (new_config.GetEffect() != guest_output_paint_config_.GetEffect()) {
+    REXLOG_INFO("Presenter: output effect changed to {}", REXCVAR_GET(present_effect));
+  }
+  SetGuestOutputPaintConfigFromUIThread(new_config);
 }
 
 void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {

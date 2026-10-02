@@ -397,6 +397,24 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
+
+    // Presentation effects (FSR, CAS, dither) apply live. Deferred so the
+    // presenter isn't touched from inside the cvar change (which the settings
+    // overlay makes in the middle of a UI paint).
+    for (const char* name :
+         {"present_effect", "present_cas_additional_sharpness", "present_fsr_max_upsampling_passes",
+          "present_fsr_sharpness_reduction", "present_fsr_quality_mode", "present_dither",
+          "present_allow_overscan_cutoff"}) {
+      // config_.graphics is handed over to the runtime during setup.
+      rex::cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
+        app_context().CallInUIThreadDeferred([this] {
+          auto* graphics = runtime_ ? runtime_->graphics_system() : config_.graphics.get();
+          if (graphics && graphics->presenter()) {
+            graphics->presenter()->RefreshGuestOutputPaintConfigFromCvarsFromUIThread();
+          }
+        });
+      });
+    }
   } else if (!graphics_system) {
     // Detached mode: the app brings its own renderer and drives its own paint
     // loop. ReXApp owns the returned drawer via immediate_drawer_.
