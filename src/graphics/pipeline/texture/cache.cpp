@@ -69,23 +69,22 @@ REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
     .range(-1, 5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// The draw resolution scale applies live on D3D12 (the command processor
+// recreates the scaled caches between frames); Vulkan needs a restart.
 REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU",
                      "Draw resolution scale X (1 = no scaling). With present_effect fsr/fsr2/fsr3 "
                      "and a present_fsr_quality_mode this is the target, and the game renders lower")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(1, 8);
 
 REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU",
                      "Draw resolution scale Y (1 = no scaling). With present_effect fsr/fsr2/fsr3 "
                      "and a present_fsr_quality_mode this is the target, and the game renders lower")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(1, 8);
 
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "Draw resolution scale for both X and Y axes (same as setting "
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(1, 8);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");

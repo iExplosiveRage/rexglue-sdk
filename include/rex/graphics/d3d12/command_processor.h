@@ -417,6 +417,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteEdramBindlessDescriptors();
+
+  // Live draw resolution scale changes (draw_resolution_scale_* or the FSR
+  // quality mode changed in the settings): the scale-dependent caches are
+  // recreated at the end of a frame, once the GPU is idle.
+  void UpdateDrawResolutionScaleFromSettings();
+  bool RecreateDrawResolutionScaledCaches(uint32_t scale_x, uint32_t scale_y);
+  // How long a requested scale must stay unchanged before it's applied, so
+  // stepping through values in the settings doesn't rebuild every step.
+  static constexpr uint64_t kDrawResolutionScaleSettleMs = 400;
+  uint32_t pending_draw_resolution_scale_ = 0;  // x | (y << 16), 0 = none.
+  uint64_t pending_draw_resolution_scale_time_ms_ = 0;
+  // For reloading the pipeline storage into a recreated pipeline cache.
+  std::filesystem::path shader_storage_cache_root_;
+  uint32_t shader_storage_title_id_ = 0;
 
   bool device_removed_ = false;
 

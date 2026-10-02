@@ -37,9 +37,9 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 
 // The present_* settings change how the finished guest frame is scaled to the
 // window, so they apply live (the app re-reads them through
-// Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread). The one
-// exception is the render resolution picked by present_fsr_quality_mode, which
-// the GPU backend sets up at startup (TextureCache::GetConfigDrawResolutionScale).
+// Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread). The render
+// resolution picked by present_fsr_quality_mode is applied by the GPU backend
+// (TextureCache::GetConfigDrawResolutionScale) - live on D3D12.
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
@@ -68,8 +68,7 @@ REXCVAR_DEFINE_STRING(
     "draw_resolution_scale, quality/balanced/performance/ultra_performance render below it and "
     "upscale. Only whole scales exist: at 3x, quality/balanced/performance = 2x, "
     "ultra_performance = 1x")
-    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
     .allowed({"bilinear"});

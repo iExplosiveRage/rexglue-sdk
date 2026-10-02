@@ -10,15 +10,19 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -59,6 +63,30 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
 }  // namespace shaders
+
+namespace {
+
+// Draw resolution scale the settings currently ask for (x | (y << 16)), set by
+// cvar change callbacks on any thread and taken by the command processor at
+// the end of a frame. 0 = no change requested.
+std::atomic<uint32_t> g_requested_draw_resolution_scale{0};
+
+void RegisterDrawResolutionScaleCallbacks() {
+  static std::once_flag registered;
+  std::call_once(registered, [] {
+    for (const char* name : {"draw_resolution_scale_x", "draw_resolution_scale_y",
+                             "resolution_scale", "present_effect", "present_fsr_quality_mode"}) {
+      rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
+        uint32_t scale_x, scale_y;
+        TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
+        g_requested_draw_resolution_scale.store(scale_x | (scale_y << 16),
+                                                std::memory_order_release);
+      });
+    }
+  });
+}
+
+}  // namespace
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
@@ -148,6 +176,130 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+  shader_storage_cache_root_ = cache_root;
+  shader_storage_title_id_ = title_id;
+}
+
+void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
+  uint32_t requested = g_requested_draw_resolution_scale.exchange(0, std::memory_order_acquire);
+  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+  if (requested) {
+    pending_draw_resolution_scale_ = requested;
+    pending_draw_resolution_scale_time_ms_ = now_ms;
+  }
+  if (!pending_draw_resolution_scale_ ||
+      now_ms - pending_draw_resolution_scale_time_ms_ < kDrawResolutionScaleSettleMs) {
+    return;
+  }
+  uint32_t scale_x = pending_draw_resolution_scale_ & 0xFFFF;
+  uint32_t scale_y = pending_draw_resolution_scale_ >> 16;
+  D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(scale_x, scale_y, GetD3D12Provider());
+  if (scale_x == texture_cache_->draw_resolution_scale_x() &&
+      scale_y == texture_cache_->draw_resolution_scale_y()) {
+    pending_draw_resolution_scale_ = 0;
+    return;
+  }
+  // Nothing may still be using the caches that are about to be destroyed.
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  pending_draw_resolution_scale_ = 0;
+  RecreateDrawResolutionScaledCaches(scale_x, scale_y);
+}
+
+bool D3D12CommandProcessor::RecreateDrawResolutionScaledCaches(uint32_t scale_x,
+                                                               uint32_t scale_y) {
+  const uint32_t old_scale_x = texture_cache_->draw_resolution_scale_x();
+  const uint32_t old_scale_y = texture_cache_->draw_resolution_scale_y();
+  REXGPU_INFO("Changing the draw resolution scale from {}x{} to {}x{}", old_scale_x, old_scale_y,
+              scale_x, scale_y);
+
+  // Called between frames with the GPU idle. Only the render target cache,
+  // the texture cache (scaled resolve memory) and the pipeline cache (shaders
+  // are translated for the scale) depend on it, and the per-submission and
+  // per-frame binding state is reset when the next frame opens. The one thing
+  // kept across frames is the active shaders - the guest only loads shaders
+  // when they change - so their microcode (stored in host byte order) is moved
+  // into the new pipeline cache.
+  auto save_guest_ucode = [](const Shader* shader) {
+    std::vector<uint32_t> ucode;
+    if (shader) {
+      ucode.resize(shader->ucode_dword_count());
+      memory::copy_and_swap(ucode.data(), shader->ucode_dwords(), ucode.size());
+    }
+    return ucode;
+  };
+  const bool had_vertex_shader = active_vertex_shader_ != nullptr;
+  const bool had_pixel_shader = active_pixel_shader_ != nullptr;
+  const std::vector<uint32_t> vertex_shader_ucode = save_guest_ucode(active_vertex_shader_);
+  const std::vector<uint32_t> pixel_shader_ucode = save_guest_ucode(active_pixel_shader_);
+  active_vertex_shader_ = nullptr;
+  active_pixel_shader_ = nullptr;
+
+  // The pipeline cache uses the render target cache, so it goes first.
+  pipeline_cache_.reset();
+  texture_cache_.reset();
+  render_target_cache_.reset();
+
+  auto create = [this](uint32_t x, uint32_t y) -> bool {
+    render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
+        *register_file_, *memory_, x, y, *this, bindless_resources_used_);
+    if (!render_target_cache_->Initialize()) {
+      REXGPU_ERROR("Failed to initialize the render target cache");
+      return false;
+    }
+    texture_cache_ = D3D12TextureCache::Create(*register_file_, *shared_memory_, x, y, *this,
+                                               bindless_resources_used_);
+    if (!texture_cache_) {
+      REXGPU_ERROR("Failed to initialize the texture cache");
+      return false;
+    }
+    pipeline_cache_ = std::make_unique<PipelineCache>(*this, *register_file_,
+                                                      *render_target_cache_.get(),
+                                                      bindless_resources_used_);
+    if (!pipeline_cache_->Initialize()) {
+      REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
+      return false;
+    }
+    return true;
+  };
+  bool created = create(scale_x, scale_y);
+  if (!created) {
+    REXGPU_ERROR("Going back to the draw resolution scale {}x{}", old_scale_x, old_scale_y);
+    pipeline_cache_.reset();
+    texture_cache_.reset();
+    render_target_cache_.reset();
+    if (!create(old_scale_x, old_scale_y)) {
+      REXGPU_ERROR("Failed to restore the draw resolution scale, stopping GPU emulation");
+      device_removed_ = true;
+      return false;
+    }
+  }
+
+  if (bindless_resources_used_) {
+    WriteEdramBindlessDescriptors();
+  }
+  // Recreate the known pipelines now instead of while drawing.
+  if (!shader_storage_cache_root_.empty()) {
+    pipeline_cache_->InitializeShaderStorage(shader_storage_cache_root_, shader_storage_title_id_,
+                                             true);
+  }
+  if (had_vertex_shader) {
+    active_vertex_shader_ =
+        pipeline_cache_->LoadShader(xenos::ShaderType::kVertex, vertex_shader_ucode.data(),
+                                    uint32_t(vertex_shader_ucode.size()));
+  }
+  if (had_pixel_shader) {
+    active_pixel_shader_ =
+        pipeline_cache_->LoadShader(xenos::ShaderType::kPixel, pixel_shader_ucode.data(),
+                                    uint32_t(pixel_shader_ucode.size()));
+  }
+  // Show what is actually used (it may have been clamped or restored).
+  const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+  rex::perf::SetDrawResolutionScale(texture_cache_->draw_resolution_scale_x(),
+                                    texture_cache_->draw_resolution_scale_y(),
+                                    render_info.requested_scale_x, render_info.requested_scale_y);
+  return created;
 }
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
@@ -1572,42 +1724,8 @@ bool D3D12CommandProcessor::SetupContext() {
             view_bindless_heap_cpu_start_,
             uint32_t(SystemBindlessView::kSharedMemoryR32G32B32A32UintUAV)),
         4);
-    // kEdramRawSRV.
-    render_target_cache_->WriteEdramRawSRVDescriptor(provider.OffsetViewDescriptor(
-        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawSRV)));
-    // kEdramR32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32UintSRV)),
-        2);
-    // kEdramR32G32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32UintSRV)),
-        3);
-    // kEdramR32G32B32A32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32B32A32UintSRV)),
-        4);
-    // kEdramRawUAV.
-    render_target_cache_->WriteEdramRawUAVDescriptor(provider.OffsetViewDescriptor(
-        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawUAV)));
-    // kEdramR32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32UintUAV)),
-        2);
-    // kEdramR32G32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32UintUAV)),
-        3);
-    // kEdramR32G32B32A32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32B32A32UintUAV)),
-        4);
+    // kEdram*.
+    WriteEdramBindlessDescriptors();
     // kGammaRampTableSRV.
     WriteGammaRampSRV(
         false, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
@@ -1623,7 +1741,52 @@ bool D3D12CommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // The caches above were just created for the current settings.
+  g_requested_draw_resolution_scale.store(0, std::memory_order_relaxed);
+  pending_draw_resolution_scale_ = 0;
+  RegisterDrawResolutionScaleCallbacks();
+
   return true;
+}
+
+void D3D12CommandProcessor::WriteEdramBindlessDescriptors() {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  // kEdramRawSRV.
+  render_target_cache_->WriteEdramRawSRVDescriptor(provider.OffsetViewDescriptor(
+      view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawSRV)));
+  // kEdramR32UintSRV.
+  render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32UintSRV)),
+      2);
+  // kEdramR32G32UintSRV.
+  render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32G32UintSRV)),
+      3);
+  // kEdramR32G32B32A32UintSRV.
+  render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32G32B32A32UintSRV)),
+      4);
+  // kEdramRawUAV.
+  render_target_cache_->WriteEdramRawUAVDescriptor(provider.OffsetViewDescriptor(
+      view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawUAV)));
+  // kEdramR32UintUAV.
+  render_target_cache_->WriteEdramUintPow2UAVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32UintUAV)),
+      2);
+  // kEdramR32G32UintUAV.
+  render_target_cache_->WriteEdramUintPow2UAVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32G32UintUAV)),
+      3);
+  // kEdramR32G32B32A32UintUAV.
+  render_target_cache_->WriteEdramUintPow2UAVDescriptor(
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kEdramR32G32B32A32UintUAV)),
+      4);
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
@@ -2254,6 +2417,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  // Between frames and outside the presenter's refresh, apply a draw
+  // resolution scale changed in the settings.
+  UpdateDrawResolutionScaleFromSettings();
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
