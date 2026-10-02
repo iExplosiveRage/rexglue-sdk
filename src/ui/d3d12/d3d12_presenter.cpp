@@ -83,6 +83,11 @@ bool D3D12Presenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32
       temporal_upscaler_max_render_height_ != render_height ||
       temporal_upscaler_max_output_width_ != output_width ||
       temporal_upscaler_max_output_height_ != output_height) {
+    // Paints still in flight use the upscaler's resources - releasing them
+    // earlier hangs the GPU (DEVICE_HUNG).
+    if (temporal_upscaler_context_) {
+      paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
+    }
     DestroyTemporalUpscalerContext();
 
     ffxCreateContextDescUpscale create_desc = {};
@@ -141,7 +146,11 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
       !output_width || !output_height) {
     return false;
   }
-  if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+  // The render size changes with the draw resolution scale, which can change
+  // live. The input is never bigger than the output (GetGuestOutputPaintFlow),
+  // so a context sized for the output covers every render size and is only
+  // recreated when the window size changes.
+  if (!EnsureTemporalUpscalerContext(output_width, output_height, output_width, output_height)) {
     return false;
   }
 
