@@ -959,6 +959,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  rex::perf::RecordGuestFrontbuffer(frontbuffer_width, frontbuffer_height);
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 

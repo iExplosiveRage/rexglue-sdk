@@ -30,7 +30,7 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
 #else
-  ImGui::SetNextWindowSize(ImVec2(220, 75), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(240, 110), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
@@ -51,6 +51,18 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::Text("Game: %.1f FPS (%.2f ms)", guest_fps_,
                 guest_fps_ > 0.0 ? 1000.0 / guest_fps_ : 0.0);
     ImGui::Text("Display: %.0f FPS", io.Framerate);
+
+    // Resolution the game renders at; lower than the configured scale when an
+    // FSR quality mode upscales.
+    const rex::perf::RenderInfo render = rex::perf::GetRenderInfo();
+    if (render.scale_x && render.frontbuffer_width) {
+      ImGui::Text("Render: %ux%u (%ux)", render.frontbuffer_width * render.scale_x,
+                  render.frontbuffer_height * render.scale_y, render.scale_x);
+      if (render.scale_x != render.requested_scale_x ||
+          render.scale_y != render.requested_scale_y) {
+        ImGui::Text("FSR upscale from %ux to %ux", render.scale_x, render.requested_scale_x);
+      }
+    }
 
     if (stats_provider_) {
       auto stats = stats_provider_();

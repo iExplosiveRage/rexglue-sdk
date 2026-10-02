@@ -10,7 +10,10 @@
  */
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <string>
 #include <utility>
 
 #include <rex/assert.h>
@@ -27,6 +30,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_rate.h>
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
@@ -65,11 +69,15 @@ REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
     .range(-1, 5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU",
+                     "Draw resolution scale X (1 = no scaling). With present_effect fsr/fsr2/fsr3 "
+                     "and a present_fsr_quality_mode this is the target, and the game renders lower")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU",
+                     "Draw resolution scale Y (1 = no scaling). With present_effect fsr/fsr2/fsr3 "
+                     "and a present_fsr_quality_mode this is the target, and the game renders lower")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -261,6 +269,51 @@ TextureCache::~TextureCache() {
   }
 }
 
+namespace {
+
+std::string LowercaseFlag(std::string_view name) {
+  std::string value = rex::cvar::GetFlagByName(name);
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return char(std::tolower(c)); });
+  return value;
+}
+
+// Like the render resolution option of a PC game: with an upscaling
+// present_effect and a present_fsr_quality_mode, the configured scale is the
+// target and the game renders below it, then the presenter upscales the frame
+// to the window. Only whole scales exist, so the mode picks the closest one
+// (at 3x: quality / balanced / performance -> 2x, ultra_performance -> 1x).
+uint32_t GetUpscalerRenderScale(uint32_t target_scale, const std::string& effect,
+                                const std::string& mode) {
+  if (effect != "fsr" && effect != "fsr2" && effect != "fsr3") {
+    return target_scale;
+  }
+  float ratio;
+  if (mode == "quality") {
+    ratio = 1.5f;
+  } else if (mode == "balanced") {
+    ratio = 1.7f;
+  } else if (mode == "performance") {
+    ratio = 2.0f;
+  } else if (mode == "ultra_performance" || mode == "ultra") {
+    ratio = 3.0f;
+  } else {
+    return target_scale;  // auto / nativeaa: render at the target
+  }
+  uint32_t best_scale = target_scale;
+  float best_error = 0.0f;
+  for (uint32_t scale = target_scale; scale >= 1; --scale) {
+    float error = std::abs(std::log(float(target_scale) / float(scale) / ratio));
+    if (scale == target_scale || error < best_error) {
+      best_scale = scale;
+      best_error = error;
+    }
+  }
+  return best_scale;
+}
+
+}  // namespace
+
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
   uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
   bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
@@ -272,8 +325,17 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
                           : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
   uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
   uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
-  x_out = clamped_x;
-  y_out = clamped_y;
+
+  // The presenter cvars live in rexruntime, so they're read by name.
+  const std::string effect = LowercaseFlag("present_effect");
+  const std::string mode = LowercaseFlag("present_fsr_quality_mode");
+  x_out = GetUpscalerRenderScale(clamped_x, effect, mode);
+  y_out = GetUpscalerRenderScale(clamped_y, effect, mode);
+  if (x_out != clamped_x || y_out != clamped_y) {
+    REXLOG_INFO("{} {}: rendering at {}x{} scale, upscaled towards {}x{}", effect, mode, x_out,
+                y_out, clamped_x, clamped_y);
+  }
+  rex::perf::SetDrawResolutionScale(x_out, y_out, clamped_x, clamped_y);
   return clamped_x == config_x && clamped_y == config_y;
 }
 

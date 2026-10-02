@@ -17,4 +17,21 @@ void RecordGuestSwap();
 // Total guest swaps since startup.
 uint64_t GetGuestSwapCount();
 
+// Guest frontbuffer size (before resolution scaling) of the latest swap.
+void RecordGuestFrontbuffer(uint32_t width, uint32_t height);
+
+// Draw resolution scale the GPU backend renders with, and the one the config
+// asked for (higher when an upscaler quality mode renders below it).
+void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32_t requested_y);
+
+struct RenderInfo {
+  uint32_t frontbuffer_width = 0;
+  uint32_t frontbuffer_height = 0;
+  uint32_t scale_x = 0;
+  uint32_t scale_y = 0;
+  uint32_t requested_scale_x = 0;
+  uint32_t requested_scale_y = 0;
+};
+RenderInfo GetRenderInfo();
+
 }  // namespace rex::perf

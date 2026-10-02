@@ -21,11 +21,6 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-#include <ffx_api/ffx_api.h>
-#include <ffx_api/ffx_upscale.h>
-#endif
-
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
@@ -40,10 +35,11 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
-// The present_* settings only change how the finished guest frame is scaled to
-// the window, so they apply live (the app re-reads them through
-// Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread). They don't
-// change the resolution the game renders at - that's draw_resolution_scale.
+// The present_* settings change how the finished guest frame is scaled to the
+// window, so they apply live (the app re-reads them through
+// Presenter::RefreshGuestOutputPaintConfigFromCvarsFromUIThread). The one
+// exception is the render resolution picked by present_fsr_quality_mode, which
+// the GPU backend sets up at startup (TextureCache::GetConfigDrawResolutionScale).
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
@@ -68,9 +64,12 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
-    "fsr2/fsr3 only: auto, nativeaa, quality, balanced, performance, ultra_performance. "
-    "Does not change the game's render resolution (use draw_resolution_scale for that)")
-    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
+    "Render resolution for fsr/fsr2/fsr3 (like a PC game): auto/nativeaa render at "
+    "draw_resolution_scale, quality/balanced/performance/ultra_performance render below it and "
+    "upscale. Only whole scales exist: at 3x, quality/balanced/performance = 2x, "
+    "ultra_performance = 1x")
+    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
     .allowed({"bilinear"});
@@ -136,99 +135,6 @@ GuestOutputPaintConfig::FsrQualityMode ParsePresentFsrQualityMode(const std::str
   return GuestOutputPaintConfig::FsrQualityMode::kAuto;
 }
 
-bool GetFsrQualityModeApiValue(GuestOutputPaintConfig::FsrQualityMode mode,
-                               uint32_t& api_mode_out) {
-  switch (mode) {
-    case GuestOutputPaintConfig::FsrQualityMode::kAuto:
-      return false;
-    case GuestOutputPaintConfig::FsrQualityMode::kNativeAa:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_NATIVEAA;
-#else
-      api_mode_out = 0;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kQuality:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_QUALITY;
-#else
-      api_mode_out = 1;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kBalanced:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_BALANCED;
-#else
-      api_mode_out = 2;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kPerformance:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
-#else
-      api_mode_out = 3;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kUltraPerformance:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE;
-#else
-      api_mode_out = 4;
-#endif
-      return true;
-  }
-  return false;
-}
-
-float GetFsrQualityModeRatioFallback(GuestOutputPaintConfig::FsrQualityMode mode) {
-  switch (mode) {
-    case GuestOutputPaintConfig::FsrQualityMode::kNativeAa:
-      return 1.0f;
-    case GuestOutputPaintConfig::FsrQualityMode::kQuality:
-      return 1.5f;
-    case GuestOutputPaintConfig::FsrQualityMode::kBalanced:
-      return 1.7f;
-    case GuestOutputPaintConfig::FsrQualityMode::kPerformance:
-      return 2.0f;
-    case GuestOutputPaintConfig::FsrQualityMode::kUltraPerformance:
-      return 3.0f;
-    case GuestOutputPaintConfig::FsrQualityMode::kAuto:
-    default:
-      return 1.0f;
-  }
-}
-
-bool QueryTemporalFsrRenderResolutionFromQualityMode(uint32_t display_width,
-                                                     uint32_t display_height,
-                                                     GuestOutputPaintConfig::FsrQualityMode mode,
-                                                     uint32_t& render_width_out,
-                                                     uint32_t& render_height_out) {
-  uint32_t api_mode = 0;
-  if (!GetFsrQualityModeApiValue(mode, api_mode)) {
-    return false;
-  }
-
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  ffxQueryDescUpscaleGetRenderResolutionFromQualityMode query_desc = {};
-  query_desc.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE;
-  query_desc.header.pNext = nullptr;
-  query_desc.displayWidth = display_width;
-  query_desc.displayHeight = display_height;
-  query_desc.qualityMode = api_mode;
-  query_desc.pOutRenderWidth = &render_width_out;
-  query_desc.pOutRenderHeight = &render_height_out;
-  if (ffxQuery(nullptr, &query_desc.header) == FFX_API_RETURN_OK && render_width_out &&
-      render_height_out) {
-    return true;
-  }
-#endif
-
-  float ratio = GetFsrQualityModeRatioFallback(mode);
-  render_width_out = std::max(uint32_t(1), uint32_t(float(display_width) / ratio + 0.5f));
-  render_height_out = std::max(uint32_t(1), uint32_t(float(display_height) / ratio + 0.5f));
-  return true;
-}
-
 void LogTemporalFsrCompatibilityPathOnce() {
   static std::atomic<bool> temporal_fsr_compatibility_logged = false;
   if (!temporal_fsr_compatibility_logged.exchange(true)) {
@@ -238,14 +144,6 @@ void LogTemporalFsrCompatibilityPathOnce() {
   }
 }
 
-void LogTemporalFsrQualityModeInputLimitOnce() {
-  static std::atomic<bool> temporal_fsr_quality_mode_input_limit_logged = false;
-  if (!temporal_fsr_quality_mode_input_limit_logged.exchange(true)) {
-    REXLOG_WARN(
-        "present_fsr_quality_mode requested a render size larger than the "
-        "guest output; using guest output size");
-  }
-}
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
@@ -1086,37 +984,22 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       // EASU will always write to intermediate images, and RCAS supports only
       // 1:1.
       if (is_temporal_effect) {
-        uint32_t temporal_input_width = ffx_last_size.first;
-        uint32_t temporal_input_height = ffx_last_size.second;
-        uint32_t quality_mode_render_width = 0;
-        uint32_t quality_mode_render_height = 0;
-        if (QueryTemporalFsrRenderResolutionFromQualityMode(
-                output_width_clamped, output_height_clamped, config.GetFsrQualityMode(),
-                quality_mode_render_width, quality_mode_render_height)) {
-          quality_mode_render_width =
-              std::max(uint32_t(1), std::min(quality_mode_render_width, output_width_clamped));
-          quality_mode_render_height =
-              std::max(uint32_t(1), std::min(quality_mode_render_height, output_height_clamped));
-          if (quality_mode_render_width < temporal_input_width ||
-              quality_mode_render_height < temporal_input_height) {
-            temporal_input_width = quality_mode_render_width;
-            temporal_input_height = quality_mode_render_height;
-            if (temporal_input_width != ffx_last_size.first ||
-                temporal_input_height != ffx_last_size.second) {
-              assert_true(flow.effect_count < flow.effects.size());
-              flow.effect_output_sizes[flow.effect_count] =
-                  std::make_pair(temporal_input_width, temporal_input_height);
-              // Pre-temporal quality mode may request a lower render
-              // resolution. Use CAS resample since bilinear is not allowed in
-              // intermediate passes.
-              flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kCasResample;
-              ffx_last_size.first = temporal_input_width;
-              ffx_last_size.second = temporal_input_height;
-            }
-          } else if (quality_mode_render_width > temporal_input_width ||
-                     quality_mode_render_height > temporal_input_height) {
-            LogTemporalFsrQualityModeInputLimitOnce();
-          }
+        // present_fsr_quality_mode already lowered the render resolution on the
+        // GPU side (TextureCache::GetConfigDrawResolutionScale), so the whole
+        // guest output is the temporal input. It only has to be brought down
+        // to the output size along an axis where it's bigger, as the upscaler
+        // can't downscale.
+        uint32_t temporal_input_width = std::min(ffx_last_size.first, output_width_clamped);
+        uint32_t temporal_input_height = std::min(ffx_last_size.second, output_height_clamped);
+        if (temporal_input_width != ffx_last_size.first ||
+            temporal_input_height != ffx_last_size.second) {
+          assert_true(flow.effect_count < flow.effects.size());
+          flow.effect_output_sizes[flow.effect_count] =
+              std::make_pair(temporal_input_width, temporal_input_height);
+          // CAS resample since bilinear is not allowed in intermediate passes.
+          flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kCasResample;
+          ffx_last_size.first = temporal_input_width;
+          ffx_last_size.second = temporal_input_height;
         }
 
         // A single temporal upscaler dispatch can target the final clamped
