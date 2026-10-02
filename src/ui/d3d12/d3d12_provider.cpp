@@ -344,6 +344,21 @@ bool D3D12Provider::Initialize() {
     d3d12_info_queue_filter.DenyList.NumIDs = UINT(rex::countof(d3d12_info_queue_denied_messages));
     d3d12_info_queue_filter.DenyList.pIDList = d3d12_info_queue_denied_messages;
     d3d12_info_queue->PushStorageFilter(&d3d12_info_queue_filter);
+    // Without an attached debugger the messages would go nowhere - put them
+    // into the log as well.
+    ID3D12InfoQueue1* d3d12_info_queue_1;
+    if (SUCCEEDED(d3d12_info_queue->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue_1)))) {
+      DWORD callback_cookie = 0;
+      d3d12_info_queue_1->RegisterMessageCallback(
+          [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+             LPCSTR description, void*) {
+            if (severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+              REXLOG_WARN("D3D12 debug layer ({}): {}", int(id), description);
+            }
+          },
+          D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &callback_cookie);
+      d3d12_info_queue_1->Release();
+    }
     if (REXCVAR_GET(d3d12_break_on_error)) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
