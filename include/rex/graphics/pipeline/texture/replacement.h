@@ -25,20 +25,31 @@
  */
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
 #include <rex/graphics/xenos.h>
 
+namespace rex::thread {
+class Thread;
+}  // namespace rex::thread
+
 // CVARs controlling the dump/replace pipeline (defined in cache.cpp).
 REXCVAR_DECLARE(bool, texture_dump_enabled);
 REXCVAR_DECLARE(bool, texture_replace_enabled);
+REXCVAR_DECLARE(bool, texture_replace_preload);
 REXCVAR_DECLARE(std::string, texture_folder);
 
 namespace rex::graphics {
@@ -53,6 +64,9 @@ struct TextureReplacementData {
   uint32_t height = 0;
   // Number of mip levels present in the replacement file (>= 1).
   uint32_t mip_levels = 1;
+  // Smaller levels made from `pixels` (level 1 first, down to 1x1), RGBA8 like
+  // it.
+  std::vector<std::vector<uint8_t>> mips;
 };
 
 // ---------------------------------------------------------------------------
@@ -61,7 +75,7 @@ struct TextureReplacementData {
 class TextureReplacement {
  public:
   explicit TextureReplacement(std::filesystem::path textures_dir);
-  ~TextureReplacement() = default;
+  ~TextureReplacement();
 
   TextureReplacement(const TextureReplacement&) = delete;
   TextureReplacement& operator=(const TextureReplacement&) = delete;
@@ -88,26 +102,60 @@ class TextureReplacement {
   // Injection path
   // ---------------------------------------------------------------------------
   // Returns a pointer into the internal cache, or nullptr if not found.
-  // The pointer is valid until the next call to Rescan().
+  // The pointer is valid until the next call to Rescan(). The first call
+  // starts decoding all the files in the background (texture_replace_preload),
+  // ones not decoded yet are loaded here.
   [[nodiscard]] const TextureReplacementData* FindReplacement(uint64_t content_hash) const;
+
+  // The smaller mips of an RGBA8 image down to 1x1: each texel is the average
+  // of 2x2 of the level above, weighted by alpha so the color of transparent
+  // texels doesn't bleed into the edges of cutouts.
+  static std::vector<std::vector<uint8_t>> BuildMips(const uint8_t* pixels, uint32_t width,
+                                                     uint32_t height);
 
   // ---------------------------------------------------------------------------
   // Hash
   // ---------------------------------------------------------------------------
   static uint64_t HashGuestData(const uint8_t* data, size_t size);
+  // Cheap check of whether the content behind a cached hash is still the same
+  // (samples of it, or all of a small one).
+  static uint64_t FingerprintGuestData(const uint8_t* data, size_t size);
 
   std::filesystem::path dump_dir() const { return textures_dir_ / "dump"; }
   std::filesystem::path replace_dir() const { return textures_dir_ / "replace"; }
 
  private:
+  // Decodes a replacement file and makes its mips.
+  static bool LoadFile(const std::filesystem::path& path, TextureReplacementData& out);
+  // Decodes the indexed files on background threads.
+  void StartPreload() const;
+  void StopPreload();
+  void PreloadWorker() const;
+
   std::filesystem::path textures_dir_;
   std::unordered_map<uint64_t, std::filesystem::path> replacements_;
 
   // Textures that have been loaded from disk are cached here so that
   // FindReplacement never touches the filesystem after the first load.
+  // Elements are never moved, so pointers to them stay valid while others are
+  // added.
   mutable std::unordered_map<uint64_t, TextureReplacementData> pixel_cache_;
   // Hashes that failed to load are remembered so we don't retry every frame.
   mutable std::unordered_set<uint64_t> failed_cache_;
+  // Guards the caches, shared with the preload threads.
+  mutable std::mutex cache_mutex_;
+  // Hashes being decoded right now (by the preload or FindReplacement), and
+  // the signal for when one of them is done.
+  mutable std::unordered_set<uint64_t> preload_in_progress_;
+  mutable std::condition_variable preload_done_;
+
+  mutable bool preload_started_ = false;
+  mutable std::vector<std::pair<uint64_t, std::filesystem::path>> preload_queue_;
+  mutable std::atomic<size_t> preload_next_{0};
+  mutable std::atomic<size_t> preload_remaining_{0};
+  mutable std::atomic<bool> preload_stop_{false};
+  mutable std::chrono::steady_clock::time_point preload_start_time_;
+  mutable std::vector<std::unique_ptr<rex::thread::Thread>> preload_threads_;
 
   static bool WriteDDS_RGBA8(const std::filesystem::path& path, uint32_t width, uint32_t height,
                              const uint8_t* rgba8_rows, uint32_t row_pitch_bytes);

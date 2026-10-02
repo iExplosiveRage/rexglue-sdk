@@ -167,6 +167,10 @@ class TextureCache {
     uint32_t scaled_resolve : 1;  // 97
     // Least important in ==, so placed last.
     uint32_t is_valid : 1;  // 98
+    // Non-zero for a texture replaced from disk: bits of the guest content
+    // hash, so different content at the same address with replacements of the
+    // same size don't share a texture.
+    uint32_t replacement_id : 28;  // 126
 
     TextureKey() { MakeInvalid(); }
     TextureKey(const TextureKey& key) { std::memcpy(this, &key, sizeof(*this)); }
@@ -636,13 +640,21 @@ class TextureCache {
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
 
-  // Dump-only pipeline. Replacement upload will be added separately.
   void InvalidateHashCache(uint32_t base_page) {
     base_page_hash_cache_.erase(base_page);
   }
 
   std::unique_ptr<TextureReplacement> replacement_;
-  std::unordered_map<uint32_t, uint64_t> base_page_hash_cache_;
+  // Content hashes of the textures at a base page, for finding replacements
+  // without hashing the whole texture again on every lookup. The memory may be
+  // reused for another texture without a watch noticing (the old texture may
+  // be gone), so a sampled fingerprint of the content is checked each time.
+  struct CachedContentHash {
+    uint32_t size;
+    uint64_t fingerprint;
+    uint64_t hash;
+  };
+  std::unordered_map<uint32_t, CachedContentHash> base_page_hash_cache_;
 };
 
 }  // namespace rex::graphics

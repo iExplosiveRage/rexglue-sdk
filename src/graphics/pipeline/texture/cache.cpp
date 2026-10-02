@@ -97,6 +97,12 @@ REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
                     "Inject replacement textures from disk when available")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(texture_replace_preload, true, "GPU/Texture Replacement",
+                    "Decode all the replacement textures in the background at startup, so they "
+                    "don't stutter the game the first time they're used (keeps all of them in "
+                    "RAM)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
                       "Texture dump folder (empty = <executable folder>/textures)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -984,16 +990,18 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
 
     if (guest_size > 0) {
       const uint32_t base_page = key.base_page;
+      const uint8_t* guest_bytes = shared_memory().TranslatePhysical(key.base_page << 12);
+      const uint64_t fingerprint =
+          TextureReplacement::FingerprintGuestData(guest_bytes, guest_size);
       auto cached_hash = base_page_hash_cache_.find(base_page);
 
-      if (cached_hash != base_page_hash_cache_.end()) {
-        replacement_content_hash = cached_hash->second;
+      if (cached_hash != base_page_hash_cache_.end() &&
+          cached_hash->second.size == guest_size &&
+          cached_hash->second.fingerprint == fingerprint) {
+        replacement_content_hash = cached_hash->second.hash;
       } else {
-        const uint8_t* guest_bytes =
-            shared_memory().TranslatePhysical(key.base_page << 12);
-        replacement_content_hash =
-            TextureReplacement::HashGuestData(guest_bytes, guest_size);
-        base_page_hash_cache_.emplace(base_page, replacement_content_hash);
+        replacement_content_hash = TextureReplacement::HashGuestData(guest_bytes, guest_size);
+        base_page_hash_cache_[base_page] = {guest_size, fingerprint, replacement_content_hash};
       }
 
       replacement = replacement_->FindReplacement(replacement_content_hash);
@@ -1008,7 +1016,13 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           key.width_minus_1 = replacement->width - 1;
           key.height_minus_1 = replacement->height - 1;
           key.format = xenos::TextureFormat::k_8_8_8_8;
-          key.mip_max_level = 0;
+          // A full mip chain (made when the replacement is loaded), so it
+          // doesn't shimmer when it's far away - the guest's sampler state
+          // still picks which levels are used.
+          key.mip_max_level =
+              std::min(rex::log2_floor(std::max(replacement->width, replacement->height)),
+                       uint32_t(xenos::kTextureMaxMips - 1));
+          key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
 
           has_replacement = true;
 

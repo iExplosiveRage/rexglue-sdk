@@ -2240,11 +2240,20 @@ bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
     footprint_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   }
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  // The smaller mips are made when the replacement is loaded.
+  const uint32_t level_count = std::max(uint32_t(resource_desc.MipLevels), uint32_t(1));
+  std::vector<std::vector<uint8_t>> built_mips;
+  const std::vector<std::vector<uint8_t>>* mips = &data.mips;
+  if (data.mips.size() < level_count - 1) {
+    built_mips = TextureReplacement::BuildMips(data.pixels.data(), data.width, data.height);
+    mips = &built_mips;
+  }
+
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(level_count);
   UINT64 upload_size = 0;
 
-  device->GetCopyableFootprints(&footprint_desc, 0, 1, 0, &footprint,
-                                nullptr, nullptr, &upload_size);
+  device->GetCopyableFootprints(&footprint_desc, 0, level_count, 0, footprints.data(), nullptr,
+                                nullptr, &upload_size);
 
   D3D12_RESOURCE_DESC buffer_desc{};
   ui::d3d12::util::FillBufferResourceDesc(
@@ -2269,17 +2278,18 @@ bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
     return false;
   }
 
-  const uint32_t source_row_bytes = data.width * 4;
-  const uint32_t destination_row_bytes = footprint.Footprint.RowPitch;
-
-  uint8_t* destination =
-      static_cast<uint8_t*>(mapped) + footprint.Offset;
-  const uint8_t* source = data.pixels.data();
-
-  for (uint32_t y = 0; y < data.height; ++y) {
-    std::memcpy(destination, source, source_row_bytes);
-    source += source_row_bytes;
-    destination += destination_row_bytes;
+  for (uint32_t level = 0; level < level_count; ++level) {
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[level];
+    const uint32_t width = std::max(data.width >> level, uint32_t(1));
+    const uint32_t height = std::max(data.height >> level, uint32_t(1));
+    const uint32_t source_row_bytes = width * 4;
+    const uint8_t* source = level ? (*mips)[level - 1].data() : data.pixels.data();
+    uint8_t* destination = static_cast<uint8_t*>(mapped) + footprint.Offset;
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(destination, source, source_row_bytes);
+      source += source_row_bytes;
+      destination += footprint.Footprint.RowPitch;
+    }
   }
 
   upload_buffer->Unmap(0, nullptr);
@@ -2294,18 +2304,19 @@ bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
   DeferredCommandList& command_list =
       command_processor_.GetDeferredCommandList();
 
-  D3D12_TEXTURE_COPY_LOCATION destination_location{};
-  destination_location.pResource = resource;
-  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  destination_location.SubresourceIndex = 0;
+  for (uint32_t level = 0; level < level_count; ++level) {
+    D3D12_TEXTURE_COPY_LOCATION destination_location{};
+    destination_location.pResource = resource;
+    destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination_location.SubresourceIndex = level;
 
-  D3D12_TEXTURE_COPY_LOCATION source_location{};
-  source_location.pResource = upload_buffer.Get();
-  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  source_location.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION source_location{};
+    source_location.pResource = upload_buffer.Get();
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source_location.PlacedFootprint = footprints[level];
 
-  command_list.D3DCopyTextureRegion(
-      &destination_location, 0, 0, 0, &source_location, nullptr);
+    command_list.D3DCopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+  }
 
   retained_upload_buffers_.emplace_back(
       command_processor_.GetCurrentSubmission(), std::move(upload_buffer));

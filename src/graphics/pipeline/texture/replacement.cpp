@@ -11,10 +11,12 @@
 #include <cstring>
 #include <fstream>
 #include <system_error>
+#include <thread>
 
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #ifndef XXH_INLINE_ALL
 #define XXH_INLINE_ALL
@@ -643,7 +645,13 @@ TextureReplacement::TextureReplacement(std::filesystem::path textures_dir)
   Rescan();
 }
 
+TextureReplacement::~TextureReplacement() {
+  StopPreload();
+}
+
 void TextureReplacement::Rescan() {
+  StopPreload();
+  std::lock_guard<std::mutex> lock(cache_mutex_);
   replacements_.clear();
   pixel_cache_.clear();
   failed_cache_.clear();
@@ -698,6 +706,22 @@ void TextureReplacement::Rescan() {
 // ---------------------------------------------------------------------------
 uint64_t TextureReplacement::HashGuestData(const uint8_t* data, size_t size) {
   return XXH3_64bits(data, size);
+}
+
+uint64_t TextureReplacement::FingerprintGuestData(const uint8_t* data, size_t size) {
+  // Small textures whole, bigger ones by 16 samples of 512 bytes spread over
+  // them.
+  constexpr size_t kSampleCount = 16;
+  constexpr size_t kSampleSize = 512;
+  if (size <= kSampleCount * kSampleSize * 2) {
+    return XXH3_64bits(data, size);
+  }
+  uint64_t fingerprint = size;
+  for (size_t i = 0; i < kSampleCount; ++i) {
+    const size_t offset = (size - kSampleSize) * i / (kSampleCount - 1);
+    fingerprint = XXH3_64bits_withSeed(data + offset, kSampleSize, fingerprint);
+  }
+  return fingerprint;
 }
 
 // ---------------------------------------------------------------------------
@@ -856,45 +880,199 @@ bool TextureReplacement::ReadPNG(const std::filesystem::path& path, TextureRepla
 }
 
 // ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* pixels,
+                                                                uint32_t width, uint32_t height) {
+  std::vector<std::vector<uint8_t>> mips;
+  const uint8_t* source = pixels;
+  uint32_t source_width = width, source_height = height;
+  while (source_width > 1 || source_height > 1) {
+    const uint32_t mip_width = std::max(source_width >> 1, uint32_t(1));
+    const uint32_t mip_height = std::max(source_height >> 1, uint32_t(1));
+    std::vector<uint8_t>& mip = mips.emplace_back(size_t(mip_width) * mip_height * 4);
+    for (uint32_t y = 0; y < mip_height; ++y) {
+      const uint32_t y0 = std::min(y * 2, source_height - 1);
+      const uint32_t y1 = std::min(y * 2 + 1, source_height - 1);
+      for (uint32_t x = 0; x < mip_width; ++x) {
+        const uint32_t x0 = std::min(x * 2, source_width - 1);
+        const uint32_t x1 = std::min(x * 2 + 1, source_width - 1);
+        const uint8_t* texels[4] = {
+            source + (size_t(y0) * source_width + x0) * 4,
+            source + (size_t(y0) * source_width + x1) * 4,
+            source + (size_t(y1) * source_width + x0) * 4,
+            source + (size_t(y1) * source_width + x1) * 4,
+        };
+        uint32_t alpha_sum = 0, color_sum[3] = {}, weighted_sum[3] = {};
+        for (const uint8_t* texel : texels) {
+          alpha_sum += texel[3];
+          for (uint32_t c = 0; c < 3; ++c) {
+            color_sum[c] += texel[c];
+            weighted_sum[c] += uint32_t(texel[c]) * texel[3];
+          }
+        }
+        uint8_t* out = mip.data() + (size_t(y) * mip_width + x) * 4;
+        for (uint32_t c = 0; c < 3; ++c) {
+          out[c] = uint8_t(alpha_sum ? (weighted_sum[c] + alpha_sum / 2) / alpha_sum
+                                     : (color_sum[c] + 2) / 4);
+        }
+        out[3] = uint8_t((alpha_sum + 2) / 4);
+      }
+    }
+    source = mip.data();
+    source_width = mip_width;
+    source_height = mip_height;
+  }
+  return mips;
+}
+
+bool TextureReplacement::LoadFile(const std::filesystem::path& path, TextureReplacementData& out) {
+  const auto ext = LowerASCII(path.extension().string());
+  const bool ok = ext == ".png" ? ReadPNG(path, out) : ReadDDS(path, out);
+  if (!ok) {
+    REXLOG_WARN("TextureReplacement: failed to load {}", path.filename().string());
+    return false;
+  }
+  out.mips = BuildMips(out.pixels.data(), out.width, out.height);
+  return true;
+}
+
+void TextureReplacement::StartPreload() const {
+  preload_started_ = true;
+  if (!REXCVAR_GET(texture_replace_preload) || replacements_.empty()) {
+    return;
+  }
+  preload_queue_.assign(replacements_.begin(), replacements_.end());
+  preload_next_ = 0;
+  preload_remaining_ = preload_queue_.size();
+  preload_start_time_ = std::chrono::steady_clock::now();
+  // Below normal priority, a few threads - the game's own threads come first.
+  const uint32_t thread_count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+  for (uint32_t i = 0; i < thread_count; ++i) {
+    rex::thread::Thread::CreationParameters params;
+    params.stack_size = 1024 * 1024;
+    auto thread = rex::thread::Thread::Create(params, [this]() { PreloadWorker(); });
+    if (!thread) {
+      break;
+    }
+    thread->set_name("Texture Preload");
+    thread->set_priority(rex::thread::ThreadPriority::kBelowNormal);
+    preload_threads_.push_back(std::move(thread));
+  }
+  REXLOG_INFO("TextureReplacement: decoding {} replacement(s) in the background ({} thread(s))",
+              preload_queue_.size(), preload_threads_.size());
+}
+
+void TextureReplacement::StopPreload() {
+  preload_stop_ = true;
+  for (auto& thread : preload_threads_) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  preload_threads_.clear();
+  preload_queue_.clear();
+  preload_in_progress_.clear();
+  preload_started_ = false;
+  preload_stop_ = false;
+}
+
+void TextureReplacement::PreloadWorker() const {
+  while (!preload_stop_) {
+    const size_t index = preload_next_.fetch_add(1);
+    if (index >= preload_queue_.size()) {
+      return;
+    }
+    const auto& [hash, path] = preload_queue_[index];
+    bool needed;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      needed = !pixel_cache_.count(hash) && !failed_cache_.count(hash) &&
+               preload_in_progress_.insert(hash).second;
+    }
+    if (needed) {
+      TextureReplacementData loaded;
+      const bool ok = LoadFile(path, loaded);
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (ok) {
+          pixel_cache_.emplace(hash, std::move(loaded));
+        } else {
+          failed_cache_.insert(hash);
+        }
+        preload_in_progress_.erase(hash);
+      }
+      preload_done_.notify_all();
+    }
+    if (preload_remaining_.fetch_sub(1) == 1) {
+      REXLOG_INFO("TextureReplacement: background decoding done in {} ms",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - preload_start_time_)
+                      .count());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // FindReplacement
 // ---------------------------------------------------------------------------
 const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t content_hash) const {
-  // Already cached (success)?
+  std::filesystem::path path;
   {
-    auto it = pixel_cache_.find(content_hash);
-    if (it != pixel_cache_.end()) {
-      return &it->second;
+    std::unique_lock<std::mutex> lock(cache_mutex_);
+    if (!preload_started_) {
+      StartPreload();
     }
+    // Being decoded by the preload - waiting for it is quicker than starting
+    // over.
+    if (preload_in_progress_.count(content_hash)) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      preload_done_.wait(lock, [&]() { return !preload_in_progress_.count(content_hash); });
+      REXLOG_INFO("TextureReplacement: waited {} ms for the preload of {:016x}",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - wait_start)
+                      .count(),
+                  content_hash);
+    }
+
+    auto cached = pixel_cache_.find(content_hash);
+    if (cached != pixel_cache_.end()) {
+      return &cached->second;
+    }
+    // Known failure — don't retry.
+    if (failed_cache_.count(content_hash)) {
+      return nullptr;
+    }
+    auto it = replacements_.find(content_hash);
+    if (it == replacements_.end()) {
+      failed_cache_.insert(content_hash);
+      return nullptr;
+    }
+    path = it->second;
+    preload_in_progress_.insert(content_hash);
   }
 
-  // Known failure — don't retry.
-  if (failed_cache_.count(content_hash))
-    return nullptr;
-
-  auto it = replacements_.find(content_hash);
-  if (it == replacements_.end()) {
-    failed_cache_.insert(content_hash);
-    return nullptr;
-  }
-
-  const auto& p = it->second;
-  const auto ext = LowerASCII(p.extension().string());
+  // Not decoded yet (needed before the preload got to it, or it's off).
+  const auto load_start = std::chrono::steady_clock::now();
   TextureReplacementData loaded;
-  bool ok = false;
-  if (ext == ".png") {
-    ok = ReadPNG(p, loaded);
-  } else {
-    ok = ReadDDS(p, loaded);
+  const bool ok = LoadFile(path, loaded);
+  if (REXCVAR_GET(texture_replace_preload)) {
+    REXLOG_INFO("TextureReplacement: {} was needed before the preload got to it, loaded in {} ms",
+                path.filename().string(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - load_start)
+                    .count());
   }
-
-  if (!ok) {
-    REXLOG_WARN("TextureReplacement: failed to load {}", p.filename().string());
-    failed_cache_.insert(content_hash);
-    return nullptr;
+  const TextureReplacementData* result = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (ok) {
+      result = &pixel_cache_.emplace(content_hash, std::move(loaded)).first->second;
+    } else {
+      failed_cache_.insert(content_hash);
+    }
+    preload_in_progress_.erase(content_hash);
   }
-
-  auto [ins, _] = pixel_cache_.emplace(content_hash, std::move(loaded));
-  return &ins->second;
+  preload_done_.notify_all();
+  return result;
 }
 
 }  // namespace rex::graphics
