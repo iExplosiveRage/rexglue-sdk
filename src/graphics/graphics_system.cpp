@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_pacing.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -162,7 +163,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
-  // Guest vblank timer based on the configured guest video mode.
+  // Guest vblank timer based on the configured guest video mode, or the rate a
+  // game picked for its frame rate (rex::graphics::SetGuestVblankRate).
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -176,13 +178,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          const double game_rate_hz = rex::graphics::GetGuestVblankRate();
+          uint64_t interval_ticks;
+          if (game_rate_hz > 0.0) {
+            interval_ticks =
+                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / game_rate_hz));
+          } else {
+            interval_ticks = REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          if (game_rate_hz > 0.0 && game_rate_hz < 500.0) {
+            // A frame rate cap: sleeping is only about millisecond-precise, so
+            // get close and yield for the rest to keep the frames evenly
+            // spaced (144 Hz is under 7 ms).
+            current_time = chrono::Clock::QueryGuestTickCount();
+            const uint64_t next_vblank = last_frame_time + interval_ticks;
+            if (next_vblank > current_time &&
+                next_vblank - current_time > guest_tick_frequency / 500) {
+              rex::thread::Sleep(std::chrono::milliseconds(1));
+            } else {
+              rex::thread::MaybeYield();
+            }
+          } else {
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+          }
         }
         return 0;
       }));

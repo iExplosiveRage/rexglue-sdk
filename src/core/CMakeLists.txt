@@ -9,6 +9,7 @@ add_library(rexcore OBJECT
     clock.cpp
     cvar.cpp
     draw_overrides.cpp
+    frame_pacing.cpp
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
