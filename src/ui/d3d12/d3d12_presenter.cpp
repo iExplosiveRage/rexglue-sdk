@@ -863,10 +863,25 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           ID3D12Resource* effect_source_resource =
               i ? paint_context_.guest_output_intermediate_textures[i - 1].Get()
                 : guest_output_resource.Get();
+          // The upscaler reads its input from compute shaders.
+          D3D12_RESOURCE_BARRIER barrier_source;
+          barrier_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          barrier_source.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+          barrier_source.Transition.pResource = effect_source_resource;
+          barrier_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          barrier_source.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          barrier_source.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+          command_list->ResourceBarrier(1, &barrier_source);
           temporal_dispatch_done = DispatchTemporalUpscaler(
               command_list, effect_source_resource, effect_input_width, effect_input_height,
               effect_dest_resource, guest_output_flow.effect_output_sizes[i].first,
               guest_output_flow.effect_output_sizes[i].second, guest_output_paint_config);
+          std::swap(barrier_source.Transition.StateBefore, barrier_source.Transition.StateAfter);
+          command_list->ResourceBarrier(1, &barrier_source);
+          // The upscaler binds its own descriptor heap; the following effects
+          // take their descriptors from the presenter's one again.
+          command_list->SetDescriptorHeaps(1, &view_heap);
           if (!temporal_dispatch_done) {
             D3D12_RESOURCE_BARRIER barrier_uav_to_rtv;
             barrier_uav_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
