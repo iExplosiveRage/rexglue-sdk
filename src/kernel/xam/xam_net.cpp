@@ -17,6 +17,12 @@
 #include <atomic>
 #include <cstring>
 #include <thread>
+#include <algorithm>
+#include <vector>
+#include <random>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
@@ -1271,6 +1277,95 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
   return socket->Send(buf_ptr, buf_len, flags);
 }
 
+namespace {
+// Test helper: REX_XNET_SIM_LATENCY_MS / REX_XNET_SIM_JITTER_MS hold every
+// outgoing UDP packet for a while before sending it, so internet latency can
+// be reproduced with two local instances.
+class BurstSimLatency {
+ public:
+  static BurstSimLatency& Get() {
+    static BurstSimLatency instance;
+    return instance;
+  }
+
+  bool enabled() const { return latency_ms_ > 0 || jitter_ms_ > 0; }
+
+  void Send(uint64_t native, const sockaddr_in& to, const uint8_t* data, uint32_t len,
+            int flags) {
+    Packet packet;
+    int delay = latency_ms_;
+    if (jitter_ms_ > 0) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      delay += static_cast<int>(rng_() % static_cast<uint32_t>(jitter_ms_ + 1));
+    }
+    packet.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay);
+    packet.native = native;
+    packet.to = to;
+    packet.flags = flags;
+    packet.data.assign(data, data + len);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      queue_.push(std::move(packet));
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  struct Packet {
+    std::chrono::steady_clock::time_point due;
+    uint64_t native = 0;
+    sockaddr_in to = {};
+    int flags = 0;
+    std::vector<uint8_t> data;
+    bool operator>(const Packet& other) const { return due > other.due; }
+  };
+
+  BurstSimLatency() {
+    auto env_int = [](const char* name) {
+      const char* value = std::getenv(name);
+      return value ? std::max(0, std::atoi(value)) : 0;
+    };
+    latency_ms_ = env_int("REX_XNET_SIM_LATENCY_MS");
+    jitter_ms_ = env_int("REX_XNET_SIM_JITTER_MS");
+    if (enabled()) {
+      REXKRNL_WARN("[BurstSimLatency] holding outgoing packets {} ms (+0..{} ms jitter)",
+                   latency_ms_, jitter_ms_);
+      std::thread([this] { Run(); }).detach();
+    }
+  }
+
+  void Run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      if (queue_.empty()) {
+        cv_.wait(lock);
+        continue;
+      }
+      const auto due = queue_.top().due;
+      if (std::chrono::steady_clock::now() < due) {
+        cv_.wait_until(lock, due);
+        continue;
+      }
+      Packet packet = queue_.top();
+      queue_.pop();
+      lock.unlock();
+      sendto(static_cast<decltype(socket(0, 0, 0))>(packet.native),
+             reinterpret_cast<const char*>(packet.data.data()),
+             static_cast<int>(packet.data.size()), packet.flags,
+             reinterpret_cast<const sockaddr*>(&packet.to), sizeof(packet.to));
+      lock.lock();
+    }
+  }
+
+  int latency_ms_ = 0;
+  int jitter_ms_ = 0;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::priority_queue<Packet, std::vector<Packet>, std::greater<Packet>> queue_;
+  std::minstd_rand rng_{12345};
+};
+}  // namespace
+
 u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
                         ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
@@ -1281,7 +1376,18 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  const int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret;
+  if (to_ptr && BurstSimLatency::Get().enabled()) {
+    sockaddr_in nto = {};
+    nto.sin_family = native_to.sin_family;
+    nto.sin_port = native_to.sin_port;
+    nto.sin_addr.s_addr = htonl(native_to.sin_addr);
+    BurstSimLatency::Get().Send(socket->native_handle(), nto, buf_ptr, buf_len,
+                                static_cast<int>(flags));
+    ret = static_cast<int>(buf_len);
+  } else {
+    ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  }
 
   g_burst_net_stats.send_calls++;
   if (ret > 0) {
