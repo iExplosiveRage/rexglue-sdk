@@ -2720,9 +2720,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
     REXGPU_INFO(
-        "DRAW vs={:016X} ps={:016X} pitch={} msaa={} z={}/{}/{} vte={:08X} clip={:08X} "
-        "vport=({} {} {} {} {} {}) prim={} idx={}",
+        "DRAW vs={:016X} ps={:016X} color0={:08X} depth={:08X} pitch={} msaa={} z={}/{}/{} "
+        "vte={:08X} clip={:08X} vport=({} {} {} {} {} {}) prim={} idx={}",
         vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_DEPTH_INFO],
         regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
         uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
         uint32_t(normalized_depth_control.z_enable),
