@@ -12,8 +12,10 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <string>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,9 +33,9 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
+                      "Anti-aliasing of the final image: none, fxaa, fxaa_extreme")
+    .allowed({"none", "fxaa", "fxaa_extreme"});
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -56,6 +58,9 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
+
+// The command processor swap_post_effect changes go to while it exists.
+std::atomic<rex::graphics::CommandProcessor*> g_swap_post_effect_target{nullptr};
 }  // namespace
 
 namespace rex::graphics {
@@ -136,6 +141,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     return X_STATUS_UNSUCCESSFUL;
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  // Applies live: the command processor switches the effect on its thread.
+  g_swap_post_effect_target.store(command_processor_.get(), std::memory_order_release);
+  static std::once_flag swap_post_effect_callback_registered;
+  std::call_once(swap_post_effect_callback_registered, [] {
+    rex::cvar::RegisterChangeCallback(
+        "swap_post_effect", [](std::string_view, std::string_view value) {
+          if (auto* command_processor = g_swap_post_effect_target.load(std::memory_order_acquire)) {
+            command_processor->SetDesiredSwapPostEffect(ParseSwapPostEffect(std::string(value)));
+          }
+        });
+  });
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
@@ -180,6 +196,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 
 void GraphicsSystem::Shutdown() {
   if (command_processor_) {
+    g_swap_post_effect_target.store(nullptr, std::memory_order_release);
     command_processor_->Shutdown();
     command_processor_.reset();
   }
