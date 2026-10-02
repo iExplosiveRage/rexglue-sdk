@@ -10,12 +10,16 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include <CLI/CLI.hpp>
 
@@ -535,16 +539,79 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+namespace {
+
+// TOML basic strings treat '\' as an escape, so Windows paths must be escaped
+// or the saved file no longer parses.
+std::string FormatTomlValue(const FlagEntry& entry, const std::string& value) {
+  if (entry.type != FlagType::String) {
+    return value;
+  }
+  std::string out = "\"";
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04X", static_cast<unsigned>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  out += "\"";
+  return out;
+}
+
+// Values passed on the command line or through the environment are supplied
+// again on every launch; pinning them into the config file would override the
+// user's own settings later.
+bool IsPersistable(const FlagEntry& entry) {
+  return entry.type != FlagType::Command && entry.source != Source::kCommandLine &&
+         entry.source != Source::kEnvironment;
+}
+
+std::string Trim(std::string_view text) {
+  size_t begin = 0;
+  size_t end = text.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) {
+    ++begin;
+  }
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return std::string(text.substr(begin, end - begin));
+}
+
+}  // namespace
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    if (!IsPersistable(entry)) {
+      continue;
+    }
+    const std::string value = entry.getter();
+    if (value != entry.default_value) {
+      result += entry.name + " = " + FormatTomlValue(entry, value) + "\n";
     }
   }
   return result;
@@ -554,12 +621,12 @@ std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.category == category && entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    if (entry.category != category || !IsPersistable(entry)) {
+      continue;
+    }
+    const std::string value = entry.getter();
+    if (value != entry.default_value) {
+      result += entry.name + " = " + FormatTomlValue(entry, value) + "\n";
     }
   }
   return result;
@@ -691,20 +758,122 @@ bool IsFinalized() {
 }
 
 void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
-  if (content.empty()) {
-    REXLOG_DEBUG("SaveConfig: no modified flags to save");
-    return;
+  // Current persistable values: full key -> formatted TOML value.
+  std::unordered_map<std::string, std::string> current;
+  std::vector<std::string> non_default_order;
+  {
+    std::lock_guard lock(GetRegistryMutex());
+    for (const auto& entry : GetRegistryStorage()) {
+      if (!IsPersistable(entry)) {
+        continue;
+      }
+      const std::string value = entry.getter();
+      current[entry.name] = FormatTomlValue(entry, value);
+      if (value != entry.default_value) {
+        non_default_order.push_back(entry.name);
+      }
+    }
   }
 
+  // Merge into the existing file so comments, ordering and unrelated keys
+  // survive. A file that no longer parses is rewritten from scratch.
+  std::vector<std::string> lines;
+  bool have_existing = false;
+  {
+    std::ifstream in(config_path);
+    if (in) {
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      try {
+        (void)toml::parse(text);
+        have_existing = true;
+        size_t pos = 0;
+        while (pos <= text.size()) {
+          size_t nl = text.find('\n', pos);
+          std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+          if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+          }
+          lines.push_back(std::move(line));
+          if (nl == std::string::npos) {
+            break;
+          }
+          pos = nl + 1;
+        }
+        while (!lines.empty() && lines.back().empty()) {
+          lines.pop_back();
+        }
+      } catch (const toml::parse_error& err) {
+        REXLOG_WARN("SaveConfig: existing {} is not valid TOML ({}); rewriting it",
+                    config_path.string(), err.what());
+      }
+    }
+  }
+
+  std::unordered_map<std::string, bool> written;
+  size_t first_section_line = lines.size();
+  std::string section;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const std::string trimmed = Trim(lines[i]);
+    if (trimmed.empty() || trimmed[0] == '#') {
+      continue;
+    }
+    if (trimmed[0] == '[') {
+      if (first_section_line == lines.size()) {
+        first_section_line = i;
+      }
+      std::string name = Trim(std::string_view(trimmed).substr(1, trimmed.find(']') - 1));
+      std::replace(name.begin(), name.end(), '.', '_');
+      section = name;
+      continue;
+    }
+    const size_t eq = trimmed.find('=');
+    if (eq == std::string::npos) {
+      continue;
+    }
+    std::string key = Trim(std::string_view(trimmed).substr(0, eq));
+    std::string flat_key = key;
+    if (key.size() >= 2 && (key.front() == '"' || key.front() == '\'') && key.back() == key.front()) {
+      flat_key = key.substr(1, key.size() - 2);
+    } else {
+      // Dotted keys (gpu.vsync) are nested tables, flattened like ApplyTomlTable does.
+      std::replace(flat_key.begin(), flat_key.end(), '.', '_');
+    }
+    const std::string full_key = section.empty() ? flat_key : section + "_" + flat_key;
+    auto it = current.find(full_key);
+    if (it == current.end()) {
+      continue;  // unknown key, or a value that came from the command line
+    }
+    lines[i] = key + " = " + it->second;
+    written[full_key] = true;
+  }
+
+  // New non-default values go before the first [section] so they stay top-level.
+  std::vector<std::string> additions;
+  for (const auto& name : non_default_order) {
+    if (!written.count(name)) {
+      additions.push_back(name + " = " + current[name]);
+    }
+  }
+  if (!have_existing) {
+    lines.insert(lines.begin(), "# Auto-generated cvar configuration");
+    first_section_line = lines.size();
+  }
+  size_t insert_at = first_section_line;
+  while (insert_at > 0 && Trim(lines[insert_at - 1]).empty()) {
+    --insert_at;  // keep the blank line(s) in front of the first [section]
+  }
+  lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insert_at), additions.begin(),
+               additions.end());
+
   try {
-    std::ofstream file(config_path);
+    std::ofstream file(config_path, std::ios::trunc);
     if (!file) {
       REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
       return;
     }
-    file << "# Auto-generated cvar configuration\n";
-    file << content;
+    for (const auto& line : lines) {
+      file << line << '\n';
+    }
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());

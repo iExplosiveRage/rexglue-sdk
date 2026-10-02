@@ -707,6 +707,61 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
   }
 }
 
+TEST_CASE("cvar SaveConfig keeps the file valid and merges", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto save_path = std::filesystem::temp_directory_path() / "test_save_config_merge.toml";
+  std::filesystem::remove(save_path);
+
+  auto read_file = [&] {
+    std::ifstream file(save_path);
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  };
+
+  SECTION("Backslashes and quotes are escaped and load back unchanged") {
+    REXCVAR_SET(test_string_flag, "C:\\games\\say \"hi\"");
+    rex::cvar::SaveConfig(save_path);
+    CHECK(read_file().find("test_string_flag = \"C:\\\\games\\\\say \\\"hi\\\"\"") !=
+          std::string::npos);
+
+    rex::cvar::testing::ResetAllForTesting();
+    rex::cvar::LoadConfig(save_path);
+    CHECK(REXCVAR_GET(test_string_flag) == "C:\\games\\say \"hi\"");
+  }
+
+  SECTION("Existing comments and unknown keys are kept") {
+    {
+      std::ofstream file(save_path);
+      file << "# keep this comment\n";
+      file << "test_int32_flag = 1\n";
+      file << "other_key = \"untouched\"\n";
+    }
+    REXCVAR_SET(test_int32_flag, 7);
+    rex::cvar::SaveConfig(save_path);
+
+    auto content = read_file();
+    CHECK(content.find("# keep this comment") != std::string::npos);
+    CHECK(content.find("test_int32_flag = 7") != std::string::npos);
+    CHECK(content.find("test_int32_flag = 1") == std::string::npos);
+    CHECK(content.find("other_key = \"untouched\"") != std::string::npos);
+  }
+
+  SECTION("Command line values are not written") {
+    char argv0[] = "cvar_test";
+    char arg1[] = "--test_string_flag=from cmdline";
+    char* argv[] = {argv0, arg1};
+    rex::cvar::Init(2, argv);
+    REXCVAR_SET(test_int32_flag, 5);
+    rex::cvar::SaveConfig(save_path);
+
+    auto content = read_file();
+    CHECK(content.find("test_string_flag") == std::string::npos);
+    CHECK(content.find("test_int32_flag = 5") != std::string::npos);
+  }
+
+  std::filesystem::remove(save_path);
+}
+
 TEST_CASE("cvar ApplyEnvironment", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
