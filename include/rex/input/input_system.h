@@ -13,7 +13,9 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -59,6 +61,13 @@ class InputSystem : public system::IInputSystem {
   void AddUIInputBlocker();
   void RemoveUIInputBlocker();
 
+  /// Calls `callback` on the polling thread when all of `buttons` (X_INPUT_GAMEPAD_*)
+  /// get held on one controller, like Back + Start to open a menu. The guest
+  /// doesn't see that press. Set it before the guest starts polling.
+  void SetUIToggleCombo(uint16_t buttons, std::function<void()> callback);
+  /// Changes the buttons of the combo, 0 to turn it off.
+  void SetUIToggleComboButtons(uint16_t buttons);
+
   bool GetVibrationEnabled() const;
   void ToggleVibration();
 
@@ -98,9 +107,17 @@ class InputSystem : public system::IInputSystem {
   // {left, right} stick maxima, scaling the deadzone percentages.
   std::array<std::pair<JoystickValue, JoystickValue>, kMaxGuestUsers> user_max_joystick_value_ = {};
 
+  // The guest polls from its threads while the emulator's own UI reads the
+  // controllers from the UI thread (dialogs).
+  std::recursive_mutex mutex_;
+
   std::atomic<int> ui_input_blockers_{0};
   // Masked out per user until the guest sees them released.
   std::array<uint16_t, kMaxGuestUsers> consumed_buttons_ = {};
+
+  std::atomic<uint16_t> ui_toggle_combo_{0};
+  std::function<void()> ui_toggle_callback_;
+  std::array<bool, kMaxGuestUsers> ui_toggle_combo_held_ = {};
 };
 
 /// Create a default InputSystem with SDL + MnK + NOP drivers.
