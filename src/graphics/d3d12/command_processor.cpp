@@ -51,6 +51,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
+                      "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
+                      "names) whose draws are skipped, for finding which effect draws something");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -71,9 +75,50 @@ namespace {
 // the end of a frame. 0 = no change requested.
 std::atomic<uint32_t> g_requested_draw_resolution_scale{0};
 
+// gpu_debug_skip_pixel_shaders, parsed when it changes.
+std::mutex g_skip_pixel_shaders_mutex;
+std::vector<uint64_t> g_skip_pixel_shaders;
+std::atomic<uint32_t> g_skip_pixel_shaders_generation{0};
+
+void ParseSkipPixelShaders(std::string_view text) {
+  std::vector<uint64_t> hashes;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find_first_of(", ", pos);
+    if (end == std::string_view::npos) {
+      end = text.size();
+    }
+    std::string token(text.substr(pos, end - pos));
+    if (!token.empty()) {
+      hashes.push_back(std::strtoull(token.c_str(), nullptr, 16));
+    }
+    pos = end + 1;
+  }
+  std::lock_guard lock(g_skip_pixel_shaders_mutex);
+  g_skip_pixel_shaders = std::move(hashes);
+  g_skip_pixel_shaders_generation.fetch_add(1, std::memory_order_release);
+}
+
+// Called on the command processor thread only.
+bool IsPixelShaderSkipped(uint64_t ucode_hash) {
+  static std::vector<uint64_t> skipped;
+  static uint32_t skipped_generation = UINT32_MAX;
+  uint32_t generation = g_skip_pixel_shaders_generation.load(std::memory_order_acquire);
+  if (generation != skipped_generation) {
+    std::lock_guard lock(g_skip_pixel_shaders_mutex);
+    skipped = g_skip_pixel_shaders;
+    skipped_generation = generation;
+  }
+  return !skipped.empty() && std::find(skipped.begin(), skipped.end(), ucode_hash) != skipped.end();
+}
+
 void RegisterDrawResolutionScaleCallbacks() {
   static std::once_flag registered;
   std::call_once(registered, [] {
+    ParseSkipPixelShaders(REXCVAR_GET(gpu_debug_skip_pixel_shaders));
+    rex::cvar::RegisterChangeCallback(
+        "gpu_debug_skip_pixel_shaders",
+        [](std::string_view, std::string_view value) { ParseSkipPixelShaders(value); });
     for (const char* name : {"draw_resolution_scale_x", "draw_resolution_scale_y",
                              "resolution_scale", "present_effect", "present_fsr_quality_mode"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
@@ -2476,6 +2521,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // when it's kColorDepth here.
     if (edram_mode == xenos::EdramMode::kColorDepth) {
       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
+      if (pixel_shader && IsPixelShaderSkipped(pixel_shader->ucode_data_hash())) {
+        return true;
+      }
       if (pixel_shader) {
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
