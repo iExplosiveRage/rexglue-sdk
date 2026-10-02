@@ -7,11 +7,18 @@
  */
 #include <rex/perf/frame_rate.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 
 namespace rex::perf {
 
 namespace {
+// Times of the latest swaps, by swap number. Written by the command processor
+// thread only.
+constexpr size_t kSwapTimeHistory = 256;
+std::array<std::atomic<int64_t>, kSwapTimeHistory> g_swap_times_ns{};
 std::atomic<uint64_t> g_guest_swap_count{0};
 std::atomic<uint32_t> g_frontbuffer_width{0};
 std::atomic<uint32_t> g_frontbuffer_height{0};
@@ -22,11 +29,34 @@ std::atomic<uint32_t> g_requested_scale_y{0};
 }  // namespace
 
 void RecordGuestSwap() {
-  g_guest_swap_count.fetch_add(1, std::memory_order_relaxed);
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  // The time first, so readers never see a count with its time missing.
+  const uint64_t index = g_guest_swap_count.load(std::memory_order_relaxed);
+  g_swap_times_ns[index % kSwapTimeHistory].store(now, std::memory_order_relaxed);
+  g_guest_swap_count.store(index + 1, std::memory_order_release);
 }
 
 uint64_t GetGuestSwapCount() {
   return g_guest_swap_count.load(std::memory_order_relaxed);
+}
+
+size_t GetGuestFrameTimes(float* out_ms, size_t max_count) {
+  const uint64_t count = g_guest_swap_count.load(std::memory_order_acquire);
+  if (!out_ms || count < 2) {
+    return 0;
+  }
+  const size_t frames =
+      size_t(std::min<uint64_t>({uint64_t(max_count), count - 1, kSwapTimeHistory - 1}));
+  for (size_t i = 0; i < frames; ++i) {
+    const uint64_t newer = count - frames + i;
+    const int64_t interval_ns =
+        g_swap_times_ns[newer % kSwapTimeHistory].load(std::memory_order_relaxed) -
+        g_swap_times_ns[(newer - 1) % kSwapTimeHistory].load(std::memory_order_relaxed);
+    out_ms[i] = float(std::max<int64_t>(interval_ns, 0)) * 1.0e-6f;
+  }
+  return frames;
 }
 
 void RecordGuestFrontbuffer(uint32_t width, uint32_t height) {

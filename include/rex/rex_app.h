@@ -27,6 +27,7 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/quick_menu.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
@@ -107,6 +108,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   /// Called after ImGui drawer is created. Add custom dialogs here.
   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
+
+  /// Settings for the controller-friendly quick menu, opened with F1 or the
+  /// quick_menu_buttons combo. Changes apply live and are saved to the config.
+  /// No sections = no menu.
+  virtual void OnConfigureQuickMenu(ui::QuickMenuConfig& config) { (void)config; }
 
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
@@ -264,8 +270,15 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Set a callback that provides guest frame stats to the debug overlay.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
 
+  /// Opens or closes the quick menu. UI thread.
+  void ToggleQuickMenu();
+
  private:
   std::function<void(PathConfig)> MakeResumeCallback();
+
+  void CloseQuickMenu();
+  // Creates or destroys the debug overlay to match the debug_overlay cvar.
+  void ApplyDebugOverlaySetting();
 
   // Stand up the ImGui overlay stack (drawer, F3/Backtick/F4 binds, dialogs)
   // independently of how the presenter/drawer were obtained. `presenter` may be
@@ -310,6 +323,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
+  ui::QuickMenuConfig quick_menu_config_;
+  std::unique_ptr<ui::QuickMenuDialog> quick_menu_;
+  // Read by the input drivers' threads.
+  std::atomic<bool> quick_menu_open_{false};
+  // Holds a UI input blocker while the quick menu is open.
+  bool quick_menu_blocks_input_ = false;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;

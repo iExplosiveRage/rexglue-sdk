@@ -26,6 +26,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/overlay_text.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -53,7 +54,29 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_STRING(quick_menu_buttons, "back+start", "UI",
+                      "Controller buttons that open the settings menu (F1 on the keyboard): "
+                      "back+start, l3+r3, none")
+    .allowed({"back+start", "l3+r3", "none"});
+
+REXCVAR_DEFINE_BOOL(debug_overlay, false, "UI", "Show the frame rate overlay (F3)");
+
 namespace rex {
+
+namespace {
+
+uint16_t QuickMenuComboButtons() {
+  const std::string buttons = REXCVAR_GET(quick_menu_buttons);
+  if (buttons == "none") {
+    return 0;
+  }
+  if (buttons == "l3+r3") {
+    return rex::input::X_INPUT_GAMEPAD_LEFT_THUMB | rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB;
+  }
+  return rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
+}
+
+}  // namespace
 
 // --- ReXApp ---
 
@@ -250,11 +273,24 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     input_sys->SetActiveCallback([this]() {
       if (window_ && !window_->HasFocus())
         return false;
+      // The quick menu reads the controllers itself (the guest is blocked
+      // meanwhile), even with the mouse over it.
+      if (quick_menu_open_.load(std::memory_order_relaxed))
+        return true;
       if (!imgui_drawer_ ||
           (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))
         return true;
       return !imgui_drawer_->GetIO().WantCaptureMouse;
     });
+    if (!quick_menu_config_.sections.empty()) {
+      input_sys->SetUIToggleCombo(QuickMenuComboButtons(), [this]() {
+        app_context().CallInUIThreadDeferred([this]() { ToggleQuickMenu(); });
+      });
+      rex::cvar::RegisterChangeCallback(
+          "quick_menu_buttons", [input_sys](std::string_view, std::string_view) {
+            input_sys->SetUIToggleComboButtons(QuickMenuComboButtons());
+          });
+    }
   }
 
   std::string xex_image = "game:\\default.xex";
@@ -430,8 +466,13 @@ bool ReXApp::SetupPresentation() {
 }
 
 void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDrawer* drawer) {
+  OnConfigureQuickMenu(quick_menu_config_);
   imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
-      window_.get(), 64, [this](ImFontAtlas* atlas) { OnConfigureFonts(atlas); },
+      window_.get(), 64,
+      [this](ImFontAtlas* atlas) {
+        ui::overlay_text::AddFonts(atlas);
+        OnConfigureFonts(atlas);
+      },
       [this](ImGuiStyle& imgui_style, rex::ui::Style& ui_style) {
         OnConfigureStyle(imgui_style, ui_style);
       });
@@ -439,14 +480,18 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
-    if (debug_overlay_) {
-      debug_overlay_.reset();
-    } else {
-      debug_overlay_ =
-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
-    }
+  ui::overlay_text::SetPixelScale(float(window_->GetDpi()) / float(window_->GetMediumDpi()));
+  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [] {
+    rex::cvar::SetFlagByName("debug_overlay", REXCVAR_GET(debug_overlay) ? "false" : "true");
   });
+  rex::cvar::RegisterChangeCallback("debug_overlay", [this](std::string_view, std::string_view) {
+    app_context().CallInUIThreadDeferred([this]() { ApplyDebugOverlaySetting(); });
+  });
+  ApplyDebugOverlaySetting();
+  if (!quick_menu_config_.sections.empty()) {
+    rex::ui::RegisterBind("bind_quick_menu", "F1", "Toggle the settings menu",
+                          [this] { ToggleQuickMenu(); });
+  }
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();
@@ -575,7 +620,9 @@ void ReXApp::OnDpiChanged(ui::UISetupEvent& e) {
   if (!window_) {
     return;
   }
-  OnDpiScaleChanged(float(window_->GetDpi()) / float(window_->GetMediumDpi()));
+  const float scale = float(window_->GetDpi()) / float(window_->GetMediumDpi());
+  ui::overlay_text::SetPixelScale(scale);
+  OnDpiScaleChanged(scale);
 }
 
 void ReXApp::OnGotFocus(ui::UISetupEvent& e) {
@@ -607,6 +654,8 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
   rex::ui::UnregisterBind("bind_achievements");
+  rex::ui::UnregisterBind("bind_quick_menu");
+  rex::cvar::UnregisterChangeCallbacks("debug_overlay");
 
   // ImGui cleanup (reverse of setup)
   if (achievement_notification_listener_ != 0) {
@@ -615,6 +664,7 @@ void ReXApp::OnDestroy() {
     }
     achievement_notification_listener_ = 0;
   }
+  CloseQuickMenu();
   achievement_notification_.reset();
   achievements_overlay_.reset();
   settings_overlay_.reset();
@@ -656,6 +706,88 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
   if (debug_overlay_) {
     debug_overlay_->SetStatsProvider(provider);
   }
+}
+
+void ReXApp::ApplyDebugOverlaySetting() {
+  if (!imgui_drawer_ || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!REXCVAR_GET(debug_overlay)) {
+    debug_overlay_.reset();
+  } else if (!debug_overlay_) {
+    debug_overlay_ =
+        std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  }
+}
+
+void ReXApp::ToggleQuickMenu() {
+  if (quick_menu_) {
+    CloseQuickMenu();
+    return;
+  }
+  if (!imgui_drawer_ || quick_menu_config_.sections.empty() ||
+      shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  auto* input_sys =
+      runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr;
+
+  ui::QuickMenuDialog::Callbacks callbacks;
+  callbacks.read_pad = [input_sys]() {
+    ui::QuickMenuDialog::PadState pad;
+    if (!input_sys) {
+      return pad;
+    }
+    // Any controller can drive the menu; the stick pushed the furthest wins.
+    int stick_distance = 0;
+    for (uint32_t user_index = 0; user_index < rex::input::kMaxGuestUsers; ++user_index) {
+      rex::input::X_INPUT_STATE state = {};
+      if (input_sys->GetStateForUI(user_index, &state) != X_ERROR_SUCCESS) {
+        continue;
+      }
+      pad.buttons |= static_cast<uint16_t>(state.gamepad.buttons);
+      const int16_t thumb_lx = state.gamepad.thumb_lx;
+      const int16_t thumb_ly = state.gamepad.thumb_ly;
+      const int distance = std::abs(int(thumb_lx)) + std::abs(int(thumb_ly));
+      if (distance > stick_distance) {
+        stick_distance = distance;
+        pad.thumb_lx = thumb_lx;
+        pad.thumb_ly = thumb_ly;
+      }
+    }
+    return pad;
+  };
+  callbacks.defer = [this](std::function<void()> function) {
+    app_context().CallInUIThreadDeferred(std::move(function));
+  };
+  callbacks.close = [this]() { CloseQuickMenu(); };
+  callbacks.changed = [this]() { rex::cvar::SaveConfig(config_path_); };
+
+  quick_menu_ =
+      std::make_unique<ui::QuickMenuDialog>(imgui_drawer_.get(), quick_menu_config_, std::move(callbacks));
+  quick_menu_open_.store(true, std::memory_order_relaxed);
+  // The game doesn't see the controllers while the menu is open.
+  if (input_sys) {
+    input_sys->AddUIInputBlocker();
+    quick_menu_blocks_input_ = true;
+  }
+}
+
+void ReXApp::CloseQuickMenu() {
+  if (!quick_menu_) {
+    return;
+  }
+  quick_menu_.reset();
+  // Unblocked while still counting as open, so the buttons held right now are
+  // read (and kept from the guest) even with the mouse over an overlay.
+  if (quick_menu_blocks_input_) {
+    quick_menu_blocks_input_ = false;
+    if (auto* input_sys =
+            runtime_ ? static_cast<rex::input::InputSystem*>(runtime_->input_system()) : nullptr) {
+      input_sys->RemoveUIInputBlocker();
+    }
+  }
+  quick_menu_open_.store(false, std::memory_order_relaxed);
 }
 
 }  // namespace rex

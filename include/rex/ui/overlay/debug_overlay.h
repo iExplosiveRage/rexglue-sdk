@@ -43,6 +43,8 @@ class DebugOverlayDialog : public ImGuiDialog {
   std::chrono::steady_clock::time_point fps_window_start_{};
   uint64_t fps_window_swaps_ = 0;
   double guest_fps_ = 0.0;
+  // Guest frames shown in the frame time graph.
+  static constexpr size_t kGraphFrames = 120;
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};

@@ -1,0 +1,124 @@
+/**
+ * @file        rex/ui/overlay/quick_menu.h
+ *
+ * @brief       Controller-friendly settings menu drawn over the game: a few
+ *              hand-picked cvars per section, applied live and saved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <rex/ui/imgui_dialog.h>
+
+namespace rex::ui {
+
+// A setting in the quick menu, backed by a cvar.
+struct QuickMenuItem {
+  enum class Kind {
+    // Boolean cvar, shown as a switch.
+    kToggle,
+    // One of `choices`.
+    kChoice,
+    // A number from `min` to `max` in `step` increments.
+    kNumber,
+  };
+
+  Kind kind = Kind::kToggle;
+  std::string label;
+  // Shown under the list while the item is selected.
+  std::string help;
+  std::string cvar;
+  // Set to the same value as `cvar` (like draw_resolution_scale_y with _x).
+  std::vector<std::string> mirrored_cvars;
+  // kChoice: the cvar value and the text shown for it. Values the cvar doesn't
+  // allow are left out.
+  std::vector<std::pair<std::string, std::string>> choices;
+  // kNumber. Shown as printf(format, value * display_scale + display_offset);
+  // with a negative display_scale, right lowers the cvar value.
+  double min = 0.0;
+  double max = 1.0;
+  double step = 1.0;
+  double display_scale = 1.0;
+  double display_offset = 0.0;
+  std::string format = "%g";
+  // Only shown while the cvar `shown_if_cvar` has one of `shown_if_values`.
+  std::string shown_if_cvar;
+  std::vector<std::string> shown_if_values;
+};
+
+struct QuickMenuSection {
+  std::string title;
+  std::vector<QuickMenuItem> items;
+};
+
+struct QuickMenuConfig {
+  std::string title = "SETTINGS";
+  std::vector<QuickMenuSection> sections;
+};
+
+class QuickMenuDialog : public ImGuiDialog {
+ public:
+  struct PadState {
+    uint16_t buttons = 0;  // X_INPUT_GAMEPAD_* bits.
+    int16_t thumb_lx = 0;
+    int16_t thumb_ly = 0;
+  };
+
+  struct Callbacks {
+    // Reads the controllers. Called on the UI thread, outside of painting.
+    std::function<PadState()> read_pad;
+    // Runs a function on the UI thread after the current paint.
+    std::function<void(std::function<void()>)> defer;
+    // Asks the owner to destroy the menu (run through `defer`).
+    std::function<void()> close;
+    // After a setting changed, e.g. to save the config (run through `defer`).
+    std::function<void()> changed;
+  };
+
+  // Text is drawn with overlay_text (its fonts must be added to the atlas).
+  QuickMenuDialog(ImGuiDrawer* imgui_drawer, QuickMenuConfig config, Callbacks callbacks);
+  ~QuickMenuDialog() override;
+
+ protected:
+  void OnDraw(ImGuiIO& io) override;
+
+ private:
+  struct SharedPad;
+
+  bool IsShown(const QuickMenuItem& item) const;
+  std::vector<size_t> ShownItems(const QuickMenuSection& section) const;
+  // direction: -1 left, 1 right, 0 activate (toggle / next).
+  void Change(const QuickMenuItem& item, int direction);
+  void Set(const QuickMenuItem& item, const std::string& value);
+  void RequestClose();
+
+  QuickMenuConfig config_;
+  Callbacks callbacks_;
+  std::shared_ptr<SharedPad> pad_;
+
+  size_t section_ = 0;
+  size_t selected_item_ = 0;
+  bool close_requested_ = false;
+
+  bool pad_seen_ = false;
+  uint16_t last_buttons_ = 0;
+  // Pressed to close the menu, which happens when they're released.
+  uint16_t close_buttons_ = 0;
+  int repeat_direction_ = 0;
+  double repeat_time_ = 0.0;
+  double open_time_ = -1.0;
+
+  uint64_t fps_swaps_ = 0;
+  double fps_time_ = -1.0;
+  float fps_ = 0.0f;
+};
+
+}  // namespace rex::ui

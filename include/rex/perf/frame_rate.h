@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace rex::perf {
@@ -16,6 +17,10 @@ void RecordGuestSwap();
 
 // Total guest swaps since startup.
 uint64_t GetGuestSwapCount();
+
+// Times between the latest guest swaps in milliseconds, oldest first (up to
+// the last 255). Returns how many were written.
+size_t GetGuestFrameTimes(float* out_ms, size_t max_count);
 
 // Guest frontbuffer size (before resolution scaling) of the latest swap.
 void RecordGuestFrontbuffer(uint32_t width, uint32_t height);
