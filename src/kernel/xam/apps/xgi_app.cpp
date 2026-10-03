@@ -9,12 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
+#include <rex/net/session.h>
 #include <rex/thread.h>
 
 namespace rex {
@@ -112,6 +114,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, {:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+      rex::net::SetGameSessionOpen(true);
+      REXKRNL_INFO("[BurstSession] session open ({})", (flags & 0x01u) ? "host" : "join");
 
       // Bit 0 means this side is hosting. When joining, the game has already
       // copied the host XSESSION_INFO from XSessionSearchEx, so preserve it.
@@ -204,6 +208,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      rex::net::SetGameSessionOpen(false);
+      REXKRNL_INFO("[BurstSession] session closed");
 
       return X_E_SUCCESS;
     }
@@ -613,3 +619,19 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
+
+namespace rex::net {
+
+namespace {
+std::atomic<bool> g_game_session_open{false};
+}  // namespace
+
+bool IsGameSessionOpen() {
+  return g_game_session_open.load(std::memory_order_acquire);
+}
+
+void SetGameSessionOpen(bool open) {
+  g_game_session_open.store(open, std::memory_order_release);
+}
+
+}  // namespace rex::net
