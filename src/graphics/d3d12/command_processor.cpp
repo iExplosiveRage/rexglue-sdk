@@ -1012,6 +1012,28 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
   }
 }
 
+void D3D12CommandProcessor::InvalidateStateAfterExternalCommands() {
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  vertex_buffers_in_sync_[0] = 0;
+  vertex_buffers_in_sync_[1] = 0;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+  } else if (view_bindful_heap_current_ || sampler_bindful_heap_current_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
+                                              sampler_bindful_heap_current_);
+  }
+  render_target_cache_->InvalidateCommandListRenderTargets();
+}
+
 void D3D12CommandProcessor::SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature) {
   if (current_graphics_root_signature_ != root_signature) {
     current_graphics_root_signature_ = root_signature;
@@ -1725,6 +1747,11 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_WARN("Failed to initialize D3D12 resolve-downscale readback pipeline");
   }
 
+  dlss_ = std::make_unique<D3D12Dlss>(*this);
+  if (!dlss_->Initialize()) {
+    dlss_.reset();
+  }
+
   if (bindless_resources_used_) {
     // Create the system bindless descriptors once all resources are
     // initialized.
@@ -1880,6 +1907,10 @@ void D3D12CommandProcessor::WriteEdramBindlessDescriptors() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  if (dlss_) {
+    dlss_->Shutdown();
+    dlss_.reset();
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2507,6 +2538,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
 
+  if (dlss_) {
+    dlss_->EndFrame();
+  }
+
   // Between frames and outside the presenter's refresh, apply a draw
   // resolution scale changed in the settings.
   UpdateDrawResolutionScaleFromSettings();
@@ -2597,6 +2632,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return true;
     }
   }
+  // DLSS (see D3D12Dlss): the scene draws - depth test on and not always
+  // passing, into the frontbuffer-wide render target - and the first HUD draw
+  // after them, where the scene is handed over.
+  bool dlss_take_scene = false;
+  if (dlss_ && is_rasterization_done) {
+    const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (depth_control.z_enable && frontbuffer_width &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      if (depth_control.zfunc != xenos::CompareFunction::kAlways) {
+        float camera_constants[16];
+        for (uint32_t i = 0; i < 16; ++i) {
+          camera_constants[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+        }
+        dlss_->OnSceneDraw(camera_constants);
+      } else {
+        dlss_take_scene = dlss_->WantsScene();
+      }
+    }
+  }
   // App option (rex::graphics::SetHideHudDraws): leave out what's drawn over
   // the 3D scene with the depth test on but always passing - the HUD.
   if (is_rasterization_done && rex::graphics::GetHideHudDraws()) {
@@ -2651,6 +2706,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  if (dlss_take_scene) {
+    const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+    uint32_t scene_width = render_info.frontbuffer_width * texture_cache_->draw_resolution_scale_x();
+    uint32_t scene_height =
+        render_info.frontbuffer_height * texture_cache_->draw_resolution_scale_y();
+    render_target_cache_->RequestSceneCallback(
+        [this, scene_width, scene_height](ID3D12Resource* color, ID3D12Resource* depth,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
+          (void)depth;
+          return dlss_->ProcessScene(color, depth_srv, scene_width, scene_height);
+        });
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -4139,11 +4206,26 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   // Conversion to Direct3D 12 normalized device coordinates.
+  // With DLSS, the scene draws (as in IssueDraw) are shifted by the frame's
+  // sub-pixel jitter - like a jittered projection, as the offset is multiplied
+  // by W.
+  float ndc_jitter[3] = {};
+  if (dlss_ && (dlss_->jitter_x() != 0.0f || dlss_->jitter_y() != 0.0f) &&
+      normalized_depth_control.z_enable &&
+      normalized_depth_control.zfunc != xenos::CompareFunction::kAlways &&
+      viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      ndc_jitter[0] = 2.0f * dlss_->jitter_x() / float(viewport_info.xy_extent[0]);
+      ndc_jitter[1] = -2.0f * dlss_->jitter_y() / float(viewport_info.xy_extent[1]);
+    }
+  }
   for (uint32_t i = 0; i < 3; ++i) {
+    float ndc_offset = viewport_info.ndc_offset[i] + ndc_jitter[i];
     dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
-    dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
+    dirty |= system_constants_.ndc_offset[i] != ndc_offset;
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
-    system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+    system_constants_.ndc_offset[i] = ndc_offset;
   }
 
   // Field of view option for the main 3D scene: depth-tested draws (the HUD

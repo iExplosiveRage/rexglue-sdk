@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include <rex/assert.h>
@@ -442,6 +443,16 @@ class DeferredCommandList {
 
   void EndDebugMarker() { WriteCommand(Command::kEndDebugMarker, 0); }
 
+  // Runs code that needs the real command list (third-party SDKs such as
+  // NVIDIA NGX) when the deferred commands are executed. Such code can change
+  // any command list state, so the caller must set again what it relies on
+  // afterwards (descriptor heaps, root signatures, pipeline).
+  void ExternalCallback(std::function<void(ID3D12GraphicsCommandList*)> callback) {
+    *reinterpret_cast<size_t*>(WriteCommand(Command::kExternalCallback, sizeof(size_t))) =
+        external_callbacks_.size();
+    external_callbacks_.push_back(std::move(callback));
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -494,6 +505,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kExternalCallback,
   };
 
   struct CommandHeader {
@@ -644,6 +656,7 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  std::vector<std::function<void(ID3D12GraphicsCommandList*)>> external_callbacks_;
 };
 
 }  // namespace rex::graphics::d3d12

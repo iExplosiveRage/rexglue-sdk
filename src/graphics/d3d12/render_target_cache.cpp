@@ -1069,6 +1069,26 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
           last_update_accumulated_render_targets();
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+      if (scene_callback_) {
+        SceneCallback scene_callback = std::move(scene_callback_);
+        scene_callback_ = nullptr;
+        auto* depth_rt = static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0]);
+        auto* color_rt = static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[1]);
+        if (depth_rt && color_rt && depth_rt->descriptor_srv().IsValid()) {
+          command_processor_.PushTransitionBarrier(
+              depth_rt->resource(),
+              depth_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          command_processor_.PushTransitionBarrier(
+              color_rt->resource(),
+              color_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          color_rt->SetResourceState(scene_callback(color_rt->resource(), depth_rt->resource(),
+                                                    depth_rt->descriptor_srv().GetHandle()));
+          // The callback may have run code that binds anything.
+          are_current_command_list_render_targets_valid_ = false;
+        }
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {

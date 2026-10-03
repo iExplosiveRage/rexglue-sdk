@@ -25,6 +25,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/d3d12/dlss.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
@@ -187,6 +188,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // invalidation primarily. A submission must be open.
   void SetExternalPipeline(ID3D12PipelineState* pipeline);
   void SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature);
+  // After third-party code ran on the command list (DeferredCommandList::
+  // ExternalCallback): binds the descriptor heaps again and forgets the cached
+  // command list state. A submission must be open.
+  void InvalidateStateAfterExternalCommands();
   void SetViewport(const D3D12_VIEWPORT& viewport);
   void SetScissorRect(const D3D12_RECT& scissor_rect);
   void SetStencilReference(uint32_t stencil_ref);
@@ -567,6 +572,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
+
+  // NVIDIA DLAA for the 3D scene (null if its pipelines couldn't be created).
+  std::unique_ptr<D3D12Dlss> dlss_;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

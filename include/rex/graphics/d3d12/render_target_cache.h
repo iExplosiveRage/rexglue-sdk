@@ -63,6 +63,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     are_current_command_list_render_targets_valid_ = false;
   }
 
+  // Hands the scene over (for DLSS) in the next Update on the host render
+  // target path, after the transfers into the render targets of that draw and
+  // before binding them, if it has a depth and a color render target. Both are
+  // given in NON_PIXEL_SHADER_RESOURCE; the callback returns the state it
+  // leaves the color render target in.
+  using SceneCallback = std::function<D3D12_RESOURCE_STATES(
+      ID3D12Resource* color, ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv)>;
+  void RequestSceneCallback(SceneCallback callback) { scene_callback_ = std::move(callback); }
+
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 
   void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
@@ -692,6 +701,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   const RenderTarget* const*
       current_command_list_render_targets_[1 + xenos::kMaxColorRenderTargets];
   bool are_current_command_list_render_targets_valid_ = false;
+  SceneCallback scene_callback_;
 
   // Temporary storage for descriptors used in PerformTransfersAndResolveClears
   // and DumpRenderTargets.

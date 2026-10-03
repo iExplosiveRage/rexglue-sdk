@@ -82,6 +82,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/shared_memory.cpp
         d3d12/texture_cache.cpp
         d3d12/deferred_command_list.cpp
+        d3d12/dlss.cpp
         d3d12/pipeline_cache.cpp
     )
 endif()
@@ -159,5 +160,13 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
     )
+endif()
+
+# NVIDIA DLSS (cmake/rexglue_dlss.cmake): NGX is linked statically into the
+# plugin; nvngx_dlss.dll is copied next to the executable.
+if(REXGLUE_ENABLE_DLSS AND REXGLUE_DLSS_LIBRARY)
+    target_include_directories(rexgpu-xenos PRIVATE ${REXGLUE_DLSS_INCLUDE_DIR})
+    target_link_libraries(rexgpu-xenos PRIVATE ${REXGLUE_DLSS_LIBRARY})
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_DLSS=1)
 endif()
 
