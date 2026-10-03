@@ -11,7 +11,10 @@
 #include <atomic>
 #include <cfloat>
 #include <filesystem>
+#include <iterator>
+#include <string>
 #include <system_error>
+#include <vector>
 
 #include <rex/platform.h>
 
@@ -34,18 +37,37 @@ void AddFonts(ImFontAtlas* atlas) {
     return;
   }
   static const ImWchar kGlyphRanges[] = {0x0020, 0x00FF, 0};
-  static const char* const kFontPaths[] = {
+  // Bold sans fonts of Linux distributions (Fedora, Arch, Debian / Ubuntu) -
+  // for native builds, and through Wine's Z: drive for Windows builds running
+  // under Wine / Proton, which don't have the Windows fonts.
+  static const char* const kLinuxFontPaths[] = {
+      "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+      "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/open-sans/OpenSans-Bold.ttf",
+  };
+  std::vector<std::string> font_paths;
 #if REX_PLATFORM_WIN32
+  font_paths = {
       "C:\\Windows\\Fonts\\segoeuib.ttf",
       "C:\\Windows\\Fonts\\seguisb.ttf",
       "C:\\Windows\\Fonts\\arialbd.ttf",
-#else
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-      "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-      "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-#endif
   };
-  for (const char* path : kFontPaths) {
+  for (const char* path : kLinuxFontPaths) {
+    font_paths.push_back(std::string("Z:") + path);
+  }
+#else
+  font_paths.assign(std::begin(kLinuxFontPaths), std::end(kLinuxFontPaths));
+  font_paths.push_back("/System/Library/Fonts/Supplemental/Arial Bold.ttf");
+#endif
+  for (const std::string& font_path : font_paths) {
+    const char* path = font_path.c_str();
     std::error_code error;
     if (!std::filesystem::exists(path, error)) {
       continue;
