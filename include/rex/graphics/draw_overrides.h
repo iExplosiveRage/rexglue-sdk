@@ -49,6 +49,14 @@ const PixelShaderDrawOverride* FindPixelShaderDrawOverride(uint64_t ucode_hash);
 void SetSceneProjectionScale(float scale);
 float GetSceneProjectionScale();
 
+// Also apply the field of view (and roll) to the perspective vertices of
+// triangles drawn into the main render target with the depth test off - the
+// scene effects some games draw after the scene (glows, flares, speed lines).
+// Full-screen passes (quads, rectangles) and the HUD (depth test on, always
+// passing) stay as they are. Thread-safe.
+void SetSceneProjectionUndepthedTriangles(bool enable);
+bool GetSceneProjectionUndepthedTriangles();
+
 // Roll of the 3D scene in radians (the same draws as the projection scale),
 // turning the picture around the center of the screen like a tilted camera.
 // Thread-safe.

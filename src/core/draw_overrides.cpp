@@ -18,6 +18,7 @@ namespace rex::graphics {
 namespace {
 std::atomic<float> g_scene_projection_scale{1.0f};
 std::atomic<float> g_scene_projection_roll{0.0f};
+std::atomic<bool> g_scene_projection_undepthed_triangles{false};
 std::atomic<bool> g_hide_hud_draws{false};
 std::mutex g_overrides_mutex;
 std::map<std::string, std::vector<PixelShaderDrawOverride>> g_overrides_by_owner;
@@ -72,6 +73,14 @@ void SetSceneProjectionRoll(float radians) {
 
 float GetSceneProjectionRoll() {
   return g_scene_projection_roll.load(std::memory_order_relaxed);
+}
+
+void SetSceneProjectionUndepthedTriangles(bool enable) {
+  g_scene_projection_undepthed_triangles.store(enable, std::memory_order_relaxed);
+}
+
+bool GetSceneProjectionUndepthedTriangles() {
+  return g_scene_projection_undepthed_triangles.load(std::memory_order_relaxed);
 }
 
 void SetHideHudDraws(bool hide) {

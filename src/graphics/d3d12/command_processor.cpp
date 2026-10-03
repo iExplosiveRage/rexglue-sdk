@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,9 @@ REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
 REXCVAR_DEFINE_INT32(gpu_debug_log_vs_constants, 0, "GPU/Debug",
                      "With gpu_debug_log_draws, also log this many vertex shader float "
                      "constants (from c0) for each draw");
+REXCVAR_DEFINE_BOOL(gpu_debug_draw_census, false, "GPU/Debug",
+                    "Log each new kind of draw (shaders, depth test, render target) once, with "
+                    "its first vertex - to find which draws make an effect");
 
 REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
                       "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
@@ -2735,6 +2739,54 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     viewport_cache_valid_ = true;
   }
 
+  {
+    // gpu_debug_draw_census: each new kind of draw once.
+    static std::unordered_set<uint64_t> census_seen;
+    if (!REXCVAR_GET(gpu_debug_draw_census)) {
+      census_seen.clear();
+    } else {
+      const uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+      const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+      uint64_t key = vertex_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull ^ ps_hash;
+      key = key * 31 + (uint64_t(normalized_depth_control.z_enable) |
+                        uint64_t(normalized_depth_control.z_write_enable) << 1 |
+                        uint64_t(normalized_depth_control.zfunc) << 2 | uint64_t(pitch) << 8 |
+                        uint64_t(regs[XE_GPU_REG_PA_CL_VTE_CNTL]) << 24);
+      if (census_seen.insert(key).second) {
+        float v[8] = {};
+        uint32_t vertex_address = 0;
+        const Shader::ConstantRegisterMap& vmap = vertex_shader->constant_register_map();
+        for (uint32_t i = 0; i < rex::countof(vmap.vertex_fetch_bitmap) && !vertex_address; ++i) {
+          uint32_t j;
+          if (rex::bit_scan_forward(vmap.vertex_fetch_bitmap[i], &j)) {
+            vertex_address = regs.GetVertexFetch(i * 32 + j).address << 2;
+          }
+        }
+        if (const uint32_t* words =
+                vertex_address ? memory_->TranslatePhysical<const uint32_t*>(vertex_address)
+                               : nullptr) {
+          for (int k = 0; k < 8; ++k) {
+            const uint32_t word = rex::byte_swap(words[k]);
+            std::memcpy(&v[k], &word, sizeof(word));
+          }
+        }
+        REXGPU_INFO(
+            "CENSUS vs={:016X} ps={:016X} pitch={} z={}/{}/{} vte={:08X} vport=({} {} {} {}) "
+            "prim={} idx={} c0={:08X} v0=({} {} {} {} | {} {} {} {})",
+            vertex_shader->ucode_data_hash(), ps_hash, pitch,
+            uint32_t(normalized_depth_control.z_enable),
+            uint32_t(normalized_depth_control.z_write_enable),
+            uint32_t(normalized_depth_control.zfunc), regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET), uint32_t(primitive_type),
+            index_count, regs[XE_GPU_REG_RB_COLOR_INFO], v[0], v[1], v[2], v[3], v[4], v[5],
+            v[6], v[7]);
+      }
+    }
+  }
+
   if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
     REXGPU_INFO(
         "DRAW vs={:016X} ps={:016X} color0={:08X} depth={:08X} pitch={} msaa={} z={}/{}/{} "
@@ -2778,7 +2830,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+                             used_texture_mask, normalized_depth_control, normalized_color_mask,
+                             primitive_type);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -3897,7 +3950,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask, xenos::PrimitiveType guest_primitive_type) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4104,9 +4157,17 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   float scene_projection_matrix[4] = {1.0f, 0.0f, 0.0f, 1.0f};
   const float requested_scene_projection_scale = rex::graphics::GetSceneProjectionScale();
   const float requested_scene_roll = rex::graphics::GetSceneProjectionRoll();
+  const bool scene_depth_tested = normalized_depth_control.z_enable &&
+                                  normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
+  // Effects drawn after the scene with the depth test off, as triangles - not
+  // the full-screen passes' quads and rectangles - if the app asks.
+  const bool scene_effect =
+      !normalized_depth_control.z_enable && rex::graphics::GetSceneProjectionUndepthedTriangles() &&
+      (guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
+       guest_primitive_type == xenos::PrimitiveType::kTriangleFan ||
+       guest_primitive_type == xenos::PrimitiveType::kTriangleStrip);
   if ((requested_scene_projection_scale != 1.0f || requested_scene_roll != 0.0f) &&
-      normalized_depth_control.z_enable &&
-      normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
+      (scene_depth_tested || scene_effect)) {
     const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
     if (render_info.frontbuffer_width && render_info.frontbuffer_height &&
         regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= render_info.frontbuffer_width) {
