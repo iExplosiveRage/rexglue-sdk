@@ -68,6 +68,10 @@ class InputSystem : public system::IInputSystem {
   /// Changes the buttons of the combo, 0 to turn it off.
   void SetUIToggleComboButtons(uint16_t buttons);
 
+  /// Debugging / automation: the guest sees `buttons` (X_INPUT_GAMEPAD_*)
+  /// held on `user_index` for `duration_ms`, on top of the real controller.
+  void InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t duration_ms);
+
   bool GetVibrationEnabled() const;
   void ToggleVibration();
 
@@ -118,6 +122,10 @@ class InputSystem : public system::IInputSystem {
   std::atomic<uint16_t> ui_toggle_combo_{0};
   std::function<void()> ui_toggle_callback_;
   std::array<bool, kMaxGuestUsers> ui_toggle_combo_held_ = {};
+
+  // InjectButtons: per user, the buttons and until when (steady clock ms).
+  std::array<uint16_t, kMaxGuestUsers> injected_buttons_ = {};
+  std::array<uint64_t, kMaxGuestUsers> injected_until_ms_ = {};
 };
 
 /// Create a default InputSystem with SDL + MnK + NOP drivers.
