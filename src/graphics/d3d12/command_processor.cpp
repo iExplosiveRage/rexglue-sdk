@@ -66,6 +66,13 @@ REXCVAR_DEFINE_BOOL(gpu_debug_draw_census, false, "GPU/Debug",
                     "Log each new kind of draw (shaders, depth test, render target) once, with "
                     "its first vertex - to find which draws make an effect");
 
+REXCVAR_DEFINE_DOUBLE(texture_lod_bias, 0.0, "GPU",
+                      "Added to every texture's mip level bias: below 0 samples sharper mips, so "
+                      "distant surfaces keep more detail (NVIDIA recommends -1 with DLAA, which "
+                      "smooths the extra shimmer; without it, values below -0.5 can shimmer)")
+    .range(-3.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
                       "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
                       "names) whose draws are skipped, for finding which effect draws something");
@@ -4666,6 +4673,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_bool_loop_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_bool_loop_constants);
   }
+  // texture_lod_bias goes into the fetch constants' LOD bias, which the
+  // translated shaders apply.
+  const int32_t texture_lod_bias = int32_t(std::lround(REXCVAR_GET(texture_lod_bias) * 32.0));
+  if (texture_lod_bias != applied_texture_lod_bias_) {
+    applied_texture_lod_bias_ = texture_lod_bias;
+    cbuffer_binding_fetch_.up_to_date = false;
+  }
   if (!cbuffer_binding_fetch_.up_to_date) {
     constexpr uint32_t kFetchConstantsSize = 32 * 6 * sizeof(uint32_t);
     uint8_t* fetch_constants = constant_buffer_pool_->Request(
@@ -4675,6 +4689,19 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+    if (texture_lod_bias) {
+      auto* fetch_dwords = reinterpret_cast<uint32_t*>(fetch_constants);
+      for (uint32_t i = 0; i < xenos::kTextureFetchConstantCount; ++i) {
+        uint32_t* fetch = fetch_dwords + i * 6;
+        if (xenos::FetchConstantType(fetch[0] & 3) != xenos::FetchConstantType::kTexture) {
+          continue;
+        }
+        // dword 4 bits 12-21: signed LOD bias with 5 fractional bits.
+        int32_t lod_bias = int32_t(fetch[4] << 10) >> 22;
+        lod_bias = std::clamp(lod_bias + texture_lod_bias, -512, 511);
+        fetch[4] = (fetch[4] & ~(UINT32_C(0x3FF) << 12)) | ((uint32_t(lod_bias) & 0x3FF) << 12);
+      }
+    }
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
   }
