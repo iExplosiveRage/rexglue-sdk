@@ -13,8 +13,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -101,6 +103,13 @@ REXCVAR_DEFINE_BOOL(texture_replace_preload, true, "GPU/Texture Replacement",
                     "Decode all the replacement textures in the background at startup, so they "
                     "don't stutter the game the first time they're used (keeps all of them in "
                     "RAM)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(texture_replace_ram_mb, 3072, "GPU/Texture Replacement",
+                     "RAM for decoded replacement textures (MB). The least recently used ones are "
+                     "dropped past it (and decoded again if needed), and a pack bigger than this "
+                     "isn't preloaded")
+    .range(256, 65536)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
@@ -315,6 +324,72 @@ uint32_t GetUpscalerRenderScale(uint32_t target_scale, const std::string& effect
     }
   }
   return best_scale;
+}
+
+// The replacement key of a texture: XXH3 of its base level as the guest
+// stores it, with the bytes the texture doesn't use - the padding of tiles
+// and rows around its texels - taken as zero. Games leave whatever was in
+// memory there, which would give the same texture a different key from run
+// to run; zero is what the tools building a pack from the game files see.
+// Textures without padding (or with a layout this doesn't handle - 3D,
+// arrays, a base in the packed mip tail) hash their bytes as they are.
+uint64_t HashReplacementBase(const texture_util::TextureGuestLayout& layout,
+                             xenos::DataDimension dimension, xenos::TextureFormat format,
+                             bool tiled, const uint8_t* guest_bytes, uint32_t guest_size) {
+  const texture_util::TextureGuestLayout::Level& base = layout.base;
+  const FormatInfo* format_info = FormatInfo::Get(format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (dimension != xenos::DataDimension::k2DOrStacked || layout.array_size != 1 ||
+      layout.packed_level == 0 || !bytes_per_block ||
+      (bytes_per_block & (bytes_per_block - 1)) || !base.row_pitch_bytes) {
+    return TextureReplacement::HashGuestData(guest_bytes, guest_size);
+  }
+  const uint32_t x_blocks = base.x_extent_blocks;
+  const uint32_t y_blocks = base.y_extent_blocks;
+  const uint32_t row_bytes = x_blocks * bytes_per_block;
+  if (uint64_t(row_bytes) * y_blocks >= guest_size) {
+    return TextureReplacement::HashGuestData(guest_bytes, guest_size);
+  }
+  std::vector<uint8_t> used(guest_size, 0);
+  if (tiled) {
+    const uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
+    const uint32_t pitch_blocks = base.row_pitch_bytes / bytes_per_block;
+    for (uint32_t y = 0; y < y_blocks; ++y) {
+      for (uint32_t x = 0; x < x_blocks; ++x) {
+        const uint32_t offset = uint32_t(
+            texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks,
+                                           bytes_per_block_log2));
+        if (uint64_t(offset) + bytes_per_block <= guest_size) {
+          std::memcpy(used.data() + offset, guest_bytes + offset, bytes_per_block);
+        }
+      }
+    }
+  } else {
+    for (uint32_t y = 0; y < y_blocks; ++y) {
+      const uint64_t offset = uint64_t(y) * base.row_pitch_bytes;
+      if (offset + row_bytes > guest_size) {
+        break;
+      }
+      std::memcpy(used.data() + offset, guest_bytes + offset, row_bytes);
+    }
+  }
+  return TextureReplacement::HashGuestData(used.data(), used.size());
+}
+
+// What HashReplacementBase depends on besides the bytes.
+uint64_t ReplacementLayoutSignature(const texture_util::TextureGuestLayout& layout,
+                                    xenos::DataDimension dimension, xenos::TextureFormat format,
+                                    bool tiled) {
+  const uint32_t values[] = {uint32_t(dimension),
+                             uint32_t(format),
+                             uint32_t(tiled),
+                             layout.array_size,
+                             layout.packed_level,
+                             layout.base.row_pitch_bytes,
+                             layout.base.x_extent_blocks,
+                             layout.base.y_extent_blocks};
+  return TextureReplacement::HashGuestData(reinterpret_cast<const uint8_t*>(values),
+                                           sizeof(values));
 }
 
 }  // namespace
@@ -537,6 +612,14 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     if (replacement) {
       uploaded_replacement = LoadTextureDataFromReplacementImpl(texture, *replacement);
     }
+    // The texture has the replacement's size and format: the guest data can't
+    // go in. The file is marked failed and the bindings looked up again, so
+    // the original texture is made instead.
+    if (!uploaded_replacement) {
+      replacement_->MarkFailed(texture.replacement_content_hash_);
+      texture_became_outdated_.store(true, std::memory_order_release);
+      return false;
+    }
   }
 
   if (!uploaded_replacement &&
@@ -545,15 +628,17 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     return false;
   }
 
-  // Keep dumping originals too, even when a replacement was uploaded.
+  // Dump the originals (a replaced texture's key has the replacement's size
+  // and format, and its original is in the pack already).
   if (replacement_ && pending_load.load_base && REXCVAR_GET(texture_dump_enabled) &&
-      !texture_key.scaled_resolve) {
+      !texture_key.scaled_resolve && !texture.replacement_content_hash_) {
     const uint32_t guest_addr = texture_key.base_page << 12;
     const uint32_t guest_size = texture.GetGuestBaseSize();
     if (guest_size > 0) {
       const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
       const uint64_t content_hash =
-          TextureReplacement::HashGuestData(guest_bytes, guest_size);
+          HashReplacementBase(texture.guest_layout(), texture_key.dimension, texture_key.format,
+                              texture_key.tiled != 0, guest_bytes, guest_size);
       replacement_->DumpTexture(content_hash, texture_key.GetWidth(), texture_key.GetHeight(),
                                 texture_key.pitch, texture_key.tiled != 0, texture_key.format,
                                 texture_key.endianness, guest_bytes, guest_size);
@@ -978,7 +1063,6 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
 
   // Look for a replacement using a stable hash of the original guest bytes.
-  const TextureReplacementData* replacement = nullptr;
   texture_util::TextureGuestLayout original_guest_layout{};
   bool has_replacement = false;
   uint64_t replacement_content_hash = 0;
@@ -993,34 +1077,44 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       const uint8_t* guest_bytes = shared_memory().TranslatePhysical(key.base_page << 12);
       const uint64_t fingerprint =
           TextureReplacement::FingerprintGuestData(guest_bytes, guest_size);
+      const uint64_t layout = ReplacementLayoutSignature(original_guest_layout, key.dimension,
+                                                         key.format, key.tiled != 0);
       auto cached_hash = base_page_hash_cache_.find(base_page);
 
       if (cached_hash != base_page_hash_cache_.end() &&
           cached_hash->second.size == guest_size &&
-          cached_hash->second.fingerprint == fingerprint) {
+          cached_hash->second.fingerprint == fingerprint &&
+          cached_hash->second.layout == layout) {
         replacement_content_hash = cached_hash->second.hash;
       } else {
-        replacement_content_hash = TextureReplacement::HashGuestData(guest_bytes, guest_size);
-        base_page_hash_cache_[base_page] = {guest_size, fingerprint, replacement_content_hash};
+        replacement_content_hash =
+            HashReplacementBase(original_guest_layout, key.dimension, key.format, key.tiled != 0,
+                                guest_bytes, guest_size);
+        base_page_hash_cache_[base_page] = {guest_size, fingerprint, layout,
+                                            replacement_content_hash};
       }
 
-      replacement = replacement_->FindReplacement(replacement_content_hash);
+      // Only the size here - the pixels are decoded when the texture is
+      // loaded (and may have been dropped from RAM since).
+      uint32_t replacement_width = 0, replacement_height = 0;
+      if (replacement_->FindReplacementSize(replacement_content_hash, replacement_width,
+                                            replacement_height)) {
+        // The key holds up to 8192 per side.
+        const uint32_t max_size = std::min(GetMaxHostTextureWidthHeight(key.dimension),
+                                           xenos::kTexture2DCubeMaxWidthHeight);
 
-      if (replacement && replacement->width > 0 && replacement->height > 0) {
-        const uint32_t max_size = GetMaxHostTextureWidthHeight(key.dimension);
-
-        if (replacement->width <= max_size && replacement->height <= max_size) {
+        if (replacement_width <= max_size && replacement_height <= max_size) {
           const uint32_t original_width = key.GetWidth();
           const uint32_t original_height = key.GetHeight();
 
-          key.width_minus_1 = replacement->width - 1;
-          key.height_minus_1 = replacement->height - 1;
+          key.width_minus_1 = replacement_width - 1;
+          key.height_minus_1 = replacement_height - 1;
           key.format = xenos::TextureFormat::k_8_8_8_8;
           // A full mip chain (made when the replacement is loaded), so it
           // doesn't shimmer when it's far away - the guest's sampler state
           // still picks which levels are used.
           key.mip_max_level =
-              std::min(rex::log2_floor(std::max(replacement->width, replacement->height)),
+              std::min(rex::log2_floor(std::max(replacement_width, replacement_height)),
                        uint32_t(xenos::kTextureMaxMips - 1));
           key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
 
@@ -1029,10 +1123,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           REXGPU_DEBUG(
               "TextureReplacement: injecting {}x{} replacement for original {}x{} "
               "(hash {:016x})",
-              replacement->width, replacement->height,
+              replacement_width, replacement_height,
               original_width, original_height, replacement_content_hash);
-        } else {
-          replacement = nullptr;
         }
       }
     }

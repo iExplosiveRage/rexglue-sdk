@@ -652,6 +652,8 @@ class TextureCache {
   struct CachedContentHash {
     uint32_t size;
     uint64_t fingerprint;
+    // The layout the hash was made with (the hash skips its padding).
+    uint64_t layout;
     uint64_t hash;
   };
   std::unordered_map<uint32_t, CachedContentHash> base_page_hash_cache_;

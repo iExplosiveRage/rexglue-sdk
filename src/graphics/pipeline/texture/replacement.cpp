@@ -654,7 +654,10 @@ void TextureReplacement::Rescan() {
   std::lock_guard<std::mutex> lock(cache_mutex_);
   replacements_.clear();
   pixel_cache_.clear();
+  pixel_cache_use_.clear();
+  pixel_cache_bytes_ = 0;
   failed_cache_.clear();
+  size_cache_.clear();
 
   std::error_code ec;
   if (!std::filesystem::exists(replace_dir(), ec))
@@ -937,9 +940,154 @@ bool TextureReplacement::LoadFile(const std::filesystem::path& path, TextureRepl
   return true;
 }
 
+bool TextureReplacement::ReadImageSize(const std::filesystem::path& path, uint32_t& width,
+                                       uint32_t& height) {
+  uint8_t header[24] = {};
+  std::ifstream file(path, std::ios::binary);
+  if (!file.read(reinterpret_cast<char*>(header), sizeof(header))) {
+    return false;
+  }
+  auto big_endian = [&](size_t offset) {
+    return (uint32_t(header[offset]) << 24) | (uint32_t(header[offset + 1]) << 16) |
+           (uint32_t(header[offset + 2]) << 8) | uint32_t(header[offset + 3]);
+  };
+  auto little_endian = [&](size_t offset) {
+    return uint32_t(header[offset]) | (uint32_t(header[offset + 1]) << 8) |
+           (uint32_t(header[offset + 2]) << 16) | (uint32_t(header[offset + 3]) << 24);
+  };
+  width = 0;
+  height = 0;
+  if (!std::memcmp(header, "\x89PNG", 4)) {
+    width = big_endian(16);  // IHDR
+    height = big_endian(20);
+  } else if (!std::memcmp(header, "DDS ", 4)) {
+    height = little_endian(12);
+    width = little_endian(16);
+  }
+  return width && height && width <= 16384 && height <= 16384;
+}
+
+uint64_t TextureReplacement::DecodedSize(const std::filesystem::path& path) {
+  uint32_t width, height;
+  if (!ReadImageSize(path, width, height)) {
+    return 0;
+  }
+  // RGBA8, and a third more for the mips.
+  return uint64_t(width) * height * 4 * 4 / 3;
+}
+
+void TextureReplacement::MarkFailed(uint64_t content_hash) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  failed_cache_.insert(content_hash);
+  size_cache_.erase(content_hash);
+}
+
+bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& width,
+                                             uint32_t& height) const {
+  std::filesystem::path path;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    // The background decoding starts with the first texture looked up.
+    if (!preload_started_) {
+      StartPreload();
+    }
+    auto cached = pixel_cache_.find(content_hash);
+    if (cached != pixel_cache_.end()) {
+      width = cached->second.width;
+      height = cached->second.height;
+      return width && height;
+    }
+    if (failed_cache_.count(content_hash)) {
+      return false;
+    }
+    auto size = size_cache_.find(content_hash);
+    if (size != size_cache_.end()) {
+      width = size->second.first;
+      height = size->second.second;
+      return true;
+    }
+    auto it = replacements_.find(content_hash);
+    if (it == replacements_.end()) {
+      return false;
+    }
+    path = it->second;
+  }
+  const bool ok = ReadImageSize(path, width, height);
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  if (ok) {
+    size_cache_[content_hash] = {width, height};
+  } else {
+    failed_cache_.insert(content_hash);
+  }
+  return ok;
+}
+
+uint64_t TextureReplacement::CachedSize(const TextureReplacementData& data) {
+  uint64_t bytes = data.pixels.size();
+  for (const auto& mip : data.mips) {
+    bytes += mip.size();
+  }
+  return bytes;
+}
+
+TextureReplacementData* TextureReplacement::AddToPixelCache(uint64_t hash,
+                                                            TextureReplacementData&& data) const {
+  auto [it, added] = pixel_cache_.emplace(hash, std::move(data));
+  if (added) {
+    PixelCacheUse& use = pixel_cache_use_[hash];
+    use.bytes = CachedSize(it->second);
+    use.last_use = ++pixel_cache_clock_;
+    pixel_cache_bytes_ += use.bytes;
+  }
+  return &it->second;
+}
+
+void TextureReplacement::TrimPixelCache(uint64_t keep) const {
+  if (pixel_cache_bytes_ <= pixel_cache_budget_) {
+    return;
+  }
+  const uint64_t before = pixel_cache_bytes_;
+  size_t dropped = 0;
+  // Oldest first; a few thousand entries at most, and only when a new texture
+  // pushed the cache over.
+  std::vector<std::pair<uint64_t, uint64_t>> by_age;  // last use, hash
+  by_age.reserve(pixel_cache_use_.size());
+  for (const auto& [hash, use] : pixel_cache_use_) {
+    if (hash != keep) {
+      by_age.emplace_back(use.last_use, hash);
+    }
+  }
+  std::sort(by_age.begin(), by_age.end());
+  for (const auto& [last_use, hash] : by_age) {
+    if (pixel_cache_bytes_ <= pixel_cache_budget_) {
+      break;
+    }
+    auto use = pixel_cache_use_.find(hash);
+    pixel_cache_bytes_ -= use->second.bytes;
+    pixel_cache_use_.erase(use);
+    pixel_cache_.erase(hash);
+    ++dropped;
+  }
+  REXLOG_INFO("TextureReplacement: dropped {} decoded texture(s) from RAM ({} -> {} MB)", dropped,
+              before >> 20, pixel_cache_bytes_ >> 20);
+}
+
 void TextureReplacement::StartPreload() const {
   preload_started_ = true;
+  pixel_cache_budget_ = uint64_t(std::max(REXCVAR_GET(texture_replace_ram_mb), 1)) << 20;
   if (!REXCVAR_GET(texture_replace_preload) || replacements_.empty()) {
+    return;
+  }
+  // A pack too big to keep decoded is loaded as it's used instead.
+  uint64_t pack_bytes = 0;
+  for (const auto& [hash, path] : replacements_) {
+    pack_bytes += DecodedSize(path);
+  }
+  if (pack_bytes > pixel_cache_budget_) {
+    REXLOG_INFO(
+        "TextureReplacement: not preloading - the {} replacement(s) take {} MB decoded, more "
+        "than texture_replace_ram_mb ({} MB); they load as they're used",
+        replacements_.size(), pack_bytes >> 20, pixel_cache_budget_ >> 20);
     return;
   }
   preload_queue_.assign(replacements_.begin(), replacements_.end());
@@ -994,7 +1142,7 @@ void TextureReplacement::PreloadWorker() const {
       {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (ok) {
-          pixel_cache_.emplace(hash, std::move(loaded));
+          AddToPixelCache(hash, std::move(loaded));
         } else {
           failed_cache_.insert(hash);
         }
@@ -1035,6 +1183,10 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
 
     auto cached = pixel_cache_.find(content_hash);
     if (cached != pixel_cache_.end()) {
+      auto use = pixel_cache_use_.find(content_hash);
+      if (use != pixel_cache_use_.end()) {
+        use->second.last_use = ++pixel_cache_clock_;
+      }
       return &cached->second;
     }
     // Known failure — don't retry.
@@ -1054,7 +1206,7 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
   const auto load_start = std::chrono::steady_clock::now();
   TextureReplacementData loaded;
   const bool ok = LoadFile(path, loaded);
-  if (REXCVAR_GET(texture_replace_preload)) {
+  if (!preload_queue_.empty()) {
     REXLOG_INFO("TextureReplacement: {} was needed before the preload got to it, loaded in {} ms",
                 path.filename().string(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1065,7 +1217,8 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     if (ok) {
-      result = &pixel_cache_.emplace(content_hash, std::move(loaded)).first->second;
+      result = AddToPixelCache(content_hash, std::move(loaded));
+      TrimPixelCache(content_hash);
     } else {
       failed_cache_.insert(content_hash);
     }

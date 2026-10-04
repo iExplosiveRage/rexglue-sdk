@@ -50,6 +50,7 @@ class Thread;
 REXCVAR_DECLARE(bool, texture_dump_enabled);
 REXCVAR_DECLARE(bool, texture_replace_enabled);
 REXCVAR_DECLARE(bool, texture_replace_preload);
+REXCVAR_DECLARE(int32_t, texture_replace_ram_mb);
 REXCVAR_DECLARE(std::string, texture_folder);
 
 namespace rex::graphics {
@@ -106,6 +107,13 @@ class TextureReplacement {
   // starts decoding all the files in the background (texture_replace_preload),
   // ones not decoded yet are loaded here.
   [[nodiscard]] const TextureReplacementData* FindReplacement(uint64_t content_hash) const;
+  // Whether there's a replacement for the hash, and its size - from the file's
+  // header, without decoding it. The same as FindReplacement's width and
+  // height when that succeeds.
+  bool FindReplacementSize(uint64_t content_hash, uint32_t& width, uint32_t& height) const;
+  // A replacement that couldn't be used (e.g. a format the GPU upload doesn't
+  // take): it isn't offered again, so the original texture is used.
+  void MarkFailed(uint64_t content_hash) const;
 
   // The smaller mips of an RGBA8 image down to 1x1: each texel is the average
   // of 2x2 of the level above, weighted by alpha so the color of transparent
@@ -127,6 +135,20 @@ class TextureReplacement {
  private:
   // Decodes a replacement file and makes its mips.
   static bool LoadFile(const std::filesystem::path& path, TextureReplacementData& out);
+  // RAM an image file takes decoded (RGBA8 with its mips), from its header; 0
+  // if it can't be read.
+  static uint64_t DecodedSize(const std::filesystem::path& path);
+  // An image file's size from its header (PNG or DDS); false if unreadable.
+  static bool ReadImageSize(const std::filesystem::path& path, uint32_t& width, uint32_t& height);
+  // Bytes of a decoded texture in pixel_cache_.
+  static uint64_t CachedSize(const TextureReplacementData& data);
+  // Adds a decoded texture to pixel_cache_ (cache_mutex_ held).
+  TextureReplacementData* AddToPixelCache(uint64_t hash, TextureReplacementData&& data) const;
+  // Drops the least recently used decoded textures, other than `keep`, while
+  // pixel_cache_ is over texture_replace_ram_mb (cache_mutex_ held). Only
+  // FindReplacement calls it: the pointers it returned before are used before
+  // it's called again.
+  void TrimPixelCache(uint64_t keep) const;
   // Decodes the indexed files on background threads.
   void StartPreload() const;
   void StopPreload();
@@ -136,12 +158,26 @@ class TextureReplacement {
   std::unordered_map<uint64_t, std::filesystem::path> replacements_;
 
   // Textures that have been loaded from disk are cached here so that
-  // FindReplacement never touches the filesystem after the first load.
+  // FindReplacement doesn't touch the filesystem again while they're in RAM.
   // Elements are never moved, so pointers to them stay valid while others are
-  // added.
+  // added; the least recently used ones are dropped past texture_replace_ram_mb
+  // (TrimPixelCache).
   mutable std::unordered_map<uint64_t, TextureReplacementData> pixel_cache_;
+  // Per cached texture: its size and when it was last asked for.
+  struct PixelCacheUse {
+    uint64_t bytes = 0;
+    uint64_t last_use = 0;
+  };
+  mutable std::unordered_map<uint64_t, PixelCacheUse> pixel_cache_use_;
+  mutable uint64_t pixel_cache_bytes_ = 0;
+  mutable uint64_t pixel_cache_clock_ = 0;
+  // texture_replace_ram_mb in bytes, or the whole preloaded pack if that's
+  // bigger (it fit the budget when the preload started).
+  mutable uint64_t pixel_cache_budget_ = 0;
   // Hashes that failed to load are remembered so we don't retry every frame.
   mutable std::unordered_set<uint64_t> failed_cache_;
+  // Sizes of the replacement files read so far (FindReplacementSize).
+  mutable std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> size_cache_;
   // Guards the caches, shared with the preload threads.
   mutable std::mutex cache_mutex_;
   // Hashes being decoded right now (by the preload or FindReplacement), and
