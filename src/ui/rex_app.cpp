@@ -582,6 +582,26 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  // A key setting in the quick menu waiting for a key gets it, not the binds.
+  if (ui::QuickMenuDialog::CaptureKey(e)) {
+    e.set_handled(true);
+    return;
+  }
+  // While a text box (the console) has the keyboard, the keys that type or
+  // edit text are for it; the function keys and the keys of the console and
+  // the settings menu (wherever they're bound) still work.
+  if (window_ && window_->IsTextInputActive()) {
+    const auto key = e.virtual_key();
+    const std::string owner = rex::ui::FindBindForKey(key);
+    const bool command_key =
+        (key >= ui::VirtualKey::kF1 && key <= ui::VirtualKey::kF24) ||
+        owner == "bind_console" || owner == "bind_quick_menu" ||
+        key == ui::VirtualKey::kEscape || key == ui::VirtualKey::kPause ||
+        key == ui::VirtualKey::kSnapshot || key == ui::VirtualKey::kScroll;
+    if (!command_key) {
+      return;
+    }
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 

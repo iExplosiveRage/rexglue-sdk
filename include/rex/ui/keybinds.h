@@ -71,6 +71,13 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
 void UnregisterBind(std::string_view name);
 
 /**
+ * Find the bind a key is bound to.
+ * @param key  The key.
+ * @return     The bind's CVAR name, or empty if no bind uses the key.
+ */
+std::string FindBindForKey(VirtualKey key);
+
+/**
  * Process a key-down event against all registered binds.
  *
  * Looks up each bind's current key from its CVAR, parses it, and compares

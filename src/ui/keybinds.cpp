@@ -208,6 +208,16 @@ void UnregisterBind(std::string_view name) {
   }
 }
 
+std::string FindBindForKey(VirtualKey key) {
+  std::lock_guard lock(g_binds_mutex);
+  for (const auto& entry : g_binds) {
+    if (entry.callback && key != VirtualKey::kNone && ParseVirtualKey(entry.current_key) == key) {
+      return entry.name;
+    }
+  }
+  return {};
+}
+
 bool ProcessKeyEvent(KeyEvent& e) {
   std::lock_guard lock(g_binds_mutex);
   for (auto& entry : g_binds) {
@@ -215,7 +225,10 @@ bool ProcessKeyEvent(KeyEvent& e) {
       continue;
     VirtualKey vk = ParseVirtualKey(entry.current_key);
     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
-      entry.callback();
+      /* A held key repeats; the bind fires once per press. */
+      if (!e.prev_state()) {
+        entry.callback();
+      }
       e.set_handled(true);
       return true;
     }

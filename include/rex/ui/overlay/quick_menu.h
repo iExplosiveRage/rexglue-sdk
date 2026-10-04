@@ -17,6 +17,8 @@
 #include <vector>
 
 #include <rex/ui/imgui_dialog.h>
+#include <rex/ui/ui_event.h>
+#include <rex/ui/virtual_key.h>
 
 namespace rex::ui {
 
@@ -29,6 +31,9 @@ struct QuickMenuItem {
     kChoice,
     // A number from `min` to `max` in `step` increments.
     kNumber,
+    // A key bind (the cvar of a RegisterBind): activating it waits for the
+    // next key press and binds that key.
+    kKey,
   };
 
   Kind kind = Kind::kToggle;
@@ -94,6 +99,10 @@ class QuickMenuDialog : public ImGuiDialog {
   // Whether a quick menu is open (it has the controllers then). Any thread.
   static bool IsOpen();
 
+  // While a key setting waits for a key, takes every key press (so binds
+  // don't fire) and returns true. UI thread, before the binds.
+  static bool CaptureKey(const KeyEvent& e);
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -106,6 +115,9 @@ class QuickMenuDialog : public ImGuiDialog {
   void Change(const QuickMenuItem& item, int direction);
   void Set(const QuickMenuItem& item, const std::string& value);
   void RequestClose();
+  void StartCapture(const QuickMenuItem& item);
+  void FinishCapture(VirtualKey key);
+  void StopCapture();
 
   QuickMenuConfig config_;
   Callbacks callbacks_;
@@ -124,6 +136,14 @@ class QuickMenuDialog : public ImGuiDialog {
   int repeat_direction_ = 0;
   double repeat_time_ = 0.0;
   double open_time_ = -1.0;
+
+  // The key setting waiting for a key, the key pressed meanwhile, and why the
+  // last one wasn't taken.
+  const QuickMenuItem* capturing_ = nullptr;
+  VirtualKey captured_key_ = VirtualKey::kNone;
+  std::string capture_message_;
+  // Menu keys are ignored briefly after a key was bound (the same press).
+  double keyboard_quiet_until_ = 0.0;
 
   uint64_t fps_swaps_ = 0;
   double fps_time_ = -1.0;

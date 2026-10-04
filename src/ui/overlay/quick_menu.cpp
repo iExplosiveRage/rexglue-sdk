@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/perf/frame_rate.h>
 #include <rex/string/numeric.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/overlay/overlay_text.h>
 
 namespace rex::ui {
@@ -142,7 +143,23 @@ std::string CvarNumber(const std::string& cvar, double value) {
   return text;
 }
 
+// A key name for people: "Numpad0" -> "Numpad 0", "PageUp" -> "Page Up".
+std::string KeyLabel(const std::string& name) {
+  std::string label;
+  for (size_t i = 0; i < name.size(); ++i) {
+    const char c = name[i];
+    if (i && name[i - 1] >= 'a' && name[i - 1] <= 'z' &&
+        ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+      label += ' ';
+    }
+    label += c;
+  }
+  return label;
+}
+
 std::atomic<int> open_menus{0};
+// UI thread only.
+QuickMenuDialog* capturing_menu = nullptr;
 
 }  // namespace
 
@@ -168,11 +185,114 @@ QuickMenuDialog::QuickMenuDialog(ImGuiDrawer* imgui_drawer, QuickMenuConfig conf
 }
 
 QuickMenuDialog::~QuickMenuDialog() {
+  if (capturing_menu == this) {
+    capturing_menu = nullptr;
+  }
   open_menus.fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool QuickMenuDialog::IsOpen() {
   return open_menus.load(std::memory_order_relaxed) > 0;
+}
+
+bool QuickMenuDialog::CaptureKey(const KeyEvent& e) {
+  QuickMenuDialog* menu = capturing_menu;
+  if (!menu || !menu->capturing_) {
+    return false;
+  }
+  // A held key repeats; only the press counts.
+  if (!e.prev_state()) {
+    menu->captured_key_ = e.virtual_key();
+  }
+  return true;
+}
+
+void QuickMenuDialog::StartCapture(const QuickMenuItem& item) {
+  capturing_ = &item;
+  captured_key_ = VirtualKey::kNone;
+  capture_message_.clear();
+  capturing_menu = this;
+}
+
+void QuickMenuDialog::FinishCapture(VirtualKey key) {
+  switch (key) {
+    case VirtualKey::kShift:
+    case VirtualKey::kLShift:
+    case VirtualKey::kRShift:
+    case VirtualKey::kControl:
+    case VirtualKey::kLControl:
+    case VirtualKey::kRControl:
+    case VirtualKey::kMenu:
+    case VirtualKey::kLMenu:
+    case VirtualKey::kRMenu:
+    case VirtualKey::kLWin:
+    case VirtualKey::kRWin:
+      // The start of a shortcut like Alt+Tab, not the key wanted.
+      return;
+    default:
+      break;
+  }
+  const std::string name = VirtualKeyToString(key);
+  if (name.empty()) {
+    capture_message_ = "That key can't be used.";
+    return;
+  }
+  switch (key) {
+    case VirtualKey::kUp:
+    case VirtualKey::kDown:
+    case VirtualKey::kLeft:
+    case VirtualKey::kRight:
+    case VirtualKey::kPrior:
+    case VirtualKey::kNext:
+    case VirtualKey::kReturn:
+      capture_message_ = KeyLabel(name) + " is used by this menu.";
+      return;
+    default:
+      break;
+  }
+  // With keyboard play on, the keys of the emulated controller are taken too.
+  if (rex::cvar::Query<bool>("mnk_mode")) {
+    for (const std::string& flag : rex::cvar::ListFlagsByCategory("Input/Keybinds/Controller")) {
+      const std::string keys = rex::cvar::GetFlagByName(flag);
+      size_t start = 0;
+      while (start <= keys.size()) {
+        const size_t end = std::min(keys.find_first_of(",+", start), keys.size());
+        if (end > start && ParseVirtualKey(std::string_view(keys).substr(start, end - start)) == key) {
+          const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(flag);
+          capture_message_ = KeyLabel(name) + " is used by keyboard play" +
+                             (info && !info->description.empty()
+                                  ? " (" + info->description + ")."
+                                  : std::string("."));
+          return;
+        }
+        start = end + 1;
+      }
+    }
+  }
+  const std::string owner = FindBindForKey(key);
+  if (!owner.empty() && owner != capturing_->cvar) {
+    capture_message_ = KeyLabel(name) + " is already used";
+    const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(owner);
+    if (info && !info->description.empty()) {
+      capture_message_ += " (" + info->description + ")";
+    }
+    capture_message_ += ".";
+    return;
+  }
+  if (name != rex::cvar::GetFlagByName(capturing_->cvar)) {
+    Set(*capturing_, name);
+  }
+  StopCapture();
+}
+
+void QuickMenuDialog::StopCapture() {
+  capturing_ = nullptr;
+  captured_key_ = VirtualKey::kNone;
+  capture_message_.clear();
+  if (capturing_menu == this) {
+    capturing_menu = nullptr;
+  }
+  keyboard_quiet_until_ = ImGui::GetTime() + 0.25;
 }
 
 bool QuickMenuDialog::IsShown(const QuickMenuItem& item) const {
@@ -249,6 +369,11 @@ void QuickMenuDialog::Change(const QuickMenuItem& item, int direction) {
         Set(item, CvarNumber(item.cvar, target));
       }
     } break;
+    case QuickMenuItem::Kind::kKey:
+      if (!direction) {
+        StartCapture(item);
+      }
+      break;
   }
 }
 
@@ -320,33 +445,49 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   bool activate = false;
   bool close = false;
 
-  if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
-    move = -1;
+  // A key setting waiting for its key (from CaptureKey) has the keyboard, the
+  // controller and the mouse until then: Esc, B or a click cancels.
+  const bool capturing = capturing_ != nullptr;
+  bool cancel_capture = false;
+  if (capturing && captured_key_ != VirtualKey::kNone) {
+    const VirtualKey key = captured_key_;
+    captured_key_ = VirtualKey::kNone;
+    if (key == VirtualKey::kEscape) {
+      cancel_capture = true;
+    } else {
+      FinishCapture(key);
+    }
   }
-  if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
-    move = 1;
-  }
-  if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
-    change = -1;
-  }
-  if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
-    change = 1;
-  }
-  if (ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) {
-    section_step = -1;
-  }
-  if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) {
-    section_step = 1;
-  }
-  // With keyboard play on, Enter is the Start button of the emulated pad
-  // (Space is A).
-  if ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-       ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
-      !rex::cvar::Query<bool>("mnk_mode")) {
-    activate = true;
-  }
-  if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-    close = true;
+
+  if (!capturing && now >= keyboard_quiet_until_) {
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+      move = -1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+      move = 1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+      change = -1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+      change = 1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) {
+      section_step = -1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) {
+      section_step = 1;
+    }
+    // With keyboard play on, Enter is the Start button of the emulated pad
+    // (Space is A).
+    if ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
+        !rex::cvar::Query<bool>("mnk_mode")) {
+      activate = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      close = true;
+    }
   }
 
   if (pad_->valid) {
@@ -372,9 +513,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     } else if (buttons & kPadRight) {
       direction = 4;
     }
-    if (!pad_seen_) {
+    if (!pad_seen_ || (!capturing && now < keyboard_quiet_until_)) {
       // Whatever is held as the menu opens (like the buttons that opened it)
-      // is not a press in the menu.
+      // is not a press in the menu - nor the key just bound, which keyboard
+      // play turns into a controller button a frame later.
       pad_seen_ = true;
       last_buttons_ = buttons;
       repeat_direction_ = direction;
@@ -386,13 +528,17 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       activate = true;
     }
     if (pressed & kPadB) {
-      close_buttons_ |= kPadB;
+      if (capturing) {
+        cancel_capture = true;
+      } else {
+        close_buttons_ |= kPadB;
+      }
     }
-    if ((pressed & (kPadBack | kPadStart)) &&
+    if (!capturing && (pressed & (kPadBack | kPadStart)) &&
         (buttons & (kPadBack | kPadStart)) == (kPadBack | kPadStart)) {
       close_buttons_ |= kPadBack | kPadStart;
     }
-    if ((pressed & kPadY) && !config_.quick_toggle_cvar.empty()) {
+    if (!capturing && (pressed & kPadY) && !config_.quick_toggle_cvar.empty()) {
       close_buttons_ |= kPadY;
       quick_toggle_ = true;
     }
@@ -432,6 +578,18 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
           break;
       }
     }
+  }
+
+  const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+  if (capturing) {
+    if (clicked) {
+      cancel_capture = true;
+    }
+    move = change = section_step = 0;
+    activate = close = false;
+  }
+  if (cancel_capture && capturing_) {
+    StopCapture();
   }
 
   const int section_count = int(config_.sections.size());
@@ -521,8 +679,8 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     return;
   }
   ImDrawList* draw_list = ImGui::GetWindowDrawList();
-  const bool mouse_moved = io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f;
-  const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+  const bool mouse_moved = !capturing && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f);
+  const bool row_clicked = clicked && !capturing;
 
   // Panel.
   draw_list->AddRectFilled(ImVec2(panel_min.x + 8.0f * u, panel_min.y + 10.0f * u),
@@ -595,7 +753,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
         draw_list->AddRectFilled(ImVec2(x, y + 40.0f * u), ImVec2(x + text_size.x, y + 44.0f * u),
                                  color(0, 196, 206), 2.0f * u);
       }
-      if (clicked && ImGui::IsMouseHoveringRect(tab_min, tab_max) && !active) {
+      if (row_clicked && ImGui::IsMouseHoveringRect(tab_min, tab_max) && !active) {
         section_ = size_t(i);
         std::vector<size_t> shown = ShownItems(config_.sections[section_]);
         selected_item_ = shown.empty() ? 0 : shown.front();
@@ -666,6 +824,24 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       DrawText(draw_list, state_size,
                ImVec2(track_min.x - 12.0f * u - state_extent.x, center_y - state_extent.y * 0.5f),
                selected ? color(255, 255, 255) : color(150, 160, 175), state_text);
+    } else if (item.kind == QuickMenuItem::Kind::kKey) {
+      // The key on a key cap, pulsing while it waits for a key.
+      const bool waiting = capturing_ == &item;
+      const std::string key_text =
+          waiting ? "Press a key" : (current.empty() ? "None" : KeyLabel(current));
+      const ImVec2 key_extent = TextSize(value_size, key_text);
+      const ImVec2 cap_min(right - key_extent.x - 32.0f * u, center_y - 19.0f * u);
+      const ImVec2 cap_max(right, center_y + 19.0f * u);
+      if (waiting) {
+        const float pulse = 0.5f + 0.5f * float(std::sin(now * 6.0));
+        draw_list->AddRectFilled(cap_min, cap_max, color(255, 206, 38, 70 + int(110.0f * pulse)),
+                                 8.0f * u);
+      } else {
+        draw_list->AddRectFilled(cap_min, cap_max, color(46, 54, 70), 8.0f * u);
+      }
+      draw_list->AddRect(cap_min, cap_max, color(255, 255, 255, 70), 8.0f * u, 0, 1.5f * u);
+      DrawText(draw_list, value_size, ImVec2(cap_min.x + 16.0f * u, center_y - key_extent.y * 0.5f),
+               waiting || selected ? color(255, 255, 255) : color(132, 222, 232), key_text);
     } else {
       std::string value_text;
       bool can_lower = true, can_raise = true;
@@ -704,7 +880,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
                                    arrow_color(can_raise));
       DrawText(draw_list, value_size, ImVec2(value_x, center_y - value_extent.y * 0.5f), value_color,
                value_text);
-      if (clicked && hovered) {
+      if (row_clicked && hovered) {
         const float mouse_x = io.MousePos.x;
         if (mouse_x >= left_arrow_x - gap && mouse_x < value_x) {
           click_direction = -1;
@@ -713,7 +889,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
         }
       }
     }
-    if (clicked && hovered) {
+    if (row_clicked && hovered) {
       selected_item_ = item_index;
       Change(item, click_direction);
     }
@@ -723,7 +899,15 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   // Help for the selected setting.
   draw_list->AddLine(ImVec2(content_left, y - 8.0f * u), ImVec2(content_right, y - 8.0f * u),
                      color(255, 255, 255, 28), 1.5f * u);
-  if (!rows.empty()) {
+  if (capturing_) {
+    const std::string text =
+        capture_message_.empty()
+            ? "Press the key to use for " + capturing_->label + ". Esc or B cancels."
+            : capture_message_ + " Press another key, or Esc or B to cancel.";
+    DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u),
+             capture_message_.empty() ? color(255, 206, 38) : color(255, 140, 90), text,
+             content_right - content_left);
+  } else if (!rows.empty()) {
     DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u), color(196, 204, 216),
              section.items[selected_item_].help, content_right - content_left);
   }
