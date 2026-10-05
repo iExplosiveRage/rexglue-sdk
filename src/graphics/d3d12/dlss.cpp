@@ -1,6 +1,7 @@
 /**
  * @file        graphics/d3d12/dlss.cpp
- * @brief       NVIDIA DLAA for the 3D scene, run before the HUD is drawn
+ * @brief       NVIDIA DLSS (DLAA and upscaling) for the 3D scene, run before
+ *              the HUD is drawn
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -15,6 +16,8 @@
 #include <string>
 #include <system_error>
 
+#include <fmt/format.h>
+
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
@@ -27,19 +30,25 @@
 #endif
 
 REXCVAR_DEFINE_STRING(dlss_mode, "off", "GPU",
-                      "NVIDIA DLSS for the 3D scene (RTX GPUs): off, or dlaa - anti-aliasing at "
-                      "the render resolution")
-    .allowed({"off", "dlaa"});
+                      "NVIDIA DLSS for the 3D scene (RTX GPUs): off; dlaa - anti-aliasing at "
+                      "the draw resolution scale; quality, balanced, performance, "
+                      "ultra_performance - the game renders below the draw resolution scale and "
+                      "DLSS upscales the scene to it (the HUD is drawn at it). Only whole scales "
+                      "exist: at 3x, quality / balanced / performance render at 2x and "
+                      "ultra_performance at 1x; at 2x and 4x every mode renders at half")
+    .allowed({"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"});
 
 REXCVAR_DEFINE_STRING(dlss_preset, "m", "GPU",
-                      "DLSS model (NVIDIA's render presets): k (DLAA's default), l, or m - "
-                      "sharper and more stable than k, at about the same cost on RTX 40 GPUs")
+                      "DLSS model (NVIDIA's render presets): k (NVIDIA's default for DLAA and "
+                      "Quality), l, or m - sharper and more stable than k, at about the same cost "
+                      "on RTX 40 GPUs")
     .allowed({"k", "l", "m"});
 
 REXCVAR_DEFINE_INT32(dlss_debug_view, 0, "GPU/Debug",
                      "Show DLSS's inputs instead of its output: 0 = off, 1 = motion vectors, "
-                     "2 = depth")
-    .range(0, 2);
+                     "2 = depth; 3 = with upscaling, tint red what's presented from the game's "
+                     "own (not upscaled) frame")
+    .range(0, 3);
 
 REXCVAR_DEFINE_BOOL(dlss_jitter, true, "GPU/Debug",
                     "Jitter the scene for DLSS (off = no temporal anti-aliasing, to compare)");
@@ -53,7 +62,10 @@ namespace rex::graphics::d3d12 {
 
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/dlss_debug_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/dlss_downsample_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/dlss_inputs_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/dlss_present_compare_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/dlss_present_cs.h"
 }  // namespace shaders
 
 namespace {
@@ -62,8 +74,12 @@ namespace {
 // engines.
 constexpr char kNgxProjectId[] = "6c1f3b2e-8d4a-4f7b-9a35-2e81c0d47b19";
 
-// Halton (2, 3) points, as recommended for DLSS - at least 16 phases for DLAA.
-constexpr uint32_t kJitterPhases = 32;
+// Halton (2, 3) points, as recommended for DLSS: 8 * (output / render)^2
+// phases, at least 32.
+constexpr uint32_t kMinJitterPhases = 32;
+
+// The picture presented with upscaling.
+constexpr DXGI_FORMAT kPresentFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
 
 float Halton(uint32_t index, uint32_t base) {
   float result = 0.0f;
@@ -134,12 +150,34 @@ struct DebugConstants {
   uint32_t padding;
 };
 
+struct DownsampleConstants {
+  uint32_t size[2];
+  float ratio[2];
+  float source_size_inv[2];
+  float padding[2];
+};
+
+struct CompareConstants {
+  uint32_t size[2];
+  float tolerance;
+  uint32_t border;
+};
+
+struct PresentConstants {
+  uint32_t size[2];
+  uint32_t frame_size[2];
+  float frame_ratio[2];
+  float frame_texture_size_inv[2];
+  uint32_t mode;
+  uint32_t padding[3];
+};
+
 // Root signature: 32-bit constants at b0, then one descriptor table per SRV
 // (t0...) and per UAV (u0...) - one-use descriptors aren't contiguous with
-// bindless resources.
+// bindless resources - and optionally a bilinear clamping sampler at s0.
 ID3D12RootSignature* CreateComputeRootSignature(const ui::d3d12::D3D12Provider& provider,
                                                 uint32_t constant_count, uint32_t srv_count,
-                                                uint32_t uav_count) {
+                                                uint32_t uav_count, bool linear_sampler = false) {
   std::vector<D3D12_DESCRIPTOR_RANGE> ranges(srv_count + uav_count);
   std::vector<D3D12_ROOT_PARAMETER> parameters(1 + srv_count + uav_count);
   D3D12_ROOT_PARAMETER& constants = parameters[0];
@@ -162,11 +200,22 @@ ID3D12RootSignature* CreateComputeRootSignature(const ui::d3d12::D3D12Provider& 
     table.DescriptorTable.pDescriptorRanges = &range;
     table.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
+  D3D12_STATIC_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  sampler.ShaderRegister = 0;
+  sampler.RegisterSpace = 0;
+  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC desc;
   desc.NumParameters = UINT(parameters.size());
   desc.pParameters = parameters.data();
-  desc.NumStaticSamplers = 0;
-  desc.pStaticSamplers = nullptr;
+  desc.NumStaticSamplers = linear_sampler ? 1 : 0;
+  desc.pStaticSamplers = linear_sampler ? &sampler : nullptr;
   desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
   return ui::d3d12::util::CreateRootSignature(provider, desc);
 }
@@ -189,6 +238,20 @@ void CreateTexture2DUav(ID3D12Device* device, ID3D12Resource* resource, DXGI_FOR
   device->CreateUnorderedAccessView(resource, nullptr, &desc, handle);
 }
 
+// The depth / stencil view format of a depth render target's resource format.
+DXGI_FORMAT GetDsvFormat(DXGI_FORMAT resource_format) {
+  switch (resource_format) {
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
 }  // namespace
 
 D3D12Dlss::D3D12Dlss(D3D12CommandProcessor& command_processor)
@@ -199,13 +262,21 @@ D3D12Dlss::~D3D12Dlss() {
 }
 
 bool D3D12Dlss::Initialize() {
+  rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   *(inputs_root_signature_.ReleaseAndGetAddressOf()) =
       CreateComputeRootSignature(provider, sizeof(InputsConstants) / sizeof(uint32_t), 1, 2);
   *(debug_root_signature_.ReleaseAndGetAddressOf()) =
       CreateComputeRootSignature(provider, sizeof(DebugConstants) / sizeof(uint32_t), 2, 1);
-  if (!inputs_root_signature_ || !debug_root_signature_) {
+  *(downsample_root_signature_.ReleaseAndGetAddressOf()) = CreateComputeRootSignature(
+      provider, sizeof(DownsampleConstants) / sizeof(uint32_t), 1, 1, true);
+  *(compare_root_signature_.ReleaseAndGetAddressOf()) =
+      CreateComputeRootSignature(provider, sizeof(CompareConstants) / sizeof(uint32_t), 2, 1);
+  *(present_root_signature_.ReleaseAndGetAddressOf()) = CreateComputeRootSignature(
+      provider, sizeof(PresentConstants) / sizeof(uint32_t), 3, 1, true);
+  if (!inputs_root_signature_ || !debug_root_signature_ || !downsample_root_signature_ ||
+      !compare_root_signature_ || !present_root_signature_) {
     REXGPU_ERROR("DLSS: failed to create the root signatures");
     return false;
   }
@@ -214,19 +285,64 @@ bool D3D12Dlss::Initialize() {
       inputs_root_signature_.Get());
   *(debug_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
       device, shaders::dlss_debug_cs, sizeof(shaders::dlss_debug_cs), debug_root_signature_.Get());
-  if (!inputs_pipeline_ || !debug_pipeline_) {
+  *(downsample_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+      device, shaders::dlss_downsample_cs, sizeof(shaders::dlss_downsample_cs),
+      downsample_root_signature_.Get());
+  *(compare_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+      device, shaders::dlss_present_compare_cs, sizeof(shaders::dlss_present_compare_cs),
+      compare_root_signature_.Get());
+  *(present_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+      device, shaders::dlss_present_cs, sizeof(shaders::dlss_present_cs),
+      present_root_signature_.Get());
+  if (!inputs_pipeline_ || !debug_pipeline_ || !downsample_pipeline_ || !compare_pipeline_ ||
+      !present_pipeline_) {
     REXGPU_ERROR("DLSS: failed to create the compute pipelines");
     return false;
+  }
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  heap_desc.NumDescriptors = 1;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+  if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&hud_rtv_heap_)))) {
+    REXGPU_ERROR("DLSS: failed to create the RTV heap");
+    return false;
+  }
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&hud_dsv_heap_)))) {
+    REXGPU_ERROR("DLSS: failed to create the DSV heap");
+    return false;
+  }
+
+  // Whether DLSS works decides the render scale of its upscaling modes, so NGX
+  // is checked right away on NVIDIA GPUs.
+  if (provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kNvidia) {
+    ngx_state_ = NgxState::kUnavailable;
+  } else if (InitializeNgx()) {
+    rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kAvailable);
   }
   return true;
 }
 
 void D3D12Dlss::Shutdown() {
+  rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
   ShutdownNgx();
   resources_to_release_.clear();
   depth_ = {};
   motion_ = {};
   output_ = {};
+  upscaled_ = {};
+  hud_depth_ = {};
+  frozen_ = {};
+  tiles_ = {};
+  present_ = {};
+  hud_dsv_heap_.Reset();
+  hud_rtv_heap_.Reset();
+  present_pipeline_.Reset();
+  present_root_signature_.Reset();
+  compare_pipeline_.Reset();
+  compare_root_signature_.Reset();
+  downsample_pipeline_.Reset();
+  downsample_root_signature_.Reset();
   debug_pipeline_.Reset();
   debug_root_signature_.Reset();
   inputs_pipeline_.Reset();
@@ -236,7 +352,7 @@ void D3D12Dlss::Shutdown() {
 bool D3D12Dlss::IsEnabled() const {
 #if defined(REX_HAS_DLSS)
   return inputs_pipeline_ && ngx_state_ != NgxState::kUnavailable && !feature_failed_ &&
-         REXCVAR_GET(dlss_mode) == "dlaa";
+         REXCVAR_GET(dlss_mode) != "off";
 #else
   return false;
 #endif
@@ -294,6 +410,8 @@ bool D3D12Dlss::InitializeNgx() {
     NVSDK_NGX_D3D12_Shutdown1(device);
     return false;
   }
+  // Features released (on a mode or size change) give their memory back.
+  NVSDK_NGX_Parameter_SetI(ngx_parameters_, NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
   ngx_state_ = NgxState::kAvailable;
   REXGPU_INFO("DLSS: NGX initialized, DLSS is available");
   return true;
@@ -315,6 +433,8 @@ void D3D12Dlss::ShutdownNgx() {
   }
   feature_width_ = 0;
   feature_height_ = 0;
+  feature_output_width_ = 0;
+  feature_output_height_ = 0;
   if (ngx_state_ == NgxState::kAvailable) {
     if (ngx_parameters_) {
       NVSDK_NGX_D3D12_DestroyParameters(ngx_parameters_);
@@ -327,15 +447,14 @@ void D3D12Dlss::ShutdownNgx() {
 }
 
 bool D3D12Dlss::EnsureTexture(Texture& texture, DXGI_FORMAT format, uint32_t width,
-                              uint32_t height, const char* name) {
+                              uint32_t height, const char* name, D3D12_RESOURCE_FLAGS flags) {
   if (texture.resource) {
     D3D12_RESOURCE_DESC desc = texture.resource->GetDesc();
-    if (desc.Format == format && desc.Width == width && desc.Height == height) {
+    if (desc.Format == format && desc.Width == width && desc.Height == height &&
+        desc.Flags == flags) {
       return true;
     }
-    resources_to_release_.emplace_back(command_processor_.GetCurrentSubmission(),
-                                       std::move(texture.resource));
-    texture = {};
+    ReleaseLater(texture);
   }
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   D3D12_RESOURCE_DESC desc = {};
@@ -347,13 +466,49 @@ bool D3D12Dlss::EnsureTexture(Texture& texture, DXGI_FORMAT format, uint32_t wid
   desc.Format = format;
   desc.SampleDesc.Count = 1;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  desc.Flags = flags;
   texture.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   if (FAILED(provider.GetDevice()->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
           texture.state, nullptr, IID_PPV_ARGS(&texture.resource)))) {
     REXGPU_ERROR("DLSS: failed to create the {} texture ({}x{})", name, width, height);
     texture = {};
+    return false;
+  }
+  return true;
+}
+
+bool D3D12Dlss::EnsureHudDepth(DXGI_FORMAT resource_format, uint32_t width, uint32_t height) {
+  const DXGI_FORMAT dsv_format = GetDsvFormat(resource_format);
+  if (dsv_format == DXGI_FORMAT_UNKNOWN) {
+    return false;
+  }
+  if (hud_depth_.resource) {
+    D3D12_RESOURCE_DESC desc = hud_depth_.resource->GetDesc();
+    if (desc.Format == resource_format && desc.Width == width && desc.Height == height) {
+      return true;
+    }
+    ReleaseLater(hud_depth_);
+  }
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = resource_format;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_CLEAR_VALUE clear_value = {};
+  clear_value.Format = dsv_format;
+  hud_depth_.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+          hud_depth_.state, &clear_value, IID_PPV_ARGS(&hud_depth_.resource)))) {
+    REXGPU_ERROR("DLSS: failed to create the HUD depth texture ({}x{})", width, height);
+    hud_depth_ = {};
     return false;
   }
   return true;
@@ -366,6 +521,14 @@ void D3D12Dlss::Transition(Texture& texture, D3D12_RESOURCE_STATES state) {
   }
 }
 
+void D3D12Dlss::ReleaseLater(Texture& texture) {
+  if (texture.resource) {
+    resources_to_release_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                       std::move(texture.resource));
+  }
+  texture = {};
+}
+
 const std::array<float, 16>* D3D12Dlss::FrameCamera() const {
   const std::pair<std::array<float, 16>, uint32_t>* best = nullptr;
   for (const auto& camera : frame_cameras_) {
@@ -375,6 +538,19 @@ const std::array<float, 16>* D3D12Dlss::FrameCamera() const {
   }
   // A matrix used by a single draw may just be one object's.
   return best && best->second >= 2 ? &best->first : nullptr;
+}
+
+void D3D12Dlss::DisableUpscaling(const char* reason) {
+  if (upscaling_failed_) {
+    return;
+  }
+  upscaling_failed_ = true;
+  REXGPU_WARN("DLSS: upscaling doesn't work ({}) - DLAA at the configured resolution instead",
+              reason);
+  if (rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable) {
+    rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kDlaaOnly);
+  }
+  D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
 }
 
 void D3D12Dlss::OnSceneDraw(const float* constants_c0_c3) {
@@ -399,18 +575,24 @@ bool D3D12Dlss::WantsScene() const {
   return frame_scene_drawn_ && !frame_scene_taken_ && IsEnabled();
 }
 
-D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
+D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resource* depth,
                                               D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
-                                              uint32_t width, uint32_t height) {
+                                              uint32_t width, uint32_t height,
+                                              uint32_t output_width, uint32_t output_height) {
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   frame_scene_taken_ = true;
 #if defined(REX_HAS_DLSS)
   if (!width || !height || !InitializeNgx()) {
     return color_state;
   }
+  // A scene DLSS can't take isn't rendered below the configured scale either.
+  const bool upscaling_requested = output_width != width || output_height != height;
   D3D12_RESOURCE_DESC color_desc = color->GetDesc();
   if (color_desc.SampleDesc.Count != 1 || width > color_desc.Width ||
       height > color_desc.Height) {
+    if (upscaling_requested) {
+      DisableUpscaling("the scene is multisampled or smaller than expected");
+    }
     return color_state;
   }
   DXGI_FORMAT output_format = color_desc.Format;
@@ -426,17 +608,65 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
         format_logged = true;
         REXGPU_WARN("DLSS: the scene's color format {} isn't supported", int(output_format));
       }
+      if (upscaling_requested) {
+        DisableUpscaling("unsupported scene color format");
+      }
       return color_state;
     }
+  }
+
+  // Upscaling: only at DLSS's own ratios (Quality, Performance, Ultra
+  // Performance), with the output's aspect ratio. The debug views show the
+  // inputs at the render resolution.
+  int32_t debug_view = REXCVAR_GET(dlss_debug_view);
+  bool upscale = (output_width != width || output_height != height) && !upscaling_failed_ &&
+                 (debug_view == 0 || debug_view == 3);
+  uint32_t quality = uint32_t(NVSDK_NGX_PerfQuality_Value_DLAA);
+  if (upscale) {
+    if (uint64_t(output_width) * height != uint64_t(output_height) * width) {
+      upscale = false;
+    } else if (3 * width == 2 * output_width) {
+      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+    } else if (2 * width == output_width) {
+      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxPerf);
+    } else if (3 * width == output_width) {
+      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+    } else {
+      upscale = false;
+    }
+    if (!upscale) {
+      DisableUpscaling(
+          fmt::format("{}x{} to {}x{} isn't a DLSS ratio", width, height, output_width,
+                      output_height)
+              .c_str());
+    }
+  }
+  if (!upscale) {
+    output_width = width;
+    output_height = height;
+    debug_view = debug_view == 3 ? 0 : debug_view;
+  }
+  DXGI_FORMAT depth_dsv_format = upscale ? GetDsvFormat(depth->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+  if (upscale && depth_dsv_format == DXGI_FORMAT_UNKNOWN) {
+    DisableUpscaling("unknown depth format");
+    return color_state;
   }
   if (!EnsureTexture(depth_, DXGI_FORMAT_R32_FLOAT, width, height, "depth") ||
       !EnsureTexture(motion_, DXGI_FORMAT_R16G16_FLOAT, width, height, "motion vector") ||
       !EnsureTexture(output_, output_format, width, height, "output")) {
     return color_state;
   }
+  if (upscale &&
+      (!EnsureTexture(upscaled_, output_format, output_width, output_height, "upscaled",
+                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+       !EnsureHudDepth(depth->GetDesc().Format, output_width, output_height))) {
+    return color_state;
+  }
 
   // Camera motion: this frame's clip space -> the previous frame's.
-  bool reset = !previous_processed_ || width != previous_width_ || height != previous_height_;
+  bool reset = !previous_processed_ || width != previous_width_ || height != previous_height_ ||
+               output_width != previous_output_width_ || output_height != previous_output_height_;
   InputsConstants inputs_constants = {};
   inputs_constants.size[0] = width;
   inputs_constants.size[1] = height;
@@ -529,13 +759,14 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
   command_list.D3DSetComputeRootDescriptorTable(2, inputs_descriptors[1].second);
   command_list.D3DSetComputeRootDescriptorTable(3, inputs_descriptors[2].second);
   command_list.D3DDispatch(group_count_x, group_count_y, 1);
+  Texture& dlss_output = upscale ? upscaled_ : output_;
   Transition(depth_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(motion_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Transition(output_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Transition(dlss_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   command_processor.SubmitBarriers();
 
-  int32_t debug_view = REXCVAR_GET(dlss_debug_view);
-  if (debug_view) {
+  bool create = false;
+  if (debug_view == 1 || debug_view == 2) {
     ui::d3d12::util::DescriptorCpuGpuHandlePair debug_descriptors[3];
     if (!command_processor.RequestOneUseSingleViewDescriptors(3, debug_descriptors)) {
       return color_state;
@@ -562,8 +793,9 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
     uint32_t preset = preset_name == "k"   ? uint32_t(NVSDK_NGX_DLSS_Hint_Render_Preset_K)
                       : preset_name == "l" ? uint32_t(NVSDK_NGX_DLSS_Hint_Render_Preset_L)
                                            : uint32_t(NVSDK_NGX_DLSS_Hint_Render_Preset_M);
-    bool create = !feature_ || feature_width_ != width || feature_height_ != height ||
-                  feature_output_format_ != output_format || feature_preset_ != preset;
+    create = !feature_ || feature_width_ != width || feature_height_ != height ||
+             feature_output_width_ != output_width || feature_output_height_ != output_height ||
+             feature_output_format_ != output_format || feature_preset_ != preset;
     if (create) {
       if (feature_) {
         features_to_release_.emplace_back(command_processor.GetCurrentSubmission(), feature_);
@@ -571,41 +803,77 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
       }
       feature_width_ = width;
       feature_height_ = height;
+      feature_output_width_ = output_width;
+      feature_output_height_ = output_height;
       feature_output_format_ = output_format;
       feature_preset_ = preset;
       reset = true;
+      if (upscale) {
+        // The render size has to be in the mode's range (it's the optimal
+        // size of the mode at DLSS's own ratios).
+        unsigned int optimal_width = 0, optimal_height = 0, max_width = 0, max_height = 0,
+                     min_width = 0, min_height = 0;
+        float sharpness = 0.0f;
+        NVSDK_NGX_Result result = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+            ngx_parameters_, output_width, output_height, NVSDK_NGX_PerfQuality_Value(quality),
+            &optimal_width, &optimal_height, &max_width, &max_height, &min_width, &min_height,
+            &sharpness);
+        REXGPU_INFO("DLSS: mode {} for {}x{}: optimal {}x{}, range {}x{} to {}x{} ({:08X})",
+                    quality, output_width, output_height, optimal_width, optimal_height,
+                    min_width, min_height, max_width, max_height, uint32_t(result));
+      }
     }
     int32_t jitter_sign = REXCVAR_GET(dlss_jitter_sign);
     float jitter_x = (jitter_sign & 1) ? -jitter_[0] : jitter_[0];
     float jitter_y = (jitter_sign & 2) ? -jitter_[1] : jitter_[1];
     ID3D12Resource* depth_resource = depth_.resource.Get();
     ID3D12Resource* motion_resource = motion_.resource.Get();
-    ID3D12Resource* output_resource = output_.resource.Get();
-    command_list.ExternalCallback([this, create, preset, color, depth_resource, motion_resource,
-                                   output_resource, width, height, jitter_x, jitter_y,
+    ID3D12Resource* output_resource = dlss_output.resource.Get();
+    command_list.ExternalCallback([this, create, upscale, preset, quality, color, depth_resource,
+                                   motion_resource, output_resource, width, height, output_width,
+                                   output_height, jitter_x, jitter_y,
                                    reset](ID3D12GraphicsCommandList* d3d_command_list) {
+      dlss_output_valid_ = false;
       if (create) {
-        NVSDK_NGX_Parameter_SetUI(ngx_parameters_, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
-                                  preset);
+        // The preset of every mode, as which one NGX reads isn't documented.
+        for (const char* preset_parameter : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
+                                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+                                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
+                                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality}) {
+          NVSDK_NGX_Parameter_SetUI(ngx_parameters_, preset_parameter, preset);
+        }
         NVSDK_NGX_DLSS_Create_Params create_params = {};
         create_params.Feature.InWidth = width;
         create_params.Feature.InHeight = height;
-        create_params.Feature.InTargetWidth = width;
-        create_params.Feature.InTargetHeight = height;
-        create_params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+        create_params.Feature.InTargetWidth = output_width;
+        create_params.Feature.InTargetHeight = output_height;
+        create_params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value(quality);
         // Motion vectors at the render resolution, without the jitter; LDR
         // color; depth 0 = near.
         create_params.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
         NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(d3d_command_list, 1, 1, &feature_,
                                                             ngx_parameters_, &create_params);
         if (NVSDK_NGX_FAILED(result) || !feature_) {
-          REXGPU_ERROR("DLSS: failed to create the DLAA feature ({}x{}, {:08X})", width, height,
-                       uint32_t(result));
+          REXGPU_ERROR("DLSS: failed to create the feature ({}x{} to {}x{}, {:08X})", width,
+                       height, output_width, output_height, uint32_t(result));
           feature_ = nullptr;
-          feature_failed_ = true;
+          if (upscale) {
+            DisableUpscaling("the feature couldn't be created");
+          } else {
+            feature_failed_ = true;
+            rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
+            D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+          }
           return;
         }
-        REXGPU_INFO("DLSS: DLAA at {}x{}, preset {}", width, height, char('A' + preset - 1));
+        if (upscale) {
+          REXGPU_INFO("DLSS: upscaling {}x{} to {}x{}, preset {}", width, height, output_width,
+                      output_height, char('A' + preset - 1));
+        } else {
+          REXGPU_INFO("DLSS: DLAA at {}x{}, preset {}", width, height, char('A' + preset - 1));
+        }
       }
       if (!feature_) {
         return;
@@ -626,13 +894,52 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
           NGX_D3D12_EVALUATE_DLSS_EXT(d3d_command_list, feature_, ngx_parameters_, &eval_params);
       if (NVSDK_NGX_FAILED(result)) {
         REXGPU_ERROR("DLSS: evaluation failed ({:08X})", uint32_t(result));
-        feature_failed_ = true;
+        if (upscale) {
+          DisableUpscaling("the evaluation failed");
+        } else {
+          feature_failed_ = true;
+          rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
+          D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+        }
+        return;
       }
+      dlss_output_valid_ = true;
     });
     command_processor.InvalidateStateAfterExternalCommands();
   }
 
-  // The output replaces the scene in the color render target.
+  if (upscale) {
+    // The upscaled scene back at the render resolution, for the frame the game
+    // goes on with.
+    ui::d3d12::util::DescriptorCpuGpuHandlePair downsample_descriptors[2];
+    if (!command_processor.RequestOneUseSingleViewDescriptors(2, downsample_descriptors)) {
+      return color_state;
+    }
+    CreateTexture2DSrv(device, upscaled_.resource.Get(), output_format,
+                       downsample_descriptors[0].first);
+    CreateTexture2DUav(device, output_.resource.Get(), output_format,
+                       downsample_descriptors[1].first);
+    Transition(upscaled_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(output_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor.SubmitBarriers();
+    DownsampleConstants downsample_constants = {};
+    downsample_constants.size[0] = width;
+    downsample_constants.size[1] = height;
+    downsample_constants.ratio[0] = float(output_width) / float(width);
+    downsample_constants.ratio[1] = float(output_height) / float(height);
+    downsample_constants.source_size_inv[0] = 1.0f / float(output_width);
+    downsample_constants.source_size_inv[1] = 1.0f / float(output_height);
+    command_processor.SetExternalPipeline(downsample_pipeline_.Get());
+    command_list.D3DSetComputeRootSignature(downsample_root_signature_.Get());
+    command_list.D3DSetComputeRoot32BitConstants(
+        0, sizeof(downsample_constants) / sizeof(uint32_t), &downsample_constants, 0);
+    command_list.D3DSetComputeRootDescriptorTable(1, downsample_descriptors[0].second);
+    command_list.D3DSetComputeRootDescriptorTable(2, downsample_descriptors[1].second);
+    command_list.D3DDispatch(group_count_x, group_count_y, 1);
+  }
+
+  // The output (or the upscaled scene back at the render resolution) replaces
+  // the scene in the color render target.
   Transition(output_, D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor.PushTransitionBarrier(color, color_state, D3D12_RESOURCE_STATE_COPY_DEST);
   color_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -646,13 +953,235 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color,
   copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   copy_source.SubresourceIndex = 0;
   D3D12_BOX copy_box = {0, 0, 0, width, height, 1};
-  command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
+  if (debug_view == 1 || debug_view == 2) {
+    command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
+  } else {
+    // Only if DLSS made its output (a failure leaves the game's own scene).
+    command_list.ExternalCallback(
+        [this, copy_dest, copy_source, copy_box](ID3D12GraphicsCommandList* d3d_command_list) {
+          if (dlss_output_valid_) {
+            d3d_command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
+          }
+        });
+  }
+
+  if (upscale) {
+    // The HUD gets drawn over the output-size picture too.
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+    rtv_desc.Format = output_format;
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(upscaled_.resource.Get(), &rtv_desc,
+                                   hud_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+    dsv_desc.Format = depth_dsv_format;
+    dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = hud_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    device->CreateDepthStencilView(hud_depth_.resource.Get(), &dsv_desc, dsv);
+    Transition(upscaled_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(hud_depth_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor.SubmitBarriers();
+    command_list.D3DClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                          0.0f, 0, 0, nullptr);
+    hud_state_ = HudState::kMirroring;
+    hud_render_target_ = color;
+    hud_color_format_ = output_format;
+    hud_depth_format_ = depth_dsv_format;
+    hud_width_ = output_width;
+    hud_height_ = output_height;
+    frame_render_width_ = width;
+    frame_render_height_ = height;
+    frame_upscaled_ = true;
+  }
 
   frame_processed_ = true;
   previous_width_ = width;
   previous_height_ = height;
+  previous_output_width_ = output_width;
+  previous_output_height_ = output_height;
 #endif
   return color_state;
+}
+
+void D3D12Dlss::BindHudTargets(bool with_depth) {
+  Transition(upscaled_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  Transition(hud_depth_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  command_processor_.SubmitBarriers();
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = hud_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = hud_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  command_processor_.GetDeferredCommandList().D3DOMSetRenderTargets(1, &rtv, FALSE,
+                                                                    with_depth ? &dsv : nullptr);
+}
+
+void D3D12Dlss::InvalidateHud(const char* reason, uint64_t vertex_shader_hash,
+                              uint64_t pixel_shader_hash) {
+  if (hud_state_ != HudState::kMirroring) {
+    return;
+  }
+  hud_state_ = HudState::kInvalid;
+  if (hud_invalid_logged_.size() < 64) {
+    std::string key =
+        fmt::format("{} (vs {:016X}, ps {:016X})", reason, vertex_shader_hash, pixel_shader_hash);
+    if (hud_invalid_logged_.insert(key).second) {
+      REXGPU_INFO("DLSS: a frame presented without upscaling - a HUD draw {}", key);
+    }
+  }
+}
+
+D3D12_RESOURCE_STATES D3D12Dlss::FreezeHud(ID3D12Resource* color) {
+  D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  if (hud_state_ != HudState::kMirroring) {
+    return color_state;
+  }
+  if (!EnsureTexture(frozen_, hud_color_format_, frame_render_width_, frame_render_height_,
+                     "frozen frame", D3D12_RESOURCE_FLAG_NONE)) {
+    hud_state_ = HudState::kInvalid;
+    return color_state;
+  }
+  hud_state_ = HudState::kFrozen;
+  Transition(frozen_, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  color_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION copy_dest;
+  copy_dest.pResource = frozen_.resource.Get();
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_dest.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION copy_source;
+  copy_source.pResource = color;
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_source.SubresourceIndex = 0;
+  D3D12_BOX copy_box = {0, 0, 0, frame_render_width_, frame_render_height_, 1};
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&copy_dest, 0, 0, 0,
+                                                                   &copy_source, &copy_box);
+  Transition(frozen_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  return color_state;
+}
+
+bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
+                                      const D3D12_SHADER_RESOURCE_VIEW_DESC& frame_srv,
+                                      uint32_t frame_width, uint32_t frame_height,
+                                      uint32_t output_width, uint32_t output_height,
+                                      uint32_t edge_pixels, ID3D12Resource*& output_out,
+                                      D3D12_SHADER_RESOURCE_VIEW_DESC& output_srv_out,
+                                      bool& upscaled_out) {
+  upscaled_out = false;
+  if (!frame || !frame_width || !frame_height || !output_width || !output_height) {
+    return false;
+  }
+  if (!EnsureTexture(present_, kPresentFormat, output_width, output_height, "presented")) {
+    return false;
+  }
+  // The upscaled picture is only usable once the copy of the render target
+  // ended it, at the size presented now.
+  bool use_upscaled = hud_state_ == HudState::kFrozen && frame_upscaled_ &&
+                      hud_width_ == output_width &&
+                      hud_height_ == output_height && frame_render_width_ == frame_width &&
+                      frame_render_height_ == frame_height;
+  const uint32_t tiles_width = (frame_width + 7) / 8;
+  const uint32_t tiles_height = (frame_height + 7) / 8;
+  if (use_upscaled && !EnsureTexture(tiles_, DXGI_FORMAT_R32_UINT, tiles_width, tiles_height,
+                                     "comparison")) {
+    use_upscaled = false;
+  }
+
+  D3D12CommandProcessor& command_processor = command_processor_;
+  ID3D12Device* device = command_processor.GetD3D12Provider().GetDevice();
+  DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[7];
+  if (!command_processor.RequestOneUseSingleViewDescriptors(7, descriptors)) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC frame_desc = frame->GetDesc();
+
+  if (use_upscaled) {
+    // Which tiles of the frame are the render target at the freeze.
+    device->CreateShaderResourceView(frame, &frame_srv, descriptors[0].first);
+    CreateTexture2DSrv(device, frozen_.resource.Get(), hud_color_format_, descriptors[1].first);
+    CreateTexture2DUav(device, tiles_.resource.Get(), DXGI_FORMAT_R32_UINT, descriptors[2].first);
+    Transition(frozen_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(tiles_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor.SubmitBarriers();
+    CompareConstants compare_constants = {};
+    compare_constants.size[0] = frame_width;
+    compare_constants.size[1] = frame_height;
+    // Copies of the same pixels - just some room for rounding.
+    compare_constants.tolerance = 2.5f / 255.0f;
+    compare_constants.border = edge_pixels;
+    command_processor.SetExternalPipeline(compare_pipeline_.Get());
+    command_list.D3DSetComputeRootSignature(compare_root_signature_.Get());
+    command_list.D3DSetComputeRoot32BitConstants(0, sizeof(compare_constants) / sizeof(uint32_t),
+                                                 &compare_constants, 0);
+    command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+    command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+    command_list.D3DSetComputeRootDescriptorTable(3, descriptors[2].second);
+    command_list.D3DDispatch(tiles_width, tiles_height, 1);
+    Transition(tiles_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(upscaled_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+
+  // The picture presented.
+  CreateTexture2DSrv(device, use_upscaled ? upscaled_.resource.Get() : nullptr,
+                     use_upscaled ? hud_color_format_ : DXGI_FORMAT_R8G8B8A8_UNORM,
+                     descriptors[3].first);
+  device->CreateShaderResourceView(frame, &frame_srv, descriptors[4].first);
+  CreateTexture2DSrv(device, use_upscaled ? tiles_.resource.Get() : nullptr, DXGI_FORMAT_R32_UINT,
+                     descriptors[5].first);
+  CreateTexture2DUav(device, present_.resource.Get(), kPresentFormat, descriptors[6].first);
+  Transition(present_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  command_processor.SubmitBarriers();
+  PresentConstants present_constants = {};
+  present_constants.size[0] = output_width;
+  present_constants.size[1] = output_height;
+  present_constants.frame_size[0] = frame_width;
+  present_constants.frame_size[1] = frame_height;
+  present_constants.frame_ratio[0] = float(frame_width) / float(output_width);
+  present_constants.frame_ratio[1] = float(frame_height) / float(output_height);
+  present_constants.frame_texture_size_inv[0] = 1.0f / float(frame_desc.Width);
+  present_constants.frame_texture_size_inv[1] = 1.0f / float(frame_desc.Height);
+  present_constants.mode = use_upscaled ? (REXCVAR_GET(dlss_debug_view) == 3 ? 2 : 1) : 0;
+  command_list.D3DSetComputeRootSignature(present_root_signature_.Get());
+  // Only the frame itself if DLSS didn't make its output in this frame.
+  command_list.ExternalCallback(
+      [this, present_constants](ID3D12GraphicsCommandList* d3d_command_list) mutable {
+        if (!dlss_output_valid_) {
+          present_constants.mode = 0;
+        }
+        d3d_command_list->SetComputeRoot32BitConstants(
+            0, sizeof(present_constants) / sizeof(uint32_t), &present_constants, 0);
+      });
+  // Work after external commands needs its pipeline set again.
+  command_processor.InvalidateStateAfterExternalCommands();
+  command_processor.SetExternalPipeline(present_pipeline_.Get());
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[3].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[4].second);
+  command_list.D3DSetComputeRootDescriptorTable(3, descriptors[5].second);
+  command_list.D3DSetComputeRootDescriptorTable(4, descriptors[6].second);
+  command_list.D3DDispatch((output_width + 7) / 8, (output_height + 7) / 8, 1);
+  Transition(present_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  output_out = present_.resource.Get();
+  output_srv_out = {};
+  output_srv_out.Format = kPresentFormat;
+  output_srv_out.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  output_srv_out.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  output_srv_out.Texture2D.MipLevels = 1;
+  upscaled_out = use_upscaled;
+  return true;
+}
+
+void D3D12Dlss::OnDrawResolutionScaleChanged() {
+  // A new history at the new sizes, and the resources of the old ones go.
+  previous_processed_ = false;
+  previous_camera_valid_ = false;
+  jitter_[0] = 0.0f;
+  jitter_[1] = 0.0f;
+  jitter_index_ = 0;
+  lod_bias_ = 0;
+  ReleaseLater(upscaled_);
+  ReleaseLater(hud_depth_);
+  ReleaseLater(frozen_);
+  ReleaseLater(tiles_);
+  ReleaseLater(present_);
 }
 
 void D3D12Dlss::EndFrame() {
@@ -675,22 +1204,42 @@ void D3D12Dlss::EndFrame() {
   previous_camera_valid_ = frame_processed_ && frame_camera_valid_;
 
   // Only jitter the next frame if DLSS ran in this one - in frames it doesn't
-  // see (menus without a 3D scene, the HUD hidden) the jitter would just make
-  // the picture wobble.
-  if (frame_processed_ && IsEnabled() && REXCVAR_GET(dlss_jitter)) {
-    jitter_index_ = (jitter_index_ + 1) % kJitterPhases;
+  // see (menus without a 3D scene) the jitter would just make the picture
+  // wobble. Upscaling wants more phases: 8 * (output / render)^2.
+  const bool enabled = IsEnabled();
+  if (frame_processed_ && enabled && REXCVAR_GET(dlss_jitter)) {
+    uint32_t phases = kMinJitterPhases;
+    if (frame_upscaled_ && frame_render_width_) {
+      float ratio = float(hud_width_) / float(frame_render_width_);
+      phases = std::max(phases, uint32_t(std::ceil(8.0f * ratio * ratio)));
+    }
+    if (phases != jitter_phases_) {
+      jitter_phases_ = phases;
+      jitter_index_ = 0;
+    }
+    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
     jitter_[0] = Halton(jitter_index_ + 1, 2) - 0.5f;
     jitter_[1] = Halton(jitter_index_ + 1, 3) - 0.5f;
   } else {
     jitter_[0] = 0.0f;
     jitter_[1] = 0.0f;
   }
+  // Upscaling: textures sharper by the render to output ratio (NVIDIA's mip
+  // bias, the rest of it being texture_lod_bias).
+  lod_bias_ = 0;
+  if (frame_upscaled_ && enabled && frame_render_width_ && hud_width_) {
+    lod_bias_ = int32_t(
+        std::lround(std::log2(double(frame_render_width_) / double(hud_width_)) * 32.0));
+  }
 
   frame_scene_drawn_ = false;
   frame_scene_taken_ = false;
   frame_processed_ = false;
+  frame_upscaled_ = false;
   frame_cameras_.clear();
   frame_camera_valid_ = false;
+  hud_state_ = HudState::kNone;
+  hud_render_target_ = nullptr;
 }
 
 }  // namespace rex::graphics::d3d12

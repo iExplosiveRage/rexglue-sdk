@@ -192,6 +192,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // ExternalCallback): binds the descriptor heaps again and forgets the cached
   // command list state. A submission must be open.
   void InvalidateStateAfterExternalCommands();
+
+  // Any thread: re-reads the settings (and whether NVIDIA DLSS works) into
+  // the draw resolution scale applied at the end of a frame.
+  static void RequestDrawResolutionScaleFromSettings();
+  // The scale the 3D scene ends up at: above the render scale (the texture
+  // cache's) when NVIDIA DLSS upscales it.
+  uint32_t draw_resolution_target_scale_x() const { return draw_resolution_target_scale_x_; }
+  uint32_t draw_resolution_target_scale_y() const { return draw_resolution_target_scale_y_; }
   void SetViewport(const D3D12_VIEWPORT& viewport);
   void SetScissorRect(const D3D12_RECT& scissor_rect);
   void SetStencilReference(uint32_t stencil_ref);
@@ -430,10 +438,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   // recreated at the end of a frame, once the GPU is idle.
   void UpdateDrawResolutionScaleFromSettings();
   bool RecreateDrawResolutionScaledCaches(uint32_t scale_x, uint32_t scale_y);
+
+  // NVIDIA DLSS upscaling: the draw just made, made again into DLSS's
+  // output-size picture (see D3D12Dlss), with everything but the render
+  // targets, the viewport and the scissor as it's bound.
+  void MirrorDrawToHud(const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                       const draw_util::ViewportInfo& viewport_info,
+                       const draw_util::Scissor& guest_scissor, bool with_depth);
   // How long a requested scale must stay unchanged before it's applied, so
   // stepping through values in the settings doesn't rebuild every step.
   static constexpr uint64_t kDrawResolutionScaleSettleMs = 400;
-  uint32_t pending_draw_resolution_scale_ = 0;  // x | (y << 16), 0 = none.
+  // Render x | (y << 8) | target x << 16 | target y << 24, 0 = none.
+  uint32_t pending_draw_resolution_scale_ = 0;
+  uint32_t draw_resolution_target_scale_x_ = 1;
+  uint32_t draw_resolution_target_scale_y_ = 1;
   uint64_t pending_draw_resolution_scale_time_ms_ = 0;
   // For reloading the pipeline storage into a recreated pipeline cache.
   std::filesystem::path shader_storage_cache_root_;

@@ -69,4 +69,12 @@ float GetSceneProjectionRoll();
 void SetHideHudDraws(bool hide);
 bool GetHideHudDraws();
 
+// NVIDIA DLSS on this GPU, set by the GPU backend once it has checked NGX.
+// DLSS's upscaling modes only lower the draw resolution scale with
+// kAvailable - with kDlaaOnly (upscaling failed) DLSS runs at the configured
+// scale. Thread-safe.
+enum class DlssAvailability : uint32_t { kUnavailable, kDlaaOnly, kAvailable };
+void SetDlssAvailability(DlssAvailability availability);
+DlssAvailability GetDlssAvailability();
+
 }  // namespace rex::graphics

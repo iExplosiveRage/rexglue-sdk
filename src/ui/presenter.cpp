@@ -16,6 +16,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/draw_overrides.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
@@ -144,6 +145,17 @@ void LogTemporalFsrCompatibilityPathOnce() {
 }
 
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
+
+// An NVIDIA DLSS upscaling mode is on and DLSS works (the GPU side picks the
+// render scale for it).
+bool IsDlssUpscaling() {
+  if (rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kAvailable) {
+    return false;
+  }
+  const std::string dlss_mode = rex::cvar::GetFlagByName("dlss_mode");
+  return dlss_mode == "quality" || dlss_mode == "balanced" || dlss_mode == "performance" ||
+         dlss_mode == "ultra_performance";
+}
 
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   GuestOutputPaintConfig config;
@@ -971,9 +983,13 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
     bool is_temporal_effect = config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
                               config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
+    // With NVIDIA DLSS upscaling the frame is already at the resolution chosen
+    // (the quality mode doesn't lower it) - FSR only scales it to the window.
+    // Checked here as DLSS's availability is only known once the GPU is set up.
     bool temporal_quality_mode_forced =
         is_temporal_effect &&
-        config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto;
+        config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto &&
+        !IsDlssUpscaling();
     if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr || is_temporal_effect) &&
         ((ffx_last_size.first < output_width_clamped ||
           ffx_last_size.second < output_height_clamped) ||

@@ -69,7 +69,12 @@ class TextureCache {
   virtual ~TextureCache();
 
   // Returns whether the actual scale is not smaller than the requested one.
-  static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out);
+  // The target is the configured scale: with an NVIDIA DLSS upscaling mode the
+  // game renders below it and DLSS upscales the 3D scene to it (otherwise it's
+  // the render scale).
+  static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out,
+                                           uint32_t* target_x_out = nullptr,
+                                           uint32_t* target_y_out = nullptr);
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   bool IsDrawResolutionScaled() const {

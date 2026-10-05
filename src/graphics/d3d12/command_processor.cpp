@@ -92,9 +92,10 @@ namespace shaders {
 
 namespace {
 
-// Draw resolution scale the settings currently ask for (x | (y << 16)), set by
-// cvar change callbacks on any thread and taken by the command processor at
-// the end of a frame. 0 = no change requested.
+// Draw resolution scale the settings currently ask for (render x | (y << 8) |
+// target x << 16 | target y << 24 - the target is above the render scale when
+// NVIDIA DLSS upscales), set on any thread and taken by the command processor
+// at the end of a frame. 0 = no change requested.
 std::atomic<uint32_t> g_requested_draw_resolution_scale{0};
 
 void SetDebugSkippedPixelShaders(std::string_view text) {
@@ -170,13 +171,11 @@ void RegisterDrawResolutionScaleCallbacks() {
     rex::cvar::RegisterChangeCallback(
         "gpu_debug_skip_pixel_shaders",
         [](std::string_view, std::string_view value) { SetDebugSkippedPixelShaders(value); });
-    for (const char* name : {"draw_resolution_scale_x", "draw_resolution_scale_y",
-                             "resolution_scale", "present_effect", "present_fsr_quality_mode"}) {
+    for (const char* name :
+         {"draw_resolution_scale_x", "draw_resolution_scale_y", "resolution_scale",
+          "present_effect", "present_fsr_quality_mode", "dlss_mode"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
-        uint32_t scale_x, scale_y;
-        TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
-        g_requested_draw_resolution_scale.store(scale_x | (scale_y << 16),
-                                                std::memory_order_release);
+        D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
       });
     }
   });
@@ -276,6 +275,13 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   shader_storage_title_id_ = title_id;
 }
 
+void D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings() {
+  uint32_t scale_x, scale_y, target_x, target_y;
+  TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y, &target_x, &target_y);
+  g_requested_draw_resolution_scale.store(
+      scale_x | (scale_y << 8) | (target_x << 16) | (target_y << 24), std::memory_order_release);
+}
+
 void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
   uint32_t requested = g_requested_draw_resolution_scale.exchange(0, std::memory_order_acquire);
   const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
@@ -287,12 +293,31 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
       now_ms - pending_draw_resolution_scale_time_ms_ < kDrawResolutionScaleSettleMs) {
     return;
   }
-  uint32_t scale_x = pending_draw_resolution_scale_ & 0xFFFF;
-  uint32_t scale_y = pending_draw_resolution_scale_ >> 16;
+  uint32_t scale_x = pending_draw_resolution_scale_ & 0xFF;
+  uint32_t scale_y = (pending_draw_resolution_scale_ >> 8) & 0xFF;
+  uint32_t target_x = (pending_draw_resolution_scale_ >> 16) & 0xFF;
+  uint32_t target_y = pending_draw_resolution_scale_ >> 24;
+  const uint32_t requested_x = scale_x, requested_y = scale_y;
   D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(scale_x, scale_y, GetD3D12Provider());
+  // Not upscaled by DLSS if the device lowered the scale.
+  if (scale_x != requested_x || scale_y != requested_y || target_x < scale_x ||
+      target_y < scale_y) {
+    target_x = scale_x;
+    target_y = scale_y;
+  }
   if (scale_x == texture_cache_->draw_resolution_scale_x() &&
       scale_y == texture_cache_->draw_resolution_scale_y()) {
     pending_draw_resolution_scale_ = 0;
+    // Only the scale DLSS upscales to may have changed (Performance at 2x and
+    // off at 1x both render at 1x).
+    if (target_x != draw_resolution_target_scale_x_ ||
+        target_y != draw_resolution_target_scale_y_) {
+      draw_resolution_target_scale_x_ = target_x;
+      draw_resolution_target_scale_y_ = target_y;
+      if (dlss_) {
+        dlss_->OnDrawResolutionScaleChanged();
+      }
+    }
     return;
   }
   // Nothing may still be using the caches that are about to be destroyed.
@@ -300,7 +325,16 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
     return;
   }
   pending_draw_resolution_scale_ = 0;
-  RecreateDrawResolutionScaledCaches(scale_x, scale_y);
+  if (RecreateDrawResolutionScaledCaches(scale_x, scale_y)) {
+    draw_resolution_target_scale_x_ = target_x;
+    draw_resolution_target_scale_y_ = target_y;
+  } else {
+    draw_resolution_target_scale_x_ = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+    draw_resolution_target_scale_y_ = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  }
+  if (dlss_) {
+    dlss_->OnDrawResolutionScaleChanged();
+  }
 }
 
 bool D3D12CommandProcessor::RecreateDrawResolutionScaledCaches(uint32_t scale_x,
@@ -1179,14 +1213,24 @@ bool D3D12CommandProcessor::SetupContext() {
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
+  // NVIDIA DLSS first: whether it works on this GPU decides the render scale of
+  // its upscaling modes.
+  dlss_ = std::make_unique<D3D12Dlss>(*this);
+  if (!dlss_->Initialize()) {
+    dlss_.reset();
+  }
+
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
-  bool draw_resolution_scale_not_clamped =
-      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y);
+  bool draw_resolution_scale_not_clamped = TextureCache::GetConfigDrawResolutionScale(
+      draw_resolution_scale_x, draw_resolution_scale_y, &draw_resolution_target_scale_x_,
+      &draw_resolution_target_scale_y_);
   if (!D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(
           draw_resolution_scale_x, draw_resolution_scale_y, provider)) {
     draw_resolution_scale_not_clamped = false;
+    draw_resolution_target_scale_x_ = draw_resolution_scale_x;
+    draw_resolution_target_scale_y_ = draw_resolution_scale_y;
   }
   if (!draw_resolution_scale_not_clamped) {
     REXGPU_WARN(
@@ -1754,9 +1798,13 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_WARN("Failed to initialize D3D12 resolve-downscale readback pipeline");
   }
 
-  dlss_ = std::make_unique<D3D12Dlss>(*this);
-  if (!dlss_->Initialize()) {
-    dlss_.reset();
+  // The scene is only handed over to DLSS on the host render target path: no
+  // DLSS (and no lower render scale for it) with pixel shader interlock.
+  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets &&
+      rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kUnavailable) {
+    REXGPU_WARN("DLSS: not available with the pixel shader interlock render target path");
+    rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
+    RequestDrawResolutionScaleFromSettings();
   }
 
   if (bindless_resources_used_) {
@@ -2275,14 +2323,45 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // NVIDIA DLSS upscaling: every frame is presented at the output resolution
+  // (the presenter would recreate its textures on size changes) - DLSS's
+  // picture where it's what the game presents, the frame stretched elsewhere.
+  ID3D12Resource* present_resource = swap_texture_resource;
+  D3D12_SHADER_RESOURCE_VIEW_DESC present_srv_desc = swap_texture_srv_desc;
+  uint32_t present_width = guest_output_width;
+  uint32_t present_height = guest_output_height;
+  bool present_upscaled = false;
+  {
+    const uint32_t render_scale_x = texture_cache_->draw_resolution_scale_x();
+    const uint32_t render_scale_y = texture_cache_->draw_resolution_scale_y();
+    if (dlss_ && (draw_resolution_target_scale_x_ > render_scale_x ||
+                  draw_resolution_target_scale_y_ > render_scale_y)) {
+      const uint32_t upscaled_width =
+          guest_output_width * draw_resolution_target_scale_x_ / render_scale_x;
+      const uint32_t upscaled_height =
+          guest_output_height * draw_resolution_target_scale_y_ / render_scale_y;
+      if (dlss_->ComposeUpscaledOutput(swap_texture_resource, swap_texture_srv_desc,
+                                       guest_output_width, guest_output_height, upscaled_width,
+                                       upscaled_height, std::max(render_scale_x, render_scale_y),
+                                       present_resource, present_srv_desc, present_upscaled)) {
+        present_width = upscaled_width;
+        present_height = upscaled_height;
+      }
+    }
+  }
+
   presenter->RefreshGuestOutput(
-      guest_output_width, guest_output_height, display_width, display_height,
-      [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+      present_width, present_height, display_width, display_height,
+      [this, present_srv_desc, frontbuffer_format, present_resource, present_upscaled,
+       guest_output_width = present_width,
+       guest_output_height = present_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
-        SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
+        // DLSS already anti-aliased its picture (frames it didn't make, only
+        // stretched, keep the post effect).
+        SwapPostEffect swap_post_effect =
+            present_upscaled ? SwapPostEffect::kNone : GetActualSwapPostEffect();
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
         if (use_fxaa) {
@@ -2424,7 +2503,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         device->CreateUnorderedAccessView(apply_gamma_dest, nullptr, &apply_gamma_dest_uav_desc,
                                           apply_gamma_descriptors[0].first);
 
-        device->CreateShaderResourceView(swap_texture_resource, &swap_texture_srv_desc,
+        device->CreateShaderResourceView(present_resource, &present_srv_desc,
                                          apply_gamma_descriptors[1].first);
 
         PushTransitionBarrier(gamma_ramp_buffer_.Get(), gamma_ramp_buffer_state_,
@@ -2548,6 +2627,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (dlss_) {
     dlss_->EndFrame();
   }
+  render_target_cache_->EndSceneFrame();
 
   // Between frames and outside the presenter's refresh, apply a draw
   // resolution scale changed in the settings.
@@ -2660,13 +2740,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
   // App option (rex::graphics::SetHideHudDraws): leave out what's drawn over
-  // the 3D scene with the depth test on but always passing - the HUD.
+  // the 3D scene with the depth test on but always passing - the HUD. The
+  // first one still hands the scene over to DLSS (without drawing).
+  bool hud_draw_hidden = false;
   if (is_rasterization_done && rex::graphics::GetHideHudDraws()) {
     const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
     const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
     if (depth_control.z_enable && depth_control.zfunc == xenos::CompareFunction::kAlways &&
         frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
-      return true;
+      if (!dlss_take_scene) {
+        return true;
+      }
+      hud_draw_hidden = true;
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
@@ -2718,16 +2803,39 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     uint32_t scene_width = render_info.frontbuffer_width * texture_cache_->draw_resolution_scale_x();
     uint32_t scene_height =
         render_info.frontbuffer_height * texture_cache_->draw_resolution_scale_y();
+    // Larger with DLSS upscaling.
+    uint32_t output_width = render_info.frontbuffer_width * draw_resolution_target_scale_x_;
+    uint32_t output_height = render_info.frontbuffer_height * draw_resolution_target_scale_y_;
     render_target_cache_->RequestSceneCallback(
-        [this, scene_width, scene_height](ID3D12Resource* color, ID3D12Resource* depth,
-                                          D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
-          (void)depth;
-          return dlss_->ProcessScene(color, depth_srv, scene_width, scene_height);
+        [this, scene_width, scene_height, output_width, output_height](
+            ID3D12Resource* color, ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
+          D3D12_RESOURCE_STATES color_state = dlss_->ProcessScene(
+              color, depth, depth_srv, scene_width, scene_height, output_width, output_height);
+          // Upscaling: the HUD is mirrored until the first copy of the render
+          // target.
+          if (dlss_->IsHudMirrorActive()) {
+            render_target_cache_->RequestSceneResolveCallback(
+                [this](ID3D12Resource* color) { return dlss_->FreezeHud(color); });
+          }
+          return color_state;
         });
   }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
+  }
+  if (hud_draw_hidden) {
+    return true;
+  }
+  // DLSS upscaling: data moved into the render target from other render
+  // targets isn't in the output-size picture.
+  if (dlss_ && dlss_->IsHudMirrorActive() && !dlss_take_scene &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      render_target_cache_->GetLastUpdateBoundResource(1) == dlss_->hud_render_target() &&
+      render_target_cache_->LastUpdateTransferredInto(1)) {
+    dlss_->InvalidateHud("transferred data into the render target",
+                         vertex_shader->ucode_data_hash(),
+                         pixel_shader ? pixel_shader->ucode_data_hash() : 0);
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -2762,6 +2870,49 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
+  }
+
+  // DLSS upscaling: draws into the render target the scene was taken from
+  // (the HUD) are drawn again into DLSS's output-size picture - those that
+  // don't depend on the render resolution or on what's only in the game's own
+  // render targets.
+  bool hud_mirror = false;
+  if (dlss_ && dlss_->IsHudMirrorActive() && host_render_targets_used &&
+      (bound_depth_and_color_render_target_bits & 0b10) && (normalized_color_mask & 0xF) &&
+      render_target_cache_->GetLastUpdateBoundResource(1) == dlss_->hud_render_target()) {
+    const char* hud_mirror_failure = nullptr;
+    if (bound_depth_and_color_render_target_bits & ~uint32_t(0b11)) {
+      hud_mirror_failure = "also writes other render targets";
+    } else if (render_target_cache_->GetColorDrawDXGIFormat(xenos::ColorRenderTargetFormat(
+                   bound_depth_and_color_render_target_formats[1])) !=
+               dlss_->hud_color_format()) {
+      hud_mirror_failure = "uses another color format";
+    } else if ((bound_depth_and_color_render_target_bits & 0b1) &&
+               D3D12RenderTargetCache::GetDepthDSVDXGIFormat(xenos::DepthRenderTargetFormat(
+                   bound_depth_and_color_render_target_formats[0])) !=
+                   dlss_->hud_depth_format()) {
+      hud_mirror_failure = "uses another depth format";
+    } else if (memexport_used) {
+      hud_mirror_failure = "exports to memory";
+    } else if (ps_param_gen_pos != UINT32_MAX) {
+      hud_mirror_failure = "uses the pixel position";
+    } else if (normalized_depth_control.z_enable &&
+               normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
+      hud_mirror_failure = "tests depth";
+    } else if (normalized_depth_control.stencil_enable &&
+               (normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+                (normalized_depth_control.backface_enable && primitive_polygonal &&
+                 normalized_depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways))) {
+      hud_mirror_failure = "tests stencil";
+    } else if (active_occlusion_query_.valid) {
+      hud_mirror_failure = "is in an occlusion query";
+    }
+    if (hud_mirror_failure) {
+      dlss_->InvalidateHud(hud_mirror_failure, vertex_shader->ucode_data_hash(),
+                           pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    } else {
+      hud_mirror = true;
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -2891,6 +3042,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  const draw_util::Scissor guest_scissor = scissor;
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -3132,6 +3284,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  if (hud_mirror) {
+    MirrorDrawToHud(primitive_processing_result, viewport_info, guest_scissor,
+                    (bound_depth_and_color_render_target_bits & 0b1) != 0);
+  }
+
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
@@ -3166,6 +3323,56 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   return true;
+}
+
+void D3D12CommandProcessor::MirrorDrawToHud(
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    const draw_util::ViewportInfo& viewport_info, const draw_util::Scissor& guest_scissor,
+    bool with_depth) {
+  const uint32_t render_scale_x = texture_cache_->draw_resolution_scale_x();
+  const uint32_t render_scale_y = texture_cache_->draw_resolution_scale_y();
+  const uint32_t target_scale_x = draw_resolution_target_scale_x_;
+  const uint32_t target_scale_y = draw_resolution_target_scale_y_;
+  // The viewport is a multiple of the render scale (the normalized device
+  // coordinates around it are in guest pixels), so it's the same at the
+  // output's.
+  D3D12_VIEWPORT viewport;
+  viewport.TopLeftX = float(viewport_info.xy_offset[0]) * float(target_scale_x) / float(render_scale_x);
+  viewport.TopLeftY = float(viewport_info.xy_offset[1]) * float(target_scale_y) / float(render_scale_y);
+  viewport.Width = float(viewport_info.xy_extent[0]) * float(target_scale_x) / float(render_scale_x);
+  viewport.Height = float(viewport_info.xy_extent[1]) * float(target_scale_y) / float(render_scale_y);
+  viewport.MinDepth = viewport_info.z_min;
+  viewport.MaxDepth = viewport_info.z_max;
+  if (viewport.TopLeftX + viewport.Width > float(D3D12_VIEWPORT_BOUNDS_MAX) ||
+      viewport.TopLeftY + viewport.Height > float(D3D12_VIEWPORT_BOUNDS_MAX)) {
+    dlss_->InvalidateHud("has a viewport too large for the output resolution", 0, 0);
+    return;
+  }
+  const uint32_t width = dlss_->hud_width();
+  const uint32_t height = dlss_->hud_height();
+  D3D12_RECT scissor;
+  scissor.left = LONG(std::min(guest_scissor.offset[0] * target_scale_x, width));
+  scissor.top = LONG(std::min(guest_scissor.offset[1] * target_scale_y, height));
+  scissor.right = LONG(
+      std::min((guest_scissor.offset[0] + guest_scissor.extent[0]) * target_scale_x, width));
+  scissor.bottom = LONG(
+      std::min((guest_scissor.offset[1] + guest_scissor.extent[1]) * target_scale_y, height));
+
+  dlss_->BindHudTargets(with_depth);
+  // The next draw binds the game's render targets again.
+  render_target_cache_->InvalidateCommandListRenderTargets();
+  SetViewport(viewport);
+  SetScissorRect(scissor);
+  SubmitBarriers();
+  if (primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
+                                            0, 0);
+  } else {
+    // The index buffer is still bound.
+    deferred_command_list_.D3DDrawIndexedInstanced(
+        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+  }
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -4218,7 +4425,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // by W.
   float ndc_jitter[3] = {};
   if (dlss_ && (dlss_->jitter_x() != 0.0f || dlss_->jitter_y() != 0.0f) &&
-      normalized_depth_control.z_enable &&
+      !dlss_->scene_taken() && normalized_depth_control.z_enable &&
       normalized_depth_control.zfunc != xenos::CompareFunction::kAlways &&
       viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
     const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
@@ -4675,7 +4882,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   }
   // texture_lod_bias goes into the fetch constants' LOD bias, which the
   // translated shaders apply.
-  const int32_t texture_lod_bias = int32_t(std::lround(REXCVAR_GET(texture_lod_bias) * 32.0));
+  // With DLSS upscaling, the scene's textures are also sharpened by the
+  // render to output ratio.
+  const int32_t texture_lod_bias = int32_t(std::lround(REXCVAR_GET(texture_lod_bias) * 32.0)) +
+                                   (dlss_ ? dlss_->scene_lod_bias() : 0);
   if (texture_lod_bias != applied_texture_lod_bias_) {
     applied_texture_lod_bias_ = texture_lod_bias;
     cbuffer_binding_fetch_.up_to_date = false;

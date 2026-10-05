@@ -71,6 +71,29 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   using SceneCallback = std::function<D3D12_RESOURCE_STATES(
       ID3D12Resource* color, ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv)>;
   void RequestSceneCallback(SceneCallback callback) { scene_callback_ = std::move(callback); }
+  // At the first resolve after that copying from the color render target
+  // handed over, before it's copied, with the render target in
+  // NON_PIXEL_SHADER_RESOURCE; the callback returns the state it leaves it in.
+  using SceneResolveCallback = std::function<D3D12_RESOURCE_STATES(ID3D12Resource* color)>;
+  void RequestSceneResolveCallback(SceneResolveCallback callback) {
+    scene_resolve_callback_ = std::move(callback);
+  }
+  // At the end of a frame: forgets the handover and the resolve callback.
+  void EndSceneFrame() {
+    scene_color_render_target_ = nullptr;
+    scene_resolve_callback_ = nullptr;
+  }
+  // Host render target path: the resource of a render target bound by the
+  // last Update (0 - depth, 1+ - color), and whether data was transferred into
+  // it from other render targets then.
+  ID3D12Resource* GetLastUpdateBoundResource(uint32_t index) const {
+    const RenderTarget* render_target = last_update_accumulated_render_targets()[index];
+    return render_target ? static_cast<const D3D12RenderTarget*>(render_target)->resource()
+                         : nullptr;
+  }
+  bool LastUpdateTransferredInto(uint32_t index) const {
+    return !last_update_transfers()[index].empty();
+  }
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 
@@ -702,6 +725,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       current_command_list_render_targets_[1 + xenos::kMaxColorRenderTargets];
   bool are_current_command_list_render_targets_valid_ = false;
   SceneCallback scene_callback_;
+  SceneResolveCallback scene_resolve_callback_;
+  RenderTarget* scene_color_render_target_ = nullptr;
+  std::vector<ResolveCopyDumpRectangle> scene_resolve_rectangles_;
 
   // Temporary storage for descriptors used in PerformTransfersAndResolveClears
   // and DumpRenderTargets.

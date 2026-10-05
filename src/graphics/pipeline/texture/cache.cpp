@@ -23,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/filesystem.h>
+#include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -326,6 +327,41 @@ uint32_t GetUpscalerRenderScale(uint32_t target_scale, const std::string& effect
   return best_scale;
 }
 
+// NVIDIA DLSS's upscaling modes: the render scale below the target for the
+// mode, among those DLSS has a mode for (2/3 = Quality, 1/2 = Performance,
+// 1/3 = Ultra Performance) - only whole scales exist, so the closest one (at
+// 3x: quality / balanced / performance -> 2x, ultra_performance -> 1x; at 2x
+// and 4x every mode is 1/2). The target if none fits (DLAA at the target).
+uint32_t GetDlssRenderScale(uint32_t target_scale, const std::string& mode) {
+  float ratio;
+  if (mode == "quality") {
+    ratio = 1.5f;
+  } else if (mode == "balanced") {
+    ratio = 1.724f;
+  } else if (mode == "performance") {
+    ratio = 2.0f;
+  } else if (mode == "ultra_performance") {
+    ratio = 3.0f;
+  } else {
+    return target_scale;  // off / dlaa
+  }
+  uint32_t best_scale = target_scale;
+  float best_error = 0.0f;
+  for (uint32_t scale = target_scale - 1; scale >= 1; --scale) {
+    // DLSS's own ratios: 3 * scale = 2 * target, 2 * scale = target, or
+    // 3 * scale = target.
+    if (3 * scale != 2 * target_scale && 2 * scale != target_scale && 3 * scale != target_scale) {
+      continue;
+    }
+    float error = std::abs(std::log(float(target_scale) / float(scale) / ratio));
+    if (best_scale == target_scale || error < best_error) {
+      best_scale = scale;
+      best_error = error;
+    }
+  }
+  return best_scale;
+}
+
 // The replacement key of a texture: XXH3 of its base level as the guest
 // stores it, with the bytes the texture doesn't use - the padding of tiles
 // and rows around its texels - taken as zero. Games leave whatever was in
@@ -394,7 +430,8 @@ uint64_t ReplacementLayoutSignature(const texture_util::TextureGuestLayout& layo
 
 }  // namespace
 
-bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
+bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out,
+                                                uint32_t* target_x_out, uint32_t* target_y_out) {
   uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
   bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
   uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
@@ -406,14 +443,37 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
   uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
 
-  // The presenter cvars live in rexruntime, so they're read by name.
-  const std::string effect = LowercaseFlag("present_effect");
-  const std::string mode = LowercaseFlag("present_fsr_quality_mode");
-  x_out = GetUpscalerRenderScale(clamped_x, effect, mode);
-  y_out = GetUpscalerRenderScale(clamped_y, effect, mode);
-  if (x_out != clamped_x || y_out != clamped_y) {
-    REXLOG_INFO("{} {}: rendering at {}x{} scale, upscaled towards {}x{}", effect, mode, x_out,
-                y_out, clamped_x, clamped_y);
+  // NVIDIA DLSS (dlss_mode, read by name like the presenter cvars) goes first:
+  // with an upscaling mode, DLSS upscales the 3D scene to the configured scale,
+  // and present_fsr_quality_mode doesn't lower it further. Only where DLSS
+  // works, and for square scales (DLSS needs the output's aspect ratio).
+  const std::string dlss = LowercaseFlag("dlss_mode");
+  const bool dlss_upscaling =
+      !dlss.empty() && dlss != "off" && dlss != "dlaa" && clamped_x == clamped_y &&
+      rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable;
+  if (dlss_upscaling) {
+    x_out = GetDlssRenderScale(clamped_x, dlss);
+    y_out = x_out;
+    if (x_out != clamped_x) {
+      REXLOG_INFO("NVIDIA DLSS {}: rendering at {}x{} scale, upscaled to {}x{}", dlss, x_out,
+                  y_out, clamped_x, clamped_y);
+    }
+  } else {
+    // The presenter cvars live in rexruntime, so they're read by name.
+    const std::string effect = LowercaseFlag("present_effect");
+    const std::string mode = LowercaseFlag("present_fsr_quality_mode");
+    x_out = GetUpscalerRenderScale(clamped_x, effect, mode);
+    y_out = GetUpscalerRenderScale(clamped_y, effect, mode);
+    if (x_out != clamped_x || y_out != clamped_y) {
+      REXLOG_INFO("{} {}: rendering at {}x{} scale, upscaled towards {}x{}", effect, mode, x_out,
+                  y_out, clamped_x, clamped_y);
+    }
+  }
+  if (target_x_out) {
+    *target_x_out = dlss_upscaling ? clamped_x : x_out;
+  }
+  if (target_y_out) {
+    *target_y_out = dlss_upscaling ? clamped_y : y_out;
   }
   rex::perf::SetDrawResolutionScale(x_out, y_out, clamped_x, clamped_y);
   return clamped_x == config_x && clamped_y == config_y;

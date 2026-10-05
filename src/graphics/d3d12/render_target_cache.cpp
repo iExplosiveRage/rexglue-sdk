@@ -1085,6 +1085,7 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
           color_rt->SetResourceState(scene_callback(color_rt->resource(), depth_rt->resource(),
                                                     depth_rt->descriptor_srv().GetHandle()));
+          scene_color_render_target_ = color_rt;
           // The callback may have run code that binds anything.
           are_current_command_list_render_targets_valid_ = false;
         }
@@ -1201,6 +1202,31 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+
+  // The first copy of the render target handed over (see
+  // RequestSceneResolveCallback).
+  if (scene_resolve_callback_ && scene_color_render_target_ &&
+      resolve_info.copy_dest_extent_length && !resolve_info.IsCopyingDepth() &&
+      GetPath() == Path::kHostRenderTargets) {
+    uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+    resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+    GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                   scene_resolve_rectangles_);
+    for (const ResolveCopyDumpRectangle& rectangle : scene_resolve_rectangles_) {
+      if (rectangle.render_target != scene_color_render_target_) {
+        continue;
+      }
+      auto* color_rt = static_cast<D3D12RenderTarget*>(scene_color_render_target_);
+      command_processor_.PushTransitionBarrier(
+          color_rt->resource(),
+          color_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      SceneResolveCallback scene_resolve_callback = std::move(scene_resolve_callback_);
+      scene_resolve_callback_ = nullptr;
+      color_rt->SetResourceState(scene_resolve_callback(color_rt->resource()));
+      break;
+    }
+  }
 
   // Copying.
   bool copied = false;

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/graphics/draw_overrides.h>
 #include <rex/perf/frame_rate.h>
 #include <rex/ui/overlay/overlay_text.h>
 #include <rex/version.h>
@@ -36,8 +37,43 @@ namespace rex::ui {
 
 namespace {
 
-// The upscaler shown in the overlay, from the presenter settings.
+std::string PresentUpscalerText();
+
+// The upscaler shown in the overlay: NVIDIA DLSS where it works - upscaling
+// if it lowered the render resolution, DLAA otherwise (with the presenter's
+// upscaler if there's one) - or the presenter's.
 std::string UpscalerText() {
+  const rex::graphics::DlssAvailability dlss_availability = rex::graphics::GetDlssAvailability();
+  if (dlss_availability != rex::graphics::DlssAvailability::kUnavailable &&
+      rex::cvar::GetFlagInfo("dlss_mode")) {
+    const std::string dlss = rex::cvar::GetFlagByName("dlss_mode");
+    if (dlss != "off") {
+      static const std::pair<const char*, const char*> kDlssModes[] = {
+          {"quality", "Quality"},
+          {"balanced", "Balanced"},
+          {"performance", "Performance"},
+          {"ultra_performance", "Ultra Perf."},
+      };
+      const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
+      const bool lowered =
+          info.scale_x < info.requested_scale_x || info.scale_y < info.requested_scale_y;
+      if (dlss_availability == rex::graphics::DlssAvailability::kAvailable && lowered) {
+        for (const auto& [value, name] : kDlssModes) {
+          if (dlss == value) {
+            return std::string("NVIDIA DLSS \xC2\xB7 ") + name;
+          }
+        }
+      }
+      const std::string present = PresentUpscalerText();
+      return present.empty() || present == "Off" ? std::string("NVIDIA DLAA")
+                                                 : "NVIDIA DLAA + " + present;
+    }
+  }
+  return PresentUpscalerText();
+}
+
+// The presenter's upscaler, from its settings.
+std::string PresentUpscalerText() {
   if (!rex::cvar::GetFlagInfo("present_effect")) {
     return {};
   }

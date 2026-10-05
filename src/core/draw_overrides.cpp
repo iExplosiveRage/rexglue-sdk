@@ -20,6 +20,7 @@ std::atomic<float> g_scene_projection_scale{1.0f};
 std::atomic<float> g_scene_projection_roll{0.0f};
 std::atomic<bool> g_scene_projection_undepthed_triangles{false};
 std::atomic<bool> g_hide_hud_draws{false};
+std::atomic<DlssAvailability> g_dlss_availability{DlssAvailability::kUnavailable};
 std::mutex g_overrides_mutex;
 std::map<std::string, std::vector<PixelShaderDrawOverride>> g_overrides_by_owner;
 std::atomic<uint32_t> g_overrides_generation{0};
@@ -89,6 +90,14 @@ void SetHideHudDraws(bool hide) {
 
 bool GetHideHudDraws() {
   return g_hide_hud_draws.load(std::memory_order_relaxed);
+}
+
+void SetDlssAvailability(DlssAvailability availability) {
+  g_dlss_availability.store(availability, std::memory_order_release);
+}
+
+DlssAvailability GetDlssAvailability() {
+  return g_dlss_availability.load(std::memory_order_acquire);
 }
 
 }  // namespace rex::graphics
