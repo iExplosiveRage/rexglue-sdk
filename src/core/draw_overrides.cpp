@@ -21,6 +21,9 @@ std::atomic<float> g_scene_projection_roll{0.0f};
 std::atomic<bool> g_scene_projection_undepthed_triangles{false};
 std::atomic<bool> g_hide_hud_draws{false};
 std::atomic<DlssAvailability> g_dlss_availability{DlssAvailability::kUnavailable};
+std::atomic<FsrAvailability> g_fsr_availability{FsrAvailability::kUnavailable};
+std::mutex g_fsr_provider_mutex;
+std::string g_fsr_provider_name;
 std::mutex g_overrides_mutex;
 std::map<std::string, std::vector<PixelShaderDrawOverride>> g_overrides_by_owner;
 std::atomic<uint32_t> g_overrides_generation{0};
@@ -98,6 +101,24 @@ void SetDlssAvailability(DlssAvailability availability) {
 
 DlssAvailability GetDlssAvailability() {
   return g_dlss_availability.load(std::memory_order_acquire);
+}
+
+void SetFsrAvailability(FsrAvailability availability) {
+  g_fsr_availability.store(availability, std::memory_order_release);
+}
+
+FsrAvailability GetFsrAvailability() {
+  return g_fsr_availability.load(std::memory_order_acquire);
+}
+
+void SetFsrProviderName(std::string_view name) {
+  std::lock_guard<std::mutex> lock(g_fsr_provider_mutex);
+  g_fsr_provider_name = name;
+}
+
+std::string GetFsrProviderName() {
+  std::lock_guard<std::mutex> lock(g_fsr_provider_mutex);
+  return g_fsr_provider_name;
 }
 
 }  // namespace rex::graphics

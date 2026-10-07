@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -76,5 +77,18 @@ bool GetHideHudDraws();
 enum class DlssAvailability : uint32_t { kUnavailable, kDlaaOnly, kAvailable };
 void SetDlssAvailability(DlssAvailability availability);
 DlssAvailability GetDlssAvailability();
+
+// AMD FSR for the 3D scene (FSR 4 or 3.1.5) on this GPU, set by the GPU
+// backend once AMD's DLLs are loaded - only when fsr_mode is on. Like
+// DlssAvailability: its upscaling modes only lower the draw resolution scale
+// with kAvailable (kNativeOnly: upscaling failed). DLSS goes first when both
+// are on. Thread-safe.
+enum class FsrAvailability : uint32_t { kUnavailable, kNativeOnly, kAvailable };
+void SetFsrAvailability(FsrAvailability availability);
+FsrAvailability GetFsrAvailability();
+// The FSR version running ("4.1.1", "3.1.5"), empty before the first frame
+// using it.
+void SetFsrProviderName(std::string_view name);
+std::string GetFsrProviderName();
 
 }  // namespace rex::graphics

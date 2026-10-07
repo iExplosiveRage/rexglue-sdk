@@ -146,15 +146,22 @@ void LogTemporalFsrCompatibilityPathOnce() {
 
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
-// An NVIDIA DLSS upscaling mode is on and DLSS works (the GPU side picks the
-// render scale for it).
-bool IsDlssUpscaling() {
-  if (rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kAvailable) {
-    return false;
+// An upscaling mode of NVIDIA DLSS - or of AMD FSR while DLSS is off - is on
+// and works (the GPU side picks the render scale for it).
+bool IsSceneUpscaling() {
+  auto upscaling_mode = [](const std::string& mode) {
+    return mode == "quality" || mode == "balanced" || mode == "performance" ||
+           mode == "ultra_performance";
+  };
+  const rex::graphics::DlssAvailability dlss = rex::graphics::GetDlssAvailability();
+  const std::string dlss_mode =
+      rex::cvar::GetFlagInfo("dlss_mode") ? rex::cvar::GetFlagByName("dlss_mode") : "off";
+  if (dlss != rex::graphics::DlssAvailability::kUnavailable && dlss_mode != "off") {
+    return dlss == rex::graphics::DlssAvailability::kAvailable && upscaling_mode(dlss_mode);
   }
-  const std::string dlss_mode = rex::cvar::GetFlagByName("dlss_mode");
-  return dlss_mode == "quality" || dlss_mode == "balanced" || dlss_mode == "performance" ||
-         dlss_mode == "ultra_performance";
+  return rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable &&
+         rex::cvar::GetFlagInfo("fsr_mode") &&
+         upscaling_mode(rex::cvar::GetFlagByName("fsr_mode"));
 }
 
 GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
@@ -989,7 +996,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     bool temporal_quality_mode_forced =
         is_temporal_effect &&
         config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto &&
-        !IsDlssUpscaling();
+        !IsSceneUpscaling();
     if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr || is_temporal_effect) &&
         ((ffx_last_size.first < output_width_clamped ||
           ffx_last_size.second < output_height_clamped) ||

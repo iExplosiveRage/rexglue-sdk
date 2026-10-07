@@ -1,7 +1,7 @@
 /**
  * @file        graphics/d3d12/dlss.h
- * @brief       NVIDIA DLSS (DLAA and upscaling) for the 3D scene, run before
- *              the HUD is drawn
+ * @brief       NVIDIA DLSS and AMD FSR (anti-aliasing and upscaling) for the 3D
+ *              scene, run before the HUD is drawn
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -9,7 +9,9 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -23,9 +25,12 @@ struct NVSDK_NGX_Parameter;
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor;
+class D3D12FfxUpscaler;
 
-// NVIDIA DLSS for the 3D scene, run right before the HUD is drawn so the HUD
-// isn't part of it (cvar dlss_mode):
+// NVIDIA DLSS - or AMD FSR (FSR 4 where the GPU has it, FSR 3.1.5 elsewhere)
+// when DLSS is off or doesn't work - for the 3D scene, run right before the HUD
+// is drawn so the HUD isn't part of it (cvars dlss_mode, fsr_mode). Everything
+// below is the same for both; only the call to the upscaler differs:
 // - The scene draws - depth test on and not always passing, into the
 //   frontbuffer-wide render target - get a sub-pixel jitter every frame.
 // - At the first HUD-class draw after them (depth test on but always passing),
@@ -58,8 +63,12 @@ class D3D12Dlss {
   ~D3D12Dlss();
 
   // Also finds out whether DLSS works on this GPU
-  // (rex::graphics::SetDlssAvailability).
+  // (rex::graphics::SetDlssAvailability), and loads FSR if fsr_mode is on
+  // (rex::graphics::SetFsrAvailability).
   bool Initialize();
+  // Without host render targets (pixel shader interlock): neither upscaler
+  // gets the scene.
+  void OnHostRenderTargetsUnavailable();
   // With the GPU idle.
   void Shutdown();
 
@@ -138,6 +147,8 @@ class D3D12Dlss {
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
   };
 
+  enum class Backend { kNone, kDlss, kFsr };
+
   enum class HudState {
     // No output-size picture in this frame (yet).
     kNone,
@@ -149,8 +160,12 @@ class D3D12Dlss {
     kInvalid,
   };
 
-  bool IsEnabled() const;
+  // The upscaler the scene goes to: DLSS if it's on and works, else FSR.
+  Backend SelectBackend() const;
+  bool IsEnabled() const { return SelectBackend() != Backend::kNone; }
   bool InitializeNgx();
+  // Loads FSR (once); sets the availability.
+  void TryInitializeFsr();
   void ShutdownNgx();
   bool EnsureTexture(Texture& texture, DXGI_FORMAT format, uint32_t width, uint32_t height,
                      const char* name,
@@ -160,8 +175,16 @@ class D3D12Dlss {
   void ReleaseLater(Texture& texture);
   // The camera matrix shared by the most scene draws this frame, or nullptr.
   const std::array<float, 16>* FrameCamera() const;
-  // Upscaling failed: DLAA at the configured scale from now on.
-  void DisableUpscaling(const char* reason);
+  // Upscaling failed: anti-aliasing at the configured scale from now on (for
+  // that upscaler).
+  void DisableUpscaling(Backend backend, const char* reason);
+  // FSR failed entirely: off from now on.
+  void DisableFsr();
+  // Records FSR for ProcessScene (its inputs ready, the output in
+  // UNORDERED_ACCESS). False if it can't run.
+  bool RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint32_t width, uint32_t height,
+                 uint32_t output_width, uint32_t output_height, bool upscale, bool reset,
+                 ID3D12Resource* output);
 
   D3D12CommandProcessor& command_processor_;
 
@@ -193,6 +216,8 @@ class D3D12Dlss {
   Texture tiles_;
   // The picture presented.
   Texture present_;
+  // FSR: the scene's color at its own size (the render target is larger).
+  Texture fsr_color_;
   // Resources (and DLSS features) replaced while the GPU may still use them,
   // with the submission after which they can go.
   std::vector<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> resources_to_release_;
@@ -211,6 +236,16 @@ class D3D12Dlss {
   uint32_t feature_preset_ = 0;
   bool feature_failed_ = false;
   bool upscaling_failed_ = false;
+
+  // AMD FSR.
+  std::unique_ptr<D3D12FfxUpscaler> ffx_;
+  bool fsr_tried_ = false;
+  // No host render targets.
+  bool fsr_blocked_ = false;
+  bool fsr_failed_ = false;
+  bool fsr_upscaling_failed_ = false;
+  std::chrono::steady_clock::time_point fsr_previous_time_{};
+  bool fsr_camera_logged_ = false;
 
   // This frame.
   float jitter_[2] = {};
@@ -240,6 +275,7 @@ class D3D12Dlss {
   std::set<std::string> hud_invalid_logged_;
 
   // Across frames.
+  Backend previous_backend_ = Backend::kNone;
   bool previous_processed_ = false;
   std::array<float, 16> previous_camera_{};
   bool previous_camera_valid_ = false;

@@ -49,6 +49,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ~D3D12RenderTargetCache() override;
 
   bool Initialize();
+  // The path Initialize takes on this device (render_target_path_d3d12, the
+  // vendor, ROV support).
+  static Path ChoosePath(const ui::d3d12::D3D12Provider& provider);
   void Shutdown(bool from_destructor = false);
 
   void CompletedSubmissionUpdated();

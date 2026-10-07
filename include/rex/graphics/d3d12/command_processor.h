@@ -193,11 +193,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // command list state. A submission must be open.
   void InvalidateStateAfterExternalCommands();
 
-  // Any thread: re-reads the settings (and whether NVIDIA DLSS works) into
-  // the draw resolution scale applied at the end of a frame.
+  // Any thread: re-reads the settings (and whether NVIDIA DLSS / AMD FSR
+  // work) into the draw resolution scale applied at the end of a frame.
   static void RequestDrawResolutionScaleFromSettings();
+  // A new draw resolution scale has been asked for and isn't applied yet.
+  bool IsDrawResolutionScaleChangePending() const;
   // The scale the 3D scene ends up at: above the render scale (the texture
-  // cache's) when NVIDIA DLSS upscales it.
+  // cache's) when NVIDIA DLSS or AMD FSR upscales it.
   uint32_t draw_resolution_target_scale_x() const { return draw_resolution_target_scale_x_; }
   uint32_t draw_resolution_target_scale_y() const { return draw_resolution_target_scale_y_; }
   void SetViewport(const D3D12_VIEWPORT& viewport);

@@ -83,6 +83,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/texture_cache.cpp
         d3d12/deferred_command_list.cpp
         d3d12/dlss.cpp
+        d3d12/ffx_upscaler.cpp
         d3d12/pipeline_cache.cpp
     )
 endif()
@@ -168,5 +169,13 @@ if(REXGLUE_ENABLE_DLSS AND REXGLUE_DLSS_LIBRARY)
     target_include_directories(rexgpu-xenos PRIVATE ${REXGLUE_DLSS_INCLUDE_DIR})
     target_link_libraries(rexgpu-xenos PRIVATE ${REXGLUE_DLSS_LIBRARY})
     target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_DLSS=1)
+endif()
+
+# AMD FSR 4 / 3.1.5 (cmake/rexglue_fsr_sdk.cmake): only AMD's headers - the
+# loader DLL is loaded at runtime, and both DLLs are copied next to the
+# executable.
+if(REXGLUE_ENABLE_FSR_SDK AND REXGLUE_FSR_SDK_INCLUDE_DIR)
+    target_include_directories(rexgpu-xenos PRIVATE ${REXGLUE_FSR_SDK_INCLUDE_DIR})
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_FSR_SDK=1)
 endif()
 

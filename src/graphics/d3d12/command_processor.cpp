@@ -173,7 +173,7 @@ void RegisterDrawResolutionScaleCallbacks() {
         [](std::string_view, std::string_view value) { SetDebugSkippedPixelShaders(value); });
     for (const char* name :
          {"draw_resolution_scale_x", "draw_resolution_scale_y", "resolution_scale",
-          "present_effect", "present_fsr_quality_mode", "dlss_mode"}) {
+          "present_effect", "present_fsr_quality_mode", "dlss_mode", "fsr_mode"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
         D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
       });
@@ -280,6 +280,32 @@ void D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings() {
   TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y, &target_x, &target_y);
   g_requested_draw_resolution_scale.store(
       scale_x | (scale_y << 8) | (target_x << 16) | (target_y << 24), std::memory_order_release);
+}
+
+bool D3D12CommandProcessor::IsDrawResolutionScaleChangePending() const {
+  if (pending_draw_resolution_scale_ != 0 ||
+      g_requested_draw_resolution_scale.load(std::memory_order_acquire) != 0) {
+    return true;
+  }
+  // The settings may have changed with the request not made yet (another
+  // thread in the middle of the change callbacks): the scale they give now,
+  // like UpdateDrawResolutionScaleFromSettings would apply it.
+  if (!texture_cache_) {
+    return false;
+  }
+  uint32_t scale_x, scale_y, target_x, target_y;
+  TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y, &target_x, &target_y);
+  const uint32_t requested_x = scale_x, requested_y = scale_y;
+  D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(scale_x, scale_y, GetD3D12Provider());
+  if (scale_x != requested_x || scale_y != requested_y || target_x < scale_x ||
+      target_y < scale_y) {
+    target_x = scale_x;
+    target_y = scale_y;
+  }
+  return scale_x != texture_cache_->draw_resolution_scale_x() ||
+         scale_y != texture_cache_->draw_resolution_scale_y() ||
+         target_x != draw_resolution_target_scale_x_ ||
+         target_y != draw_resolution_target_scale_y_;
 }
 
 void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
@@ -1219,6 +1245,12 @@ bool D3D12CommandProcessor::SetupContext() {
   if (!dlss_->Initialize()) {
     dlss_.reset();
   }
+  // Neither upscaler gets the scene without host render targets (pixel shader
+  // interlock) - known before the render scale is chosen.
+  if (dlss_ && D3D12RenderTargetCache::ChoosePath(provider) !=
+                   RenderTargetCache::Path::kHostRenderTargets) {
+    dlss_->OnHostRenderTargetsUnavailable();
+  }
 
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
@@ -1805,6 +1837,9 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_WARN("DLSS: not available with the pixel shader interlock render target path");
     rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
     RequestDrawResolutionScaleFromSettings();
+  }
+  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets && dlss_) {
+    dlss_->OnHostRenderTargetsUnavailable();
   }
 
   if (bindless_resources_used_) {

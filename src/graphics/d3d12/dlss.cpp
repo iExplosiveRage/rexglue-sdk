@@ -1,7 +1,7 @@
 /**
  * @file        graphics/d3d12/dlss.cpp
- * @brief       NVIDIA DLSS (DLAA and upscaling) for the 3D scene, run before
- *              the HUD is drawn
+ * @brief       NVIDIA DLSS and AMD FSR (anti-aliasing and upscaling) for the 3D
+ *              scene, run before the HUD is drawn
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -24,6 +24,8 @@
 #include <rex/graphics/draw_overrides.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+#include "ffx_upscaler.h"
 
 #if defined(REX_HAS_DLSS)
 #include <nvsdk_ngx_helpers.h>
@@ -55,6 +57,30 @@ REXCVAR_DEFINE_BOOL(dlss_jitter, true, "GPU/Debug",
 
 REXCVAR_DEFINE_INT32(dlss_jitter_sign, 0, "GPU/Debug",
                      "Negate the jitter given to DLSS: bit 0 = X, bit 1 = Y (to check its "
+                     "convention)")
+    .range(0, 3);
+
+REXCVAR_DEFINE_STRING(fsr_mode, "off", "GPU",
+                      "AMD FSR for the 3D scene - FSR 4 on GPUs that have it (RX 9000, RX 7000), "
+                      "FSR 3.1.5 elsewhere - used while dlss_mode is off: off; native_aa - "
+                      "anti-aliasing at the draw resolution scale; quality, balanced, "
+                      "performance, ultra_performance - the game renders below the draw "
+                      "resolution scale and FSR upscales the scene to it (the HUD is drawn at "
+                      "it). Only whole scales exist, at most 3x below")
+    .allowed({"off", "native_aa", "quality", "balanced", "performance", "ultra_performance"});
+
+REXCVAR_DEFINE_DOUBLE(fsr_sharpness, 0.0, "GPU",
+                      "AMD FSR's sharpening, 0 (off) to 1")
+    .range(0.0, 1.0);
+
+REXCVAR_DEFINE_STRING(fsr_version, "auto", "GPU",
+                      "AMD FSR version: auto (the newest the GPU has), 4 or 3 (if the GPU has it)")
+    .allowed({"auto", "4", "3"});
+
+REXCVAR_DEFINE_BOOL(fsr_debug_view, false, "GPU/Debug", "Show AMD FSR's own debug view");
+
+REXCVAR_DEFINE_INT32(fsr_jitter_sign, 0, "GPU/Debug",
+                     "Negate the jitter given to AMD FSR: bit 0 = X, bit 1 = Y (to check its "
                      "convention)")
     .range(0, 3);
 
@@ -220,6 +246,60 @@ ID3D12RootSignature* CreateComputeRootSignature(const ui::d3d12::D3D12Provider& 
   return ui::d3d12::util::CreateRootSignature(provider, desc);
 }
 
+// What FSR wants to know of the camera, from the scene's view * projection
+// matrix (row vectors): with a rigid view and a perspective projection, the
+// depth is k + c / w, w being the distance along the view direction.
+struct CameraParameters {
+  float near_plane = 0.1f;
+  float far_plane = 1000.0f;
+  float fov_y = 1.047f;
+  bool inverted = false;
+  bool infinite = false;
+  bool valid = false;
+};
+
+CameraParameters GetCameraParameters(const std::array<float, 16>& matrix) {
+  CameraParameters parameters;
+  auto m = [&matrix](int row, int column) { return double(matrix[row * 4 + column]); };
+  // The row with the most of w, for k.
+  int row = 0;
+  for (int i = 1; i < 3; ++i) {
+    if (std::abs(m(i, 3)) > std::abs(m(row, 3))) {
+      row = i;
+    }
+  }
+  if (std::abs(m(row, 3)) < 1.0e-6) {
+    return parameters;
+  }
+  const double k = m(row, 2) / m(row, 3);
+  const double c = m(3, 2) - k * m(3, 3);
+  const double column1 = std::sqrt(m(0, 1) * m(0, 1) + m(1, 1) * m(1, 1) + m(2, 1) * m(2, 1));
+  const double column3 = std::sqrt(m(0, 3) * m(0, 3) + m(1, 3) * m(1, 3) + m(2, 3) * m(2, 3));
+  if (std::abs(c) < 1.0e-9 || column1 < 1.0e-9) {
+    return parameters;
+  }
+  // The depth grows with the distance (c < 0) or falls (c > 0, inverted).
+  // Where it's 0 and 1: the near and far planes, the far one possibly at
+  // infinity (or past it, when the projection was tweaked for that).
+  const bool inverted = c > 0.0;
+  const double w0 = std::abs(k) > 1.0e-9 ? -c / k : HUGE_VAL;
+  const double w1 = std::abs(1.0 - k) > 1.0e-9 ? c / (1.0 - k) : HUGE_VAL;
+  const double near_plane = inverted ? w1 : w0;
+  const double far_plane = inverted ? w0 : w1;
+  const double fov_y = 2.0 * std::atan(column3 / column1);
+  if (!(near_plane > 0.0) || !std::isfinite(near_plane) || !(fov_y > 0.05 && fov_y < 3.0)) {
+    return parameters;
+  }
+  const bool infinite = !std::isfinite(far_plane) || !(far_plane > near_plane);
+  parameters.inverted = inverted;
+  parameters.infinite = infinite;
+  parameters.near_plane = float(near_plane);
+  parameters.far_plane = infinite ? 1.0e6f : float(far_plane);
+  parameters.fov_y = float(fov_y);
+  parameters.valid = true;
+  return parameters;
+}
+
 void CreateTexture2DSrv(ID3D12Device* device, ID3D12Resource* resource, DXGI_FORMAT format,
                         D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
@@ -320,13 +400,54 @@ bool D3D12Dlss::Initialize() {
   } else if (InitializeNgx()) {
     rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kAvailable);
   }
+  // FSR's DLLs are only loaded once it's chosen (also later, in EndFrame).
+  rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kUnavailable);
+  if (REXCVAR_GET(fsr_mode) != "off") {
+    TryInitializeFsr();
+  }
   return true;
+}
+
+void D3D12Dlss::OnHostRenderTargetsUnavailable() {
+  if (rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kUnavailable) {
+    REXGPU_WARN("DLSS: not available with the pixel shader interlock render target path");
+    rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
+  }
+  feature_failed_ = true;
+  fsr_blocked_ = true;
+  if (ffx_) {
+    REXGPU_WARN("AMD FSR: not available with the pixel shader interlock render target path");
+    ffx_->Shutdown();
+    ffx_.reset();
+  }
+  rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kUnavailable);
+  D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+}
+
+void D3D12Dlss::TryInitializeFsr() {
+  if (fsr_tried_ || fsr_blocked_) {
+    return;
+  }
+  fsr_tried_ = true;
+  ffx_ = std::make_unique<D3D12FfxUpscaler>();
+  if (!ffx_->Initialize(command_processor_.GetD3D12Provider().GetDevice())) {
+    ffx_.reset();
+    return;
+  }
+  rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kAvailable);
 }
 
 void D3D12Dlss::Shutdown() {
   rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
+  rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kUnavailable);
   ShutdownNgx();
+  if (ffx_) {
+    ffx_->Shutdown();
+    ffx_.reset();
+  }
+  fsr_tried_ = false;
   resources_to_release_.clear();
+  fsr_color_ = {};
   depth_ = {};
   motion_ = {};
   output_ = {};
@@ -349,13 +470,21 @@ void D3D12Dlss::Shutdown() {
   inputs_root_signature_.Reset();
 }
 
-bool D3D12Dlss::IsEnabled() const {
+D3D12Dlss::Backend D3D12Dlss::SelectBackend() const {
+  if (!inputs_pipeline_) {
+    return Backend::kNone;
+  }
 #if defined(REX_HAS_DLSS)
-  return inputs_pipeline_ && ngx_state_ != NgxState::kUnavailable && !feature_failed_ &&
-         REXCVAR_GET(dlss_mode) != "off";
-#else
-  return false;
+  if (ngx_state_ != NgxState::kUnavailable && !feature_failed_ &&
+      REXCVAR_GET(dlss_mode) != "off") {
+    return Backend::kDlss;
+  }
 #endif
+  if (ffx_ && ffx_->available() && !fsr_failed_ && !fsr_blocked_ &&
+      REXCVAR_GET(fsr_mode) != "off") {
+    return Backend::kFsr;
+  }
+  return Backend::kNone;
 }
 
 bool D3D12Dlss::InitializeNgx() {
@@ -540,16 +669,38 @@ const std::array<float, 16>* D3D12Dlss::FrameCamera() const {
   return best && best->second >= 2 ? &best->first : nullptr;
 }
 
-void D3D12Dlss::DisableUpscaling(const char* reason) {
-  if (upscaling_failed_) {
+void D3D12Dlss::DisableUpscaling(Backend backend, const char* reason) {
+  if (backend == Backend::kFsr) {
+    if (fsr_upscaling_failed_) {
+      return;
+    }
+    fsr_upscaling_failed_ = true;
+    REXGPU_WARN("AMD FSR: upscaling doesn't work ({}) - anti-aliasing at the configured "
+                "resolution instead",
+                reason);
+    if (rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable) {
+      rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kNativeOnly);
+    }
+  } else {
+    if (upscaling_failed_) {
+      return;
+    }
+    upscaling_failed_ = true;
+    REXGPU_WARN("DLSS: upscaling doesn't work ({}) - DLAA at the configured resolution instead",
+                reason);
+    if (rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable) {
+      rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kDlaaOnly);
+    }
+  }
+  D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+}
+
+void D3D12Dlss::DisableFsr() {
+  if (fsr_failed_) {
     return;
   }
-  upscaling_failed_ = true;
-  REXGPU_WARN("DLSS: upscaling doesn't work ({}) - DLAA at the configured resolution instead",
-              reason);
-  if (rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable) {
-    rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kDlaaOnly);
-  }
+  fsr_failed_ = true;
+  rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kUnavailable);
   D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
 }
 
@@ -581,17 +732,25 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
                                               uint32_t output_width, uint32_t output_height) {
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   frame_scene_taken_ = true;
-#if defined(REX_HAS_DLSS)
-  if (!width || !height || !InitializeNgx()) {
+#if defined(REX_HAS_DLSS) || defined(REX_HAS_FSR_SDK)
+  const Backend backend = SelectBackend();
+  if (!width || !height || backend == Backend::kNone) {
     return color_state;
   }
-  // A scene DLSS can't take isn't rendered below the configured scale either.
+#if defined(REX_HAS_DLSS)
+  if (backend == Backend::kDlss && !InitializeNgx()) {
+    return color_state;
+  }
+#endif
+  const char* backend_name = backend == Backend::kDlss ? "DLSS" : "AMD FSR";
+  // A scene the upscaler can't take isn't rendered below the configured scale
+  // either.
   const bool upscaling_requested = output_width != width || output_height != height;
   D3D12_RESOURCE_DESC color_desc = color->GetDesc();
   if (color_desc.SampleDesc.Count != 1 || width > color_desc.Width ||
       height > color_desc.Height) {
     if (upscaling_requested) {
-      DisableUpscaling("the scene is multisampled or smaller than expected");
+      DisableUpscaling(backend, "the scene is multisampled or smaller than expected");
     }
     return color_state;
   }
@@ -606,39 +765,54 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       static bool format_logged = false;
       if (!format_logged) {
         format_logged = true;
-        REXGPU_WARN("DLSS: the scene's color format {} isn't supported", int(output_format));
+        REXGPU_WARN("{}: the scene's color format {} isn't supported", backend_name,
+                    int(output_format));
       }
       if (upscaling_requested) {
-        DisableUpscaling("unsupported scene color format");
+        DisableUpscaling(backend, "unsupported scene color format");
       }
       return color_state;
     }
   }
 
-  // Upscaling: only at DLSS's own ratios (Quality, Performance, Ultra
-  // Performance), with the output's aspect ratio. The debug views show the
-  // inputs at the render resolution.
+  // Upscaling: DLSS only at its own ratios (Quality, Performance, Ultra
+  // Performance), FSR at up to 3x; with the output's aspect ratio. The debug
+  // views show the inputs at the render resolution.
   int32_t debug_view = REXCVAR_GET(dlss_debug_view);
-  bool upscale = (output_width != width || output_height != height) && !upscaling_failed_ &&
-                 (debug_view == 0 || debug_view == 3);
-  uint32_t quality = uint32_t(NVSDK_NGX_PerfQuality_Value_DLAA);
+  bool upscale =
+      (output_width != width || output_height != height) &&
+      !(backend == Backend::kDlss ? upscaling_failed_ : fsr_upscaling_failed_) &&
+      (debug_view == 0 || debug_view == 3);
+  uint32_t quality = 0;
+#if defined(REX_HAS_DLSS)
+  quality = uint32_t(NVSDK_NGX_PerfQuality_Value_DLAA);
+#endif
   if (upscale) {
     if (uint64_t(output_width) * height != uint64_t(output_height) * width) {
       upscale = false;
+    } else if (backend == Backend::kFsr) {
+      upscale = output_width <= 3 * width;
+#if defined(REX_HAS_DLSS)
     } else if (3 * width == 2 * output_width) {
       quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxQuality);
     } else if (2 * width == output_width) {
       quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxPerf);
     } else if (3 * width == output_width) {
       quality = uint32_t(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+#endif
     } else {
       upscale = false;
     }
     if (!upscale) {
-      DisableUpscaling(
-          fmt::format("{}x{} to {}x{} isn't a DLSS ratio", width, height, output_width,
-                      output_height)
-              .c_str());
+      // Switching between the upscalers, the render scale of the other one may
+      // still be there for a few frames - nothing for this frame then.
+      if (command_processor_.IsDrawResolutionScaleChangePending()) {
+        return color_state;
+      }
+      DisableUpscaling(backend,
+                       fmt::format("{}x{} to {}x{} isn't a {} ratio", width, height,
+                                   output_width, output_height, backend_name)
+                           .c_str());
     }
   }
   if (!upscale) {
@@ -648,7 +822,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   }
   DXGI_FORMAT depth_dsv_format = upscale ? GetDsvFormat(depth->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
   if (upscale && depth_dsv_format == DXGI_FORMAT_UNKNOWN) {
-    DisableUpscaling("unknown depth format");
+    DisableUpscaling(backend, "unknown depth format");
     return color_state;
   }
   if (!EnsureTexture(depth_, DXGI_FORMAT_R32_FLOAT, width, height, "depth") ||
@@ -788,7 +962,13 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     command_list.D3DSetComputeRootDescriptorTable(2, debug_descriptors[1].second);
     command_list.D3DSetComputeRootDescriptorTable(3, debug_descriptors[2].second);
     command_list.D3DDispatch(group_count_x, group_count_y, 1);
+  } else if (backend == Backend::kFsr) {
+    if (!RecordFsr(color, color_desc.Format, width, height, output_width, output_height, upscale,
+                   reset, dlss_output.resource.Get())) {
+      return color_state;
+    }
   } else {
+#if defined(REX_HAS_DLSS)
     const std::string& preset_name = REXCVAR_GET(dlss_preset);
     uint32_t preset = preset_name == "k"   ? uint32_t(NVSDK_NGX_DLSS_Hint_Render_Preset_K)
                       : preset_name == "l" ? uint32_t(NVSDK_NGX_DLSS_Hint_Render_Preset_L)
@@ -860,7 +1040,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
                        height, output_width, output_height, uint32_t(result));
           feature_ = nullptr;
           if (upscale) {
-            DisableUpscaling("the feature couldn't be created");
+            DisableUpscaling(Backend::kDlss, "the feature couldn't be created");
           } else {
             feature_failed_ = true;
             rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
@@ -895,7 +1075,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       if (NVSDK_NGX_FAILED(result)) {
         REXGPU_ERROR("DLSS: evaluation failed ({:08X})", uint32_t(result));
         if (upscale) {
-          DisableUpscaling("the evaluation failed");
+          DisableUpscaling(Backend::kDlss, "the evaluation failed");
         } else {
           feature_failed_ = true;
           rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
@@ -906,6 +1086,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       dlss_output_valid_ = true;
     });
     command_processor.InvalidateStateAfterExternalCommands();
+#endif
   }
 
   if (upscale) {
@@ -1002,6 +1183,150 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   return color_state;
 }
 
+bool D3D12Dlss::RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint32_t width,
+                          uint32_t height, uint32_t output_width, uint32_t output_height,
+                          bool upscale, bool reset, ID3D12Resource* output) {
+#if defined(REX_HAS_FSR_SDK)
+  D3D12CommandProcessor& command_processor = command_processor_;
+  DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
+
+  // The color: perceptual for 8 and 10 bits, linear for 16 bits (gamma render
+  // targets are stored linear), HDR for floats.
+  uint32_t create_flags = D3D12FfxUpscaler::kCreateAutoExposure;
+  bool non_linear_srgb = false;
+  switch (color_format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      create_flags |= D3D12FfxUpscaler::kCreateNonLinearColor;
+      non_linear_srgb = true;
+      break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+      create_flags |= D3D12FfxUpscaler::kCreateHighDynamicRange;
+      break;
+    default:
+      break;
+  }
+  CameraParameters camera;
+  if (frame_camera_valid_) {
+    camera = GetCameraParameters(frame_camera_);
+  }
+  if (camera.valid && camera.inverted) {
+    create_flags |= D3D12FfxUpscaler::kCreateDepthInverted;
+  }
+  if (camera.valid && camera.infinite) {
+    create_flags |= D3D12FfxUpscaler::kCreateDepthInfinite;
+  }
+  if (!fsr_camera_logged_ && frame_camera_valid_) {
+    fsr_camera_logged_ = true;
+    if (camera.valid) {
+      REXGPU_INFO("AMD FSR: scene color format {}, camera near {} far {} fov {:.3f}{}{}",
+                  int(color_format), camera.near_plane, camera.far_plane, camera.fov_y,
+                  camera.inverted ? ", depth inverted" : "", camera.infinite ? ", infinite" : "");
+    } else {
+      const std::array<float, 16>& m = frame_camera_;
+      REXGPU_INFO("AMD FSR: scene color format {}, camera parameters not found in [{} {} {} {} / "
+                  "{} {} {} {} / {} {} {} {} / {} {} {} {}] - defaults",
+                  int(color_format), m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
+                  m[10], m[11], m[12], m[13], m[14], m[15]);
+    }
+  }
+  const bool debug_view = REXCVAR_GET(fsr_debug_view);
+  if (debug_view) {
+    create_flags |= D3D12FfxUpscaler::kCreateDebugVisualization;
+  }
+  uint64_t version = 0;
+  const std::string& version_name = REXCVAR_GET(fsr_version);
+  if (version_name == "4" || version_name == "3") {
+    version = ffx_->FindVersion(uint32_t(version_name[0] - '0'));
+  }
+
+  bool created = false;
+  if (!ffx_->EnsureContext(output_width, output_height, create_flags, version,
+                           command_processor.GetCurrentSubmission(), created)) {
+    if (upscale) {
+      DisableUpscaling(Backend::kFsr, "the context couldn't be created");
+    } else {
+      DisableFsr();
+    }
+    return false;
+  }
+  rex::graphics::SetFsrProviderName(ffx_->provider_name());
+
+  // The scene's color at its own size: the render target is larger, and FSR
+  // takes the size of the resources it's given.
+  if (!EnsureTexture(fsr_color_, color_format, width, height, "FSR color",
+                     D3D12_RESOURCE_FLAG_NONE)) {
+    return false;
+  }
+  Transition(fsr_color_, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor.PushTransitionBarrier(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION copy_dest;
+  copy_dest.pResource = fsr_color_.resource.Get();
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_dest.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION copy_source;
+  copy_source.pResource = color;
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_source.SubresourceIndex = 0;
+  D3D12_BOX copy_box = {0, 0, 0, width, height, 1};
+  command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
+  command_processor.PushTransitionBarrier(color, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(fsr_color_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  command_processor.SubmitBarriers();
+
+  const auto now = std::chrono::steady_clock::now();
+  float frame_time_ms = 16.67f;
+  if (fsr_previous_time_.time_since_epoch().count()) {
+    frame_time_ms = std::clamp(
+        std::chrono::duration<float, std::milli>(now - fsr_previous_time_).count(), 1.0f, 100.0f);
+  }
+  fsr_previous_time_ = now;
+
+  D3D12FfxUpscaler::DispatchParams params;
+  params.color = fsr_color_.resource.Get();
+  params.depth = depth_.resource.Get();
+  params.motion_vectors = motion_.resource.Get();
+  params.output = output;
+  params.render_width = width;
+  params.render_height = height;
+  params.output_width = output_width;
+  params.output_height = output_height;
+  const int32_t jitter_sign = REXCVAR_GET(fsr_jitter_sign);
+  params.jitter_x = (jitter_sign & 1) ? -jitter_[0] : jitter_[0];
+  params.jitter_y = (jitter_sign & 2) ? -jitter_[1] : jitter_[1];
+  params.sharpness = float(REXCVAR_GET(fsr_sharpness));
+  params.frame_time_ms = frame_time_ms;
+  params.reset = reset || created || previous_backend_ != Backend::kFsr;
+  params.camera_near = camera.near_plane;
+  params.camera_far = camera.far_plane;
+  params.camera_fov_y = camera.fov_y;
+  params.non_linear_srgb = non_linear_srgb;
+  params.debug_view = debug_view;
+  // The context as it is now (a new one may replace it before this runs).
+  void* context = ffx_->context();
+  const D3D12FfxUpscaler* ffx = ffx_.get();
+  command_list.ExternalCallback(
+      [this, ffx, context, params, upscale](ID3D12GraphicsCommandList* d3d_command_list) {
+        dlss_output_valid_ = ffx->Dispatch(context, d3d_command_list, params);
+        if (!dlss_output_valid_) {
+          if (upscale) {
+            DisableUpscaling(Backend::kFsr, "the dispatch failed");
+          } else {
+            DisableFsr();
+          }
+        }
+      });
+  // FidelityFX bound its own descriptor heap, and the pipeline is gone.
+  command_processor.InvalidateStateAfterExternalCommands();
+  return true;
+#else
+  return false;
+#endif
+}
+
 void D3D12Dlss::BindHudTargets(bool with_depth) {
   Transition(upscaled_, D3D12_RESOURCE_STATE_RENDER_TARGET);
   Transition(hud_depth_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1022,7 +1347,7 @@ void D3D12Dlss::InvalidateHud(const char* reason, uint64_t vertex_shader_hash,
     std::string key =
         fmt::format("{} (vs {:016X}, ps {:016X})", reason, vertex_shader_hash, pixel_shader_hash);
     if (hud_invalid_logged_.insert(key).second) {
-      REXGPU_INFO("DLSS: a frame presented without upscaling - a HUD draw {}", key);
+      REXGPU_INFO("Scene upscaler: a frame presented without upscaling - a HUD draw {}", key);
     }
   }
 }
@@ -1198,6 +1523,32 @@ void D3D12Dlss::EndFrame() {
     return true;
   });
 #endif
+  if (ffx_) {
+    ffx_->ReleaseRetired(completed_submission);
+  }
+  // FSR chosen while running: its DLLs are loaded now, and the render scale is
+  // chosen again for it.
+  if (!fsr_tried_ && !fsr_blocked_ && REXCVAR_GET(fsr_mode) != "off") {
+    TryInitializeFsr();
+    if (ffx_) {
+      D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+    }
+  }
+  // The upscaler not used anymore gives its memory back.
+  const Backend backend = SelectBackend();
+  if (backend != previous_backend_) {
+    const uint64_t current_submission = command_processor_.GetCurrentSubmission();
+    if (backend != Backend::kFsr && ffx_) {
+      ffx_->RetireContext(current_submission);
+    }
+#if defined(REX_HAS_DLSS)
+    if (backend != Backend::kDlss && feature_) {
+      features_to_release_.emplace_back(current_submission, feature_);
+      feature_ = nullptr;
+    }
+#endif
+    previous_backend_ = backend;
+  }
 
   previous_processed_ = frame_processed_;
   previous_camera_ = frame_camera_;

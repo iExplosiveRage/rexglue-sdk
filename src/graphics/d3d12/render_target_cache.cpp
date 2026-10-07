@@ -169,14 +169,13 @@ D3D12RenderTargetCache::~D3D12RenderTargetCache() {
   Shutdown(true);
 }
 
-bool D3D12RenderTargetCache::Initialize() {
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-
+D3D12RenderTargetCache::Path D3D12RenderTargetCache::ChoosePath(
+    const ui::d3d12::D3D12Provider& provider) {
+  Path path;
   if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
-    path_ = Path::kHostRenderTargets;
+    path = Path::kHostRenderTargets;
   } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
-    path_ = Path::kPixelShaderInterlock;
+    path = Path::kPixelShaderInterlock;
   } else {
     // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
     // UHD Graphics 630), the "always" stencil comparison function isn't working
@@ -187,20 +186,28 @@ bool D3D12RenderTargetCache::Initialize() {
     // TODO(Triang3l): Make ROV the default when it's optimized better (for
     // instance, using static shader modifications to pass render target
     // parameters).
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
-                ? Path::kPixelShaderInterlock
-                : Path::kHostRenderTargets;
+    path = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
+               ? Path::kPixelShaderInterlock
+               : Path::kHostRenderTargets;
 #else
     // The AMD shader compiler crashes very often with Xenia's custom
     // output-merger code as of March 2021.
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
-                ? Path::kHostRenderTargets
-                : Path::kPixelShaderInterlock;
+    path = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
+               ? Path::kHostRenderTargets
+               : Path::kPixelShaderInterlock;
 #endif
   }
-  if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
-    path_ = Path::kHostRenderTargets;
+  if (path == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
+    path = Path::kHostRenderTargets;
   }
+  return path;
+}
+
+bool D3D12RenderTargetCache::Initialize() {
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  path_ = ChoosePath(provider);
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =

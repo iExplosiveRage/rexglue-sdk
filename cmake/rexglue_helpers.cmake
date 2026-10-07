@@ -150,6 +150,16 @@ function(rexglue_configure_target target_name)
                 VERBATIM
             )
         endif()
+        # AMD FSR SDK runtime (cmake/rexglue_fsr_sdk.cmake): the loader and the
+        # upscaler it loads from the executable's folder.
+        foreach(_rexglue_fsr_dll ${REXGLUE_FSR_SDK_RUNTIME_DLLS})
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_rexglue_fsr_dll}"
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endforeach()
     endif()
 
     # Stage requested GPU emulation plugins next to the executable. Plugins

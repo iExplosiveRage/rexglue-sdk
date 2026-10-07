@@ -41,7 +41,7 @@ std::string PresentUpscalerText();
 
 // The upscaler shown in the overlay: NVIDIA DLSS where it works - upscaling
 // if it lowered the render resolution, DLAA otherwise (with the presenter's
-// upscaler if there's one) - or the presenter's.
+// upscaler if there's one) - then AMD FSR the same way, or the presenter's.
 std::string UpscalerText() {
   const rex::graphics::DlssAvailability dlss_availability = rex::graphics::GetDlssAvailability();
   if (dlss_availability != rex::graphics::DlssAvailability::kUnavailable &&
@@ -67,6 +67,35 @@ std::string UpscalerText() {
       const std::string present = PresentUpscalerText();
       return present.empty() || present == "Off" ? std::string("NVIDIA DLAA")
                                                  : "NVIDIA DLAA + " + present;
+    }
+  }
+  const rex::graphics::FsrAvailability fsr_availability = rex::graphics::GetFsrAvailability();
+  if (fsr_availability != rex::graphics::FsrAvailability::kUnavailable &&
+      rex::cvar::GetFlagInfo("fsr_mode")) {
+    const std::string fsr = rex::cvar::GetFlagByName("fsr_mode");
+    if (fsr != "off") {
+      static const std::pair<const char*, const char*> kFsrModes[] = {
+          {"quality", "Quality"},
+          {"balanced", "Balanced"},
+          {"performance", "Performance"},
+          {"ultra_performance", "Ultra Perf."},
+      };
+      // "AMD FSR 4.1.1" / "AMD FSR 3.1.5" once a frame used it.
+      const std::string provider = rex::graphics::GetFsrProviderName();
+      const std::string name = provider.empty() ? std::string("AMD FSR") : "AMD FSR " + provider;
+      const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
+      const bool lowered =
+          info.scale_x < info.requested_scale_x || info.scale_y < info.requested_scale_y;
+      if (fsr_availability == rex::graphics::FsrAvailability::kAvailable && lowered) {
+        for (const auto& [value, mode_name] : kFsrModes) {
+          if (fsr == value) {
+            return name + " \xC2\xB7 " + mode_name;
+          }
+        }
+      }
+      const std::string present = PresentUpscalerText();
+      const std::string native = name + " \xC2\xB7 Native AA";
+      return present.empty() || present == "Off" ? native : native + " + " + present;
     }
   }
   return PresentUpscalerText();
