@@ -18,6 +18,10 @@ set(REXSYSTEM_SOURCES
     xenumerator.cpp
     xsocket.cpp
     xsymboliclink.cpp
+
+    # Online lobby + ICE transport (see include/rex/net/online.h)
+    net/online.cpp
+    net/peer_transport.cpp
     xobject.cpp
     xmodule.cpp
     guest_path.cpp
@@ -109,6 +113,16 @@ if(WIN32)
     target_link_libraries(rexruntime PRIVATE ws2_32)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Online lobby: libjuice (ICE) everywhere, the WinHTTP WebSocket client on
+# Windows (and under Wine), a stub elsewhere.
+target_link_libraries(rexruntime PRIVATE juice)
+if(WIN32)
+    target_sources(rexruntime PRIVATE net/lobby_client_win.cpp)
+    target_link_libraries(rexruntime PRIVATE winhttp)
+else()
+    target_sources(rexruntime PRIVATE net/lobby_client_stub.cpp)
 endif()
 
 if(REXGLUE_USE_D3D12)

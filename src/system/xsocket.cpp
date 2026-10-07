@@ -18,6 +18,7 @@
 #include <rex/system/xsocket.h>
 // #include <rex/system/xnet.h>
 
+#include <rex/net/online.h>
 #include <rex/net/socket.h>
 
 // Standard socket types used by Xbox API emulation
@@ -132,20 +133,29 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
     }
   }
 
+  // Lobby mode: game traffic goes through the ICE link, so the native socket
+  // takes any free port (two copies on one PC don't collide, and no firewall
+  // prompt for it). bound_port() still reports the game's port.
+  const bool lobby_mode = type_ == X_SOCK_DGRAM && rex::net::online::IsLobbyMode();
+  if (lobby_mode) {
+    native_name.sin_port = 0;
+  }
+
   int ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&native_name), name_len);
 
   const uint32_t ip_host = ntohl(native_name.sin_addr.s_addr);
   const int error = ret < 0 ? WSAGetLastError() : 0;
 
   REXSYS_WARN(
-      "[BurstWire] bind {}.{}.{}.{}:{} ret={} err={}",
+      "[BurstWire] bind {}.{}.{}.{}:{} ret={} err={}{}",
       (ip_host >> 24) & 0xFF,
       (ip_host >> 16) & 0xFF,
       (ip_host >> 8) & 0xFF,
       ip_host & 0xFF,
       ntohs(native_name.sin_port),
       ret,
-      error);
+      error,
+      lobby_mode ? " (lobby mode: any free port)" : "");
 
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;

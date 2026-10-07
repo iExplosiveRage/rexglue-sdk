@@ -24,6 +24,12 @@ class XgiApp : public system::xam::App {
 
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
+
+ private:
+  // XSessionSearchEx with the online lobby (rex/net/online.h).
+  X_HRESULT FillLobbySearchResults(uint32_t results_ptr, uint32_t buffer_size,
+                                   uint32_t num_results, uint32_t num_props, uint32_t props_ptr,
+                                   uint32_t num_ctx, uint32_t ctx_ptr);
 };
 
 }  // namespace apps

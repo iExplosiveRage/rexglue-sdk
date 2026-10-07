@@ -13,9 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#include <fmt/format.h>
 
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
+#include <rex/net/online.h>
 #include <rex/net/session.h>
 #include <rex/thread.h>
 
@@ -30,6 +35,135 @@ using namespace rex::system;
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
 // http://mb.mirage.org/bugzilla/xliveless/main.c
+
+// XSessionSearchEx in lobby mode: the lobby's rooms as XSESSION_SEARCHRESULTs.
+// The game's list reads only the properties (host name 0x40008109, PUID
+// 0x20008107, 0x1000001E) and contexts (3 rounds, 4 time, 5 drama, 6
+// location) of each result, plus its XSESSION_INFO to join.
+X_HRESULT XgiApp::FillLobbySearchResults(uint32_t results_ptr, uint32_t buffer_size,
+                                         uint32_t num_results, uint32_t num_props,
+                                         uint32_t props_ptr, uint32_t num_ctx, uint32_t ctx_ptr) {
+  constexpr uint32_t kHeaderSize = 0x08;
+  constexpr uint32_t kResultSize = 0x5C;
+  constexpr uint32_t kPropertySize = 24;
+  constexpr uint32_t kContextSize = 8;
+  constexpr uint32_t kHostName = 0x40008109;
+  constexpr uint32_t kPuid = 0x20008107;
+
+  std::vector<std::pair<uint32_t, uint32_t>> contexts;
+  if (ctx_ptr && num_ctx) {
+    const uint8_t* ctx = memory_->TranslateVirtual(ctx_ptr);
+    for (uint32_t i = 0; i < num_ctx && i < 32; ++i) {
+      contexts.emplace_back(memory::load_and_swap<uint32_t>(ctx + i * kContextSize),
+                            memory::load_and_swap<uint32_t>(ctx + i * kContextSize + 4));
+    }
+  }
+  {
+    // What the search sends (0x1000001E and the 0x10000027/28 range):
+    // logged, not used to filter.
+    std::string text;
+    if (props_ptr && num_props) {
+      const uint8_t* props = memory_->TranslateVirtual(props_ptr);
+      for (uint32_t i = 0; i < num_props && i < 16; ++i) {
+        const uint8_t* prop = props + i * kPropertySize;
+        text += fmt::format(" {:08X}={}", memory::load_and_swap<uint32_t>(prop),
+                            static_cast<int32_t>(memory::load_and_swap<uint32_t>(prop + 16)));
+      }
+    }
+    std::string context_text;
+    for (const auto& [id, value] : contexts) {
+      context_text += fmt::format(" {:X}={}", id, value);
+    }
+    REXKRNL_INFO("[BurstSearch] lobby search: props{} contexts{}", text, context_text);
+  }
+
+  const auto rooms = rex::net::online::Search(num_results, contexts);
+  uint8_t* results = memory_->TranslateVirtual(results_ptr);
+  const uint32_t slots = std::min<uint32_t>(static_cast<uint32_t>(rooms.size()), num_results);
+  uint32_t data_offset = (kHeaderSize + slots * kResultSize + 7) & ~7u;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < slots; ++i) {
+    const auto& room = rooms[i];
+    std::u16string name(room.host_name.begin(), room.host_name.end());
+    const uint32_t name_bytes = static_cast<uint32_t>(name.size() + 1) * 2;
+    const uint32_t prop_count = 2 + static_cast<uint32_t>(room.properties.size());
+    const uint32_t ctx_count = static_cast<uint32_t>(room.contexts.size());
+    const uint32_t need =
+        prop_count * kPropertySize + ctx_count * kContextSize + ((name_bytes + 7) & ~7u);
+    if (data_offset + need > buffer_size) {
+      break;
+    }
+    uint8_t* result = results + kHeaderSize + i * kResultSize;
+    std::memcpy(result + 0x00, room.xnkid, 8);
+    const uint32_t ip = room.host_ip;
+    const uint8_t ip_bytes[4] = {uint8_t(ip >> 24), uint8_t(ip >> 16), uint8_t(ip >> 8),
+                                 uint8_t(ip)};
+    std::memcpy(result + 0x08, ip_bytes, 4);  // XNADDR.ina
+    std::memcpy(result + 0x0C, ip_bytes, 4);  // XNADDR.inaOnline
+    memory::store_and_swap<uint16_t>(result + 0x10, 3074);
+    result[0x12] = 0x02;
+    result[0x13] = 0x52;
+    result[0x14] = ip_bytes[1];
+    result[0x15] = ip_bytes[2];
+    result[0x16] = ip_bytes[3];
+    result[0x17] = 0x01;
+    for (uint32_t k = 0; k < 16; ++k) {
+      result[0x2C + k] = static_cast<uint8_t>(k);  // XNKEY (unused by the game)
+    }
+    const uint32_t open = room.max_players > room.players ? room.max_players - room.players : 0;
+    memory::store_and_swap<uint32_t>(result + 0x3C, open);
+    memory::store_and_swap<uint32_t>(result + 0x40, 0);
+    memory::store_and_swap<uint32_t>(result + 0x44, room.players);
+    memory::store_and_swap<uint32_t>(result + 0x48, 0);
+
+    const uint32_t props_offset = data_offset;
+    const uint32_t ctx_offset = props_offset + prop_count * kPropertySize;
+    const uint32_t name_offset = ctx_offset + ctx_count * kContextSize;
+    uint8_t* prop = results + props_offset;
+    // X_PROPERTY_GAMER_HOSTNAME (WSTRING, big-endian UTF-16 with the NUL).
+    memory::store_and_swap<uint32_t>(prop, kHostName);
+    prop[8] = 4;
+    memory::store_and_swap<uint32_t>(prop + 16, name_bytes);
+    memory::store_and_swap<uint32_t>(prop + 20, results_ptr + name_offset);
+    prop += kPropertySize;
+    // X_PROPERTY_GAMER_PUID (every install shares the XUID).
+    memory::store_and_swap<uint32_t>(prop, kPuid);
+    prop[8] = 2;
+    memory::store_and_swap<uint64_t>(prop + 16, 0xB13EBABEBABEBABEull);
+    prop += kPropertySize;
+    for (const auto& [id, value] : room.properties) {
+      memory::store_and_swap<uint32_t>(prop, id);
+      if ((id >> 28) == 2) {
+        prop[8] = 2;
+        memory::store_and_swap<uint64_t>(prop + 16, static_cast<uint64_t>(value));
+      } else {
+        prop[8] = 1;
+        memory::store_and_swap<uint32_t>(prop + 16, static_cast<uint32_t>(value));
+      }
+      prop += kPropertySize;
+    }
+    uint8_t* ctx = results + ctx_offset;
+    for (const auto& [id, value] : room.contexts) {
+      memory::store_and_swap<uint32_t>(ctx, id);
+      memory::store_and_swap<uint32_t>(ctx + 4, value);
+      ctx += kContextSize;
+    }
+    uint8_t* text = results + name_offset;
+    for (size_t k = 0; k <= name.size(); ++k) {
+      memory::store_and_swap<uint16_t>(text + k * 2, k < name.size() ? name[k] : 0);
+    }
+    memory::store_and_swap<uint32_t>(result + 0x4C, prop_count);
+    memory::store_and_swap<uint32_t>(result + 0x50, ctx_count);
+    memory::store_and_swap<uint32_t>(result + 0x54, results_ptr + props_offset);
+    memory::store_and_swap<uint32_t>(result + 0x58, ctx_count ? results_ptr + ctx_offset : 0);
+    data_offset += need;
+    ++count;
+  }
+  memory::store_and_swap<uint32_t>(results + 0x00, count);
+  memory::store_and_swap<uint32_t>(results + 0x04, count ? results_ptr + kHeaderSize : 0);
+  REXKRNL_WARN("[BurstSearch] lobby: {} session(s) written to the game's list", count);
+  return X_E_SUCCESS;
+}
 
 X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
@@ -48,6 +182,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
+      rex::net::online::OnUserSetContext(user_index, context_id, context_value);
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -57,6 +192,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                     value_size, value_ptr);
+      if (value_ptr && value_size && value_size <= 64) {
+        rex::net::online::OnUserSetProperty(user_index, property_id,
+                                            memory_->TranslateVirtual(value_ptr), value_size);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
@@ -116,6 +255,31 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           nonce_ptr);
       rex::net::SetGameSessionOpen(true);
       REXKRNL_INFO("[BurstSession] session open ({})", (flags & 0x01u) ? "host" : "join");
+
+      if (rex::net::online::IsLobbyMode()) {
+        // Lobby mode: the host's XSESSION_INFO carries its virtual address
+        // and a fresh XNKID, and the room goes to the lobby; a joiner keeps
+        // the search result's info and starts the lobby join + ICE. Both
+        // complete at once: the game re-creates every tick while a create is
+        // pending, and waits for the host's reply afterwards instead.
+        if (!session_info_ptr) {
+          return X_E_FAIL;
+        }
+        uint8_t* session_info = memory_->TranslateVirtual(session_info_ptr);
+        if (flags & 0x01u) {
+          if (!nonce_ptr) {
+            return X_E_FAIL;
+          }
+          rex::net::online::OnHostCreate(session_info, flags, num_slots_public,
+                                         num_slots_private);
+          static uint64_t next_lobby_nonce = 0x42555253544C1001ull;
+          memory::store_and_swap<uint64_t>(memory_->TranslateVirtual(nonce_ptr),
+                                           next_lobby_nonce++);
+        } else {
+          rex::net::online::OnJoinCreate(session_info);
+        }
+        return X_E_SUCCESS;
+      }
 
       // Bit 0 means this side is hosting. When joining, the game has already
       // copied the host XSESSION_INFO from XSessionSearchEx, so preserve it.
@@ -209,6 +373,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
       rex::net::SetGameSessionOpen(false);
+      rex::net::online::OnSessionDelete();
       REXKRNL_INFO("[BurstSession] session closed");
 
       return X_E_SUCCESS;
@@ -278,6 +443,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XSessionModify({:08X}, {:08X}, {:08X}, {:08X})", obj_ptr, flags,
                     maxPublicSlots, maxPrivateSlots);
+      if (flags & 0x01u) {
+        rex::net::online::OnHostModify();
+      }
 
       return X_E_SUCCESS;
     }
@@ -313,6 +481,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
 
       std::memset(results, 0, results_buffer_size);
+
+      if (rex::net::online::IsLobbyMode()) {
+        return FillLobbySearchResults(search_results_ptr, results_buffer_size, num_results,
+                                      num_props, props_ptr, num_ctx, ctx_ptr);
+      }
 
       // Only inject a test lobby when explicitly enabled at launch.
       if (!host_ip) {

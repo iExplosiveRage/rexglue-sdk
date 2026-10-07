@@ -35,6 +35,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/net/online.h>
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -498,6 +499,15 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     combined_buffer_offset += buffers[i].len;
   }
 
+  if (to_ptr && rex::net::online::IsLobbyMode() &&
+      rex::net::online::SendTo(socket->bound_port(), to_ptr->sin_addr, to_ptr->sin_port,
+                               combined_buffer_mem.data(), combined_buffer_size)) {
+    if (num_bytes_sent) {
+      *num_bytes_sent = combined_buffer_size;
+    }
+    return 0;
+  }
+
   N_XSOCKADDR_IN native_to(to_ptr);
   socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
 
@@ -594,6 +604,29 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   }
 
   addr_ptr.Zero();
+
+  if (rex::net::online::IsLobbyMode()) {
+    // Lobby mode: this PC's virtual address (198.18.A.B); peers reach it
+    // through the ICE link, never directly.
+    const uint32_t vip = rex::net::online::VirtualIp();
+    addr_ptr->ina.s_addr = htonl(vip);
+    addr_ptr->inaOnline.s_addr = htonl(vip);
+    addr_ptr->wPortOnline = 3074;
+    addr_ptr->abEnet[0] = 0x02;
+    addr_ptr->abEnet[1] = 0x52;
+    addr_ptr->abEnet[2] = static_cast<uint8_t>((vip >> 16) & 0xFF);
+    addr_ptr->abEnet[3] = static_cast<uint8_t>((vip >> 8) & 0xFF);
+    addr_ptr->abEnet[4] = static_cast<uint8_t>(vip & 0xFF);
+    addr_ptr->abEnet[5] = 0x01;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      REXKRNL_WARN("[BurstXNet] Title XNADDR = {}.{}.{}.{}:3074 (virtual, lobby mode)",
+                   vip >> 24, (vip >> 16) & 0xFF, (vip >> 8) & 0xFF, vip & 0xFF);
+    }
+    return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
+           XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS |
+           XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  }
 
   const char* radmin_ip = std::getenv("REX_XNET_IP");
   in_addr parsed_ip = {};
@@ -700,6 +733,27 @@ u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 raw_ip,
                                      mapped_void xid) {
   if (!raw_ip || !xn_addr) {
     return 1;
+  }
+
+  if (rex::net::online::IsLobbyMode() && rex::net::online::IsVirtualIp(raw_ip)) {
+    // raw_ip is the IN_ADDR as the game holds it (198.18.A.B = 0xC612AABB):
+    // store it in network order and derive abEnet like XNetGetTitleXnAddr, so
+    // the host's XNADDR of a guest equals the guest's own. (The legacy path
+    // below keeps its byte order so old builds still interoperate.)
+    xn_addr->ina.s_addr = htonl(raw_ip);
+    xn_addr->inaOnline.s_addr = htonl(raw_ip);
+    xn_addr->wPortOnline = 3074;
+    std::memset(xn_addr->abEnet, 0, sizeof(xn_addr->abEnet));
+    std::memset(xn_addr->abOnline, 0, sizeof(xn_addr->abOnline));
+    xn_addr->abEnet[0] = 0x02;
+    xn_addr->abEnet[1] = 0x52;
+    xn_addr->abEnet[2] = static_cast<uint8_t>((raw_ip >> 16) & 0xFF);
+    xn_addr->abEnet[3] = static_cast<uint8_t>((raw_ip >> 8) & 0xFF);
+    xn_addr->abEnet[4] = static_cast<uint8_t>(raw_ip & 0xFF);
+    xn_addr->abEnet[5] = 0x01;
+    REXKRNL_WARN("[BurstXNet] InAddrToXnAddr <- {}.{}.{}.{} (virtual)", raw_ip >> 24,
+                 (raw_ip >> 16) & 0xFF, (raw_ip >> 8) & 0xFF, raw_ip & 0xFF);
+    return 0;
   }
 
   xn_addr->ina.s_addr = raw_ip;
@@ -809,6 +863,7 @@ u32 NetDll_XNetQosLookup_entry(
       static_cast<uint16_t>(probes_count ? probes_count : 1);
   constexpr u16 kReportedRttMs = 1;
   constexpr u32 kReportedRateBps = 10000000u;
+  const bool lobby_mode = rex::net::online::IsLobbyMode();
 
   REXKRNL_WARN(
       "[BurstXNet] QoS override rtt={}ms rate={}bps",
@@ -819,8 +874,21 @@ u32 NetDll_XNetQosLookup_entry(
     info.flags = kQosComplete | kQosTargetContacted;
     info.probes_xmit = completed_probes;
     info.probes_recv = completed_probes;
-    info.rtt_min_in_msecs = kReportedRttMs;
-    info.rtt_med_in_msecs = kReportedRttMs;
+    u16 rtt = kReportedRttMs;
+    if (lobby_mode && i < num_remote_consoles && session_ids_array_ptrs) {
+      // The lobby's estimate (both players' round trips to the lobby); the
+      // game turns it into the ping bars of its result list.
+      const uint32_t kid_ptr = memory::load_and_swap<uint32_t>(
+          REX_KERNEL_MEMORY()->TranslateVirtual(session_ids_array_ptrs + i * 4));
+      if (kid_ptr) {
+        if (const uint32_t estimate = rex::net::online::EstimateRttMs(
+                REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(kid_ptr))) {
+          rtt = static_cast<u16>(estimate);
+        }
+      }
+    }
+    info.rtt_min_in_msecs = rtt;
+    info.rtt_med_in_msecs = rtt;
     info.up_bits_per_sec = kReportedRateBps;
     info.down_bits_per_sec = kReportedRateBps;
   }
@@ -851,6 +919,9 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
+  if (rex::net::online::IsLobbyMode()) {
+    return 0;  // nothing reads the data ("My Game"); search QoS is estimated
+  }
   return X_ERROR_FUNCTION_FAILED;
 }
 
@@ -870,6 +941,28 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
   return rex::byte_swap(addr);
 }
 
+namespace {
+// The game's VDP sockets: their lifetime drives the lobby connection.
+std::mutex g_vdp_sockets_mutex;
+std::vector<uint32_t> g_vdp_sockets;
+
+bool IsVdpSocket(uint32_t handle) {
+  std::lock_guard<std::mutex> lock(g_vdp_sockets_mutex);
+  return std::find(g_vdp_sockets.begin(), g_vdp_sockets.end(), handle) != g_vdp_sockets.end();
+}
+
+// A few lines for the lobby path's datagrams (virtual addresses, printed in
+// the right byte order), like the [BurstUDP] lines of the direct path.
+void LogOnlineDatagram(const char* what, uint32_t ip, uint16_t port, uint32_t bytes) {
+  static std::atomic<uint32_t> count{0};
+  if (count.fetch_add(1) < 120) {
+    REXKRNL_WARN("[OnlineUDP] {} bytes={} {} {}.{}.{}.{}:{}", what, bytes,
+                 what[0] == 's' ? "->" : "<-", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF,
+                 ip & 0xFF, port);
+  }
+}
+}  // namespace
+
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
   auto socket = object_ref<XSocket>(new XSocket(REX_KERNEL_STATE()));
   X_STATUS result =
@@ -884,6 +977,14 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
     return -1;
   }
 
+  if (protocol == XSocket::X_IPPROTO_VDP) {
+    {
+      std::lock_guard<std::mutex> lock(g_vdp_sockets_mutex);
+      g_vdp_sockets.push_back(socket->handle());
+    }
+    rex::net::online::OnGameSocketOpened();
+  }
+
   return socket->handle();
 }
 
@@ -893,6 +994,19 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
     return -1;
+  }
+
+  bool was_vdp = false;
+  {
+    std::lock_guard<std::mutex> lock(g_vdp_sockets_mutex);
+    auto it = std::find(g_vdp_sockets.begin(), g_vdp_sockets.end(), socket_handle);
+    if (it != g_vdp_sockets.end()) {
+      g_vdp_sockets.erase(it);
+      was_vdp = true;
+    }
+  }
+  if (was_vdp) {
+    rex::net::online::OnGameSocketClosed();
   }
 
   // TODO: Absolutely delete this object. It is no longer valid after calling
@@ -1214,6 +1328,38 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     return -1;
   }
 
+  if (rex::net::online::IsLobbyMode()) {
+    // Datagrams from the ICE link (or looped back), one per call, oldest
+    // first, with the peer's virtual address and its game port as source.
+    rex::net::online::Datagram datagram;
+    if (rex::net::online::RecvFrom(socket->bound_port(), &datagram)) {
+      const uint32_t size = static_cast<uint32_t>(datagram.data.size());
+      const uint32_t copied = std::min(size, static_cast<uint32_t>(buf_len));
+      if (copied) {
+        std::memcpy(buf_ptr.host_address(), datagram.data.data(), copied);
+      }
+      if (from_ptr) {
+        from_ptr->sin_family = 2;  // AF_INET
+        from_ptr->sin_port = datagram.from_port;
+        from_ptr->sin_addr = datagram.from_ip;
+        std::memset(from_ptr->x_sin_zero, 0, sizeof(from_ptr->x_sin_zero));
+      }
+      if (fromlen_ptr) {
+        *fromlen_ptr = 16;
+      }
+      g_burst_net_stats.recv_calls++;
+      g_burst_net_stats.recv_ok++;
+      g_burst_net_stats.recv_bytes += copied;
+      BurstNetStatsTick();
+      LogOnlineDatagram("recvfrom", datagram.from_ip, datagram.from_port, size);
+      if (size > copied) {
+        XThread::SetLastError(0x2738);  // WSAEMSGSIZE
+        return -1;
+      }
+      return copied;
+    }
+  }
+
   N_XSOCKADDR_IN native_from;
   if (from_ptr) {
     native_from = *from_ptr;
@@ -1373,6 +1519,21 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
     return -1;
+  }
+
+  if (to_ptr && rex::net::online::IsLobbyMode()) {
+    const uint32_t dst_ip = to_ptr->sin_addr;
+    const uint16_t dst_port = to_ptr->sin_port;
+    if (rex::net::online::SendTo(socket->bound_port(), dst_ip, dst_port,
+                                 static_cast<const uint8_t*>(buf_ptr.host_address()), buf_len)) {
+      // UDP semantics: always the full length (a short send for 1.1 s makes
+      // the game drop the peer).
+      g_burst_net_stats.send_calls++;
+      g_burst_net_stats.send_bytes += buf_len;
+      BurstNetStatsTick();
+      LogOnlineDatagram("sendto", dst_ip, dst_port, buf_len);
+      return buf_len;
+    }
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);

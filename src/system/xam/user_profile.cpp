@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 
 #include <rex/logging.h>
+#include <rex/net/online.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
@@ -26,7 +27,8 @@ UserProfile::UserProfile() {
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  // online_name, else the OS user name (shown to the other player online).
+  name_ = rex::net::online::PlayerName();
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

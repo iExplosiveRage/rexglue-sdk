@@ -160,6 +160,36 @@ add_subdirectory(disasm)
 # Suppress warnings in disasm
 target_compile_options(disasm PRIVATE -w)
 
+# libjuice 1.7.4 - ICE / STUN / TURN (MPL-2.0, unmodified, see libjuice/LICENSE)
+# for the online lobby transport. Our own static target: libjuice's CMake
+# would add a shared library, tests and its own install(EXPORT) set.
+# The STUN/TURN server part stays in: it backs the online_debug_turn_server
+# test switch (a local relay for relay-only tests).
+set(JUICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libjuice")
+add_library(juice STATIC
+    ${JUICE_DIR}/src/addr.c       ${JUICE_DIR}/src/agent.c       ${JUICE_DIR}/src/base64.c
+    ${JUICE_DIR}/src/const_time.c ${JUICE_DIR}/src/conn.c        ${JUICE_DIR}/src/conn_mux.c
+    ${JUICE_DIR}/src/conn_poll.c  ${JUICE_DIR}/src/conn_thread.c ${JUICE_DIR}/src/crc32.c
+    ${JUICE_DIR}/src/hash.c       ${JUICE_DIR}/src/hmac.c        ${JUICE_DIR}/src/ice.c
+    ${JUICE_DIR}/src/juice.c      ${JUICE_DIR}/src/log.c         ${JUICE_DIR}/src/random.c
+    ${JUICE_DIR}/src/server.c     ${JUICE_DIR}/src/stun.c        ${JUICE_DIR}/src/tcp.c
+    ${JUICE_DIR}/src/timestamp.c  ${JUICE_DIR}/src/turn.c        ${JUICE_DIR}/src/udp.c
+)
+set_target_properties(juice PROPERTIES C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
+target_include_directories(juice PUBLIC $<BUILD_INTERFACE:${JUICE_DIR}/include>)
+target_include_directories(juice PRIVATE ${JUICE_DIR}/include/juice ${JUICE_DIR}/src)
+target_compile_definitions(juice
+    PUBLIC JUICE_STATIC
+    PRIVATE JUICE_EXPORTS USE_NETTLE=0 $<$<CONFIG:Release>:RELEASE=1>)
+if(WIN32)
+    target_compile_definitions(juice PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(juice PRIVATE ws2_32 bcrypt)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(juice PRIVATE Threads::Threads)
+endif()
+target_compile_options(juice PRIVATE -w)
+
 #=============================================================================
 # fmt - Formatting library (must come before spdlog)
 #=============================================================================
@@ -224,6 +254,7 @@ endif()
 #=============================================================================
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fsr_sdk.cmake)
 
 #=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
