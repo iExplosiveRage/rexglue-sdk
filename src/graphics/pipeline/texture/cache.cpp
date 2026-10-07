@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -49,6 +50,13 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
                      "Hard texture cache memory limit (MB)")
     .range(128, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(texture_cache_pack_limits, true, "GPU",
+                    "While a texture pack is used, raise the texture cache memory limits to fit "
+                    "it (from the video memory: up to a quarter / half of it, at most 4096 / 8192 "
+                    "MB, never below texture_cache_memory_limit_soft / _hard)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
@@ -260,7 +268,11 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_y >= 1);
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
 
-  if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+  // The pages last written by resolves are tracked at every scale: scaled
+  // textures are made from them above 1x, and texture replacement skips them
+  // (render-to-texture data changes all the time - finding a replacement for
+  // it would hash the whole texture again each time it's used).
+  {
     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
     scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
     std::memset(scaled_resolve_pages_.get(), 0, kScaledResolvePageDwordCount * sizeof(uint32_t));
@@ -451,12 +463,33 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   const bool dlss_upscaling =
       !dlss.empty() && dlss != "off" && dlss != "dlaa" && clamped_x == clamped_y &&
       rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable;
+  // AMD FSR (fsr_mode) the same way while DLSS isn't on, at the closest whole
+  // scale to its ratio, at most 3x below the target.
+  const bool dlss_active =
+      !dlss.empty() && dlss != "off" &&
+      rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kUnavailable;
+  const std::string fsr = LowercaseFlag("fsr_mode");
+  const bool fsr_upscaling =
+      !dlss_active && (fsr == "quality" || fsr == "balanced" || fsr == "performance" ||
+                       fsr == "ultra_performance") &&
+      clamped_x == clamped_y &&
+      rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable;
   if (dlss_upscaling) {
     x_out = GetDlssRenderScale(clamped_x, dlss);
     y_out = x_out;
     if (x_out != clamped_x) {
       REXLOG_INFO("NVIDIA DLSS {}: rendering at {}x{} scale, upscaled to {}x{}", dlss, x_out,
                   y_out, clamped_x, clamped_y);
+    }
+  } else if (fsr_upscaling) {
+    x_out = GetUpscalerRenderScale(clamped_x, "fsr", fsr);
+    while (3 * x_out < clamped_x) {
+      ++x_out;
+    }
+    y_out = x_out;
+    if (x_out != clamped_x) {
+      REXLOG_INFO("AMD FSR {}: rendering at {}x{} scale, upscaled to {}x{}", fsr, x_out, y_out,
+                  clamped_x, clamped_y);
     }
   } else {
     // The presenter cvars live in rexruntime, so they're read by name.
@@ -470,10 +503,10 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
     }
   }
   if (target_x_out) {
-    *target_x_out = dlss_upscaling ? clamped_x : x_out;
+    *target_x_out = dlss_upscaling || fsr_upscaling ? clamped_x : x_out;
   }
   if (target_y_out) {
-    *target_y_out = dlss_upscaling ? clamped_y : y_out;
+    *target_y_out = dlss_upscaling || fsr_upscaling ? clamped_y : y_out;
   }
   rex::perf::SetDrawResolutionScale(x_out, y_out, clamped_x, clamped_y);
   return clamped_x == config_x && clamped_y == config_y;
@@ -483,19 +516,79 @@ void TextureCache::ClearCache() {
   DestroyAllTextures();
 }
 
-void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
-  // If memory usage is too high, destroy unused textures.
-  uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+void TextureCache::GetMemoryLimits(uint32_t& soft_mb_out, uint32_t& hard_mb_out) {
+  uint32_t soft_mb = uint32_t(std::max(REXCVAR_GET(texture_cache_memory_limit_soft), INT32_C(1)));
+  uint32_t hard_mb = uint32_t(std::max(REXCVAR_GET(texture_cache_memory_limit_hard), INT32_C(1)));
+  // A texture pack's images are several times the size of the originals (and
+  // have full mip chains), so the defaults - made for the game's own textures
+  // - can't hold the ones a scene uses, and textures would be destroyed and
+  // made again from the decoded images all the time. The pack's limits come
+  // from the video memory, and don't depend on the draw resolution scale (the
+  // render-to-texture part below is added on top as usual).
+  if (REXCVAR_GET(texture_cache_pack_limits) && REXCVAR_GET(texture_replace_enabled) &&
+      replacement_ && replacement_->GetReplacementCount()) {
+    if (!pack_limit_hard_mb_) {
+      uint64_t budget = 0, usage = 0;
+      if (!QueryLocalVideoMemory(budget, usage)) {
+        budget = 0;
+      }
+      const uint64_t budget_mb = budget >> 20;
+      if (budget_mb) {
+        pack_limit_soft_mb_ = uint32_t(std::min<uint64_t>(budget_mb / 4, 4096));
+        pack_limit_hard_mb_ = uint32_t(std::min<uint64_t>(budget_mb / 2, 8192));
+      } else {
+        pack_limit_soft_mb_ = 1024;
+        pack_limit_hard_mb_ = 2048;
+      }
+      const uint32_t log_soft = std::max(soft_mb, pack_limit_soft_mb_);
+      const uint32_t log_hard = std::max(hard_mb, pack_limit_hard_mb_);
+      // Once per value (the cache is made again when the scale changes).
+      static uint64_t logged_limits = 0;
+      const uint64_t limits = (uint64_t(log_soft) << 32) | log_hard;
+      if (logged_limits != limits) {
+        logged_limits = limits;
+        REXLOG_INFO(
+            "Texture cache: a texture pack is in use ({} replacements) - memory limits soft {} "
+            "MB / hard {} MB (video memory budget {} MB{}; texture_cache_memory_limit_soft / "
+            "_hard {} / {} MB)",
+            replacement_->GetReplacementCount(), log_soft, log_hard, budget_mb,
+            budget_mb ? "" : " unknown", soft_mb, hard_mb);
+      }
+    }
+    soft_mb = std::max(soft_mb, pack_limit_soft_mb_);
+    hard_mb = std::max(hard_mb, pack_limit_hard_mb_);
+  }
   // texture_cache_memory_limit_render_to_texture is assumed to be included in
   // texture_cache_memory_limit_soft and texture_cache_memory_limit_hard, at 1x,
   // so subtracting 1 from the scale.
-  uint32_t limit_scaled_resolve_add_mb =
+  const uint32_t limit_scaled_resolve_add_mb =
       REXCVAR_GET(texture_cache_memory_limit_render_to_texture) *
       (draw_resolution_scale_x() * draw_resolution_scale_y() - 1);
-  uint32_t limit_soft_mb =
-      REXCVAR_GET(texture_cache_memory_limit_soft) + limit_scaled_resolve_add_mb;
-  uint32_t limit_hard_mb =
-      REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
+  soft_mb_out = soft_mb + limit_scaled_resolve_add_mb;
+  hard_mb_out = hard_mb + limit_scaled_resolve_add_mb;
+}
+
+void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  // If memory usage is too high, destroy unused textures.
+  uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+  uint32_t limit_soft_mb, limit_hard_mb;
+  GetMemoryLimits(limit_soft_mb, limit_hard_mb);
+  {
+    rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+    stats.memory_bytes.store(textures_total_host_memory_usage_, std::memory_order_relaxed);
+    stats.limit_soft_mb.store(limit_soft_mb, std::memory_order_relaxed);
+    stats.limit_hard_mb.store(limit_hard_mb, std::memory_order_relaxed);
+    // The process's video memory, for perf_report - once a second.
+    static uint64_t last_vram_query_time = 0;
+    if (current_time - last_vram_query_time >= 1000) {
+      last_vram_query_time = current_time;
+      uint64_t budget = 0, usage = 0;
+      if (QueryLocalVideoMemory(budget, usage)) {
+        stats.vram_budget_bytes.store(budget, std::memory_order_relaxed);
+        stats.vram_usage_bytes.store(usage, std::memory_order_relaxed);
+      }
+    }
+  }
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
   bool destroyed_any = false;
   while (texture_used_first_ != nullptr) {
@@ -528,6 +621,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       assert_true(found_texture_it->second.get() == texture);
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
+      rex::perf::GetTextureCacheStats().destroyed.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (destroyed_any) {
@@ -555,7 +649,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
-  if (IsDrawResolutionScaled()) {
+  {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
@@ -694,7 +788,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
       !texture_key.scaled_resolve && !texture.replacement_content_hash_) {
     const uint32_t guest_addr = texture_key.base_page << 12;
     const uint32_t guest_size = texture.GetGuestBaseSize();
-    if (guest_size > 0) {
+    if (guest_size > 0 && !IsRangeResolved(guest_addr, guest_size)) {
       const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
       const uint64_t content_hash =
           HashReplacementBase(texture.guest_layout(), texture_key.dimension, texture_key.format,
@@ -711,6 +805,13 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+  {
+    rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+    stats.loaded.fetch_add(1, std::memory_order_relaxed);
+    if (uploaded_replacement) {
+      stats.replacement_uploads.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
 
   return true;
 }
@@ -1132,7 +1233,11 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     original_guest_layout = key.GetGuestLayout();
     const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;
 
-    if (guest_size > 0) {
+    // Not render-to-texture data (resolved, and not written by the CPU since):
+    // that changes from frame to frame, so its key would be hashed again on
+    // every use - at 1x, where it isn't a scaled resolve texture, several
+    // full-screen textures a frame took most of the frame time.
+    if (guest_size > 0 && !IsRangeResolved(key.base_page << 12, guest_size)) {
       const uint32_t base_page = key.base_page;
       const uint8_t* guest_bytes = shared_memory().TranslatePhysical(key.base_page << 12);
       const uint64_t fingerprint =
@@ -1141,17 +1246,26 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
                                                          key.format, key.tiled != 0);
       auto cached_hash = base_page_hash_cache_.find(base_page);
 
+      rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+      stats.replacement_lookups.fetch_add(1, std::memory_order_relaxed);
       if (cached_hash != base_page_hash_cache_.end() &&
           cached_hash->second.size == guest_size &&
           cached_hash->second.fingerprint == fingerprint &&
           cached_hash->second.layout == layout) {
         replacement_content_hash = cached_hash->second.hash;
       } else {
+        const auto hash_start = std::chrono::steady_clock::now();
         replacement_content_hash =
             HashReplacementBase(original_guest_layout, key.dimension, key.format, key.tiled != 0,
                                 guest_bytes, guest_size);
         base_page_hash_cache_[base_page] = {guest_size, fingerprint, layout,
                                             replacement_content_hash};
+        stats.replacement_hashes.fetch_add(1, std::memory_order_relaxed);
+        stats.replacement_hash_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - hash_start)
+                         .count()),
+            std::memory_order_relaxed);
       }
 
       // Only the size here - the pixels are decoded when the texture is
@@ -1216,6 +1330,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  rex::perf::GetTextureCacheStats().created.fetch_add(1, std::memory_order_relaxed);
   texture->LogAction("Created");
   return texture;
 }
@@ -1355,10 +1470,10 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
 }
 
 bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
-  if (!IsDrawResolutionScaled()) {
-    return false;
-  }
+  return IsDrawResolutionScaled() && IsRangeResolved(start_unscaled, length_unscaled);
+}
 
+bool TextureCache::IsRangeResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
   start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
   length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
   if (!length_unscaled) {
@@ -1414,7 +1529,6 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
 void TextureCache::ScaledResolveGlobalWatchCallback(
     const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
     uint32_t address_last, bool invalidated_by_gpu) {
-  assert_true(IsDrawResolutionScaled());
   if (invalidated_by_gpu) {
     // Resolves themselves do exactly the opposite of what this should do.
     return;

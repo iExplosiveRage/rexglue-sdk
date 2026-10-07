@@ -385,6 +385,45 @@ D3D12TextureCache::~D3D12TextureCache() {
   }
   scaled_resolve_heaps_.clear();
   COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb", 0);
+
+  if (dxgi_adapter_) {
+    dxgi_adapter_->Release();
+  }
+}
+
+bool D3D12TextureCache::QueryLocalVideoMemory(uint64_t& budget_out, uint64_t& usage_out) {
+  if (!dxgi_adapter_looked_up_) {
+    dxgi_adapter_looked_up_ = true;
+    const LUID luid = command_processor_.GetD3D12Provider().GetDevice()->GetAdapterLuid();
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+      if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&dxgi_adapter_)))) {
+        dxgi_adapter_ = nullptr;
+      }
+      factory->Release();
+    }
+    if (!dxgi_adapter_) {
+      REXGPU_WARN("Texture cache: can't query the adapter's video memory");
+    }
+  }
+  if (!dxgi_adapter_) {
+    return false;
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+  if (SUCCEEDED(dxgi_adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) &&
+      info.Budget) {
+    budget_out = info.Budget;
+    usage_out = info.CurrentUsage;
+    return true;
+  }
+  // No budget (shouldn't happen on WDDM 2): the dedicated memory instead.
+  DXGI_ADAPTER_DESC1 desc = {};
+  if (SUCCEEDED(dxgi_adapter_->GetDesc1(&desc)) && desc.DedicatedVideoMemory) {
+    budget_out = uint64_t(desc.DedicatedVideoMemory);
+    usage_out = 0;
+    return true;
+  }
+  return false;
 }
 
 bool D3D12TextureCache::Initialize() {

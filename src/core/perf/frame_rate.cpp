@@ -82,4 +82,9 @@ RenderInfo GetRenderInfo() {
   return info;
 }
 
+TextureCacheStats& GetTextureCacheStats() {
+  static TextureCacheStats stats;
+  return stats;
+}
+
 }  // namespace rex::perf

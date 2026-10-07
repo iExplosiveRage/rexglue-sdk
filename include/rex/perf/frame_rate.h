@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -38,5 +39,26 @@ struct RenderInfo {
   uint32_t requested_scale_y = 0;
 };
 RenderInfo GetRenderInfo();
+
+// Texture cache activity, for the perf_report debug command (totals since
+// startup; the reader takes differences). Written by the GPU thread.
+struct TextureCacheStats {
+  std::atomic<uint64_t> created{0};             // host textures created
+  std::atomic<uint64_t> destroyed{0};           // destroyed by the memory limits
+  std::atomic<uint64_t> loaded{0};              // texture data uploads (guest or replacement)
+  std::atomic<uint64_t> replacement_uploads{0}; // uploads from replacement images
+  std::atomic<uint64_t> replacement_lookups{0}; // texture lookups checked for a replacement
+  std::atomic<uint64_t> replacement_hashes{0};  // full replacement key hashes of guest data
+  std::atomic<uint64_t> replacement_hash_ns{0};
+  std::atomic<uint64_t> replacement_decodes{0}; // image files decoded on the GPU thread
+  std::atomic<uint64_t> replacement_decode_ns{0};
+  // Current values.
+  std::atomic<uint64_t> memory_bytes{0};        // host memory of the cached textures
+  std::atomic<uint32_t> limit_soft_mb{0};
+  std::atomic<uint32_t> limit_hard_mb{0};
+  std::atomic<uint64_t> vram_usage_bytes{0};    // the process's local video memory use
+  std::atomic<uint64_t> vram_budget_bytes{0};   // the OS budget for it
+};
+TextureCacheStats& GetTextureCacheStats();
 
 }  // namespace rex::perf

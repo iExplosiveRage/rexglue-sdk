@@ -16,6 +16,7 @@
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/thread.h>
 
 #ifndef XXH_INLINE_ALL
@@ -704,6 +705,11 @@ void TextureReplacement::Rescan() {
               replace_dir().string());
 }
 
+size_t TextureReplacement::GetReplacementCount() const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return replacements_.size();
+}
+
 // ---------------------------------------------------------------------------
 // Hash
 // ---------------------------------------------------------------------------
@@ -1206,6 +1212,15 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
   const auto load_start = std::chrono::steady_clock::now();
   TextureReplacementData loaded;
   const bool ok = LoadFile(path, loaded);
+  {
+    rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+    stats.replacement_decodes.fetch_add(1, std::memory_order_relaxed);
+    stats.replacement_decode_ns.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - load_start)
+                     .count()),
+        std::memory_order_relaxed);
+  }
   if (!preload_queue_.empty()) {
     REXLOG_INFO("TextureReplacement: {} was needed before the preload got to it, loaded in {} ms",
                 path.filename().string(),

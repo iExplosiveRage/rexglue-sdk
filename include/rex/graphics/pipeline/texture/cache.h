@@ -508,6 +508,12 @@ class TextureCache {
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
   virtual bool IsSignedVersionSeparateForFormat(TextureKey /*key*/) const { return false; }
+  // The OS's budget of local (dedicated) video memory for this process and
+  // how much of it the process uses, in bytes; false if unknown. Sizes the
+  // memory limits while a texture pack is used.
+  virtual bool QueryLocalVideoMemory(uint64_t& /*budget_out*/, uint64_t& /*usage_out*/) {
+    return false;
+  }
   // Parameters like whether the texture is tiled and its dimensions are checked
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
@@ -596,6 +602,9 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Whether any page of the range was last written by a resolve (at any draw
+  // resolution scale), not by the CPU since.
+  bool IsRangeResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -650,6 +659,13 @@ class TextureCache {
   }
 
   std::unique_ptr<TextureReplacement> replacement_;
+  // The soft and hard memory limits (MB) for the textures in use now - see
+  // GetMemoryLimits.
+  void GetMemoryLimits(uint32_t& soft_mb_out, uint32_t& hard_mb_out);
+  // Limits for a texture pack from the video memory budget (MB, 0 = not
+  // worked out yet).
+  uint32_t pack_limit_soft_mb_ = 0;
+  uint32_t pack_limit_hard_mb_ = 0;
   // Content hashes of the textures at a base page, for finding replacements
   // without hashing the whole texture again on every lookup. The memory may be
   // reused for another texture without a watch noticing (the old texture may

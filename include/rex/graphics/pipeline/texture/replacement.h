@@ -84,6 +84,9 @@ class TextureReplacement {
   // Rescans textures/replace/ and rebuilds the hash→path index.
   void Rescan();
 
+  // How many replacement files are indexed.
+  size_t GetReplacementCount() const;
+
   // ---------------------------------------------------------------------------
   // Dump path
   // ---------------------------------------------------------------------------
