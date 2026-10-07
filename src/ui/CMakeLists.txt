@@ -2,9 +2,11 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    debug_command_pipe.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
+    image_encode.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp

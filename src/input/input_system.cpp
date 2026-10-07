@@ -307,28 +307,38 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (result == X_ERROR_SUCCESS && out_state && user_index < kMaxGuestUsers &&
-      injected_buttons_[user_index]) {
+      (injected_buttons_[user_index] || injected_left_trigger_[user_index] ||
+       injected_right_trigger_[user_index])) {
     const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
                                          std::chrono::steady_clock::now().time_since_epoch())
                                          .count());
     if (now_ms < injected_until_ms_[user_index]) {
       out_state->gamepad.buttons =
           static_cast<uint16_t>(uint16_t(out_state->gamepad.buttons) | injected_buttons_[user_index]);
+      out_state->gamepad.left_trigger = std::max<uint8_t>(uint8_t(out_state->gamepad.left_trigger),
+                                                          injected_left_trigger_[user_index]);
+      out_state->gamepad.right_trigger = std::max<uint8_t>(
+          uint8_t(out_state->gamepad.right_trigger), injected_right_trigger_[user_index]);
       out_state->packet_number = uint32_t(out_state->packet_number) + 1;
     } else {
       injected_buttons_[user_index] = 0;
+      injected_left_trigger_[user_index] = 0;
+      injected_right_trigger_[user_index] = 0;
     }
   }
 
   return result;
 }
 
-void InputSystem::InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t duration_ms) {
+void InputSystem::InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t duration_ms,
+                                uint8_t left_trigger, uint8_t right_trigger) {
   if (user_index >= kMaxGuestUsers) {
     return;
   }
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   injected_buttons_[user_index] = buttons;
+  injected_left_trigger_[user_index] = left_trigger;
+  injected_right_trigger_[user_index] = right_trigger;
   injected_until_ms_[user_index] =
       uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())

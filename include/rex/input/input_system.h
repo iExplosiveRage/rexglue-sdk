@@ -69,8 +69,10 @@ class InputSystem : public system::IInputSystem {
   void SetUIToggleComboButtons(uint16_t buttons);
 
   /// Debugging / automation: the guest sees `buttons` (X_INPUT_GAMEPAD_*)
-  /// held on `user_index` for `duration_ms`, on top of the real controller.
-  void InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t duration_ms);
+  /// held on `user_index` for `duration_ms`, on top of the real controller -
+  /// and the triggers pulled at least this far (0-255).
+  void InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t duration_ms,
+                     uint8_t left_trigger = 0, uint8_t right_trigger = 0);
 
   bool GetVibrationEnabled() const;
   void ToggleVibration();
@@ -125,6 +127,8 @@ class InputSystem : public system::IInputSystem {
 
   // InjectButtons: per user, the buttons and until when (steady clock ms).
   std::array<uint16_t, kMaxGuestUsers> injected_buttons_ = {};
+  std::array<uint8_t, kMaxGuestUsers> injected_left_trigger_ = {};
+  std::array<uint8_t, kMaxGuestUsers> injected_right_trigger_ = {};
   std::array<uint64_t, kMaxGuestUsers> injected_until_ms_ = {};
 };
 

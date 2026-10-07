@@ -153,22 +153,17 @@ void ConsoleDialog::AddLocal(spdlog::level::level_enum level, std::string text) 
   local_entries_.push_back({rex::LogEntry{level, "console", std::move(text)}, seq});
 }
 
-void ConsoleDialog::ExecuteCommand(std::string_view cmd) {
+ConsoleLineResult ExecuteConsoleLine(std::string_view cmd, std::string_view source,
+                                     const ConsoleFeedback& feedback) {
   // Trim whitespace.
   while (!cmd.empty() && cmd.front() == ' ')
     cmd.remove_prefix(1);
   while (!cmd.empty() && cmd.back() == ' ')
     cmd.remove_suffix(1);
   if (cmd.empty())
-    return;
+    return {};
 
-  // Record in history.
-  if (history_.empty() || history_.back() != cmd) {
-    if (history_.size() >= kMaxHistory)
-      history_.pop_front();
-    history_.push_back(std::string(cmd));
-  }
-  history_pos_ = -1;
+  const std::string tag = "[" + std::string(source) + "] ";
 
   if (cmd == "help" || cmd == "?") {
     auto names = rex::cvar::ListFlags();
@@ -178,9 +173,9 @@ void ConsoleDialog::ExecuteCommand(std::string_view cmd) {
       std::string line = "  " + n;
       if (info)
         line += " = " + info->getter() + "  (" + info->description + ")";
-      AddLocal(spdlog::level::info, line);
+      feedback(spdlog::level::info, line);
     }
-    return;
+    return {};
   }
 
   // Split on first space into name + args.
@@ -200,29 +195,54 @@ void ConsoleDialog::ExecuteCommand(std::string_view cmd) {
   // "> cmd" line is tagged with an earlier generation than any log lines the
   // command emits, keeping it just above its own output.
   if (info && info->type == rex::cvar::FlagType::Command) {
-    AddLocal(spdlog::level::info, "[console] > " + name + (args.empty() ? "" : " " + args));
-    rex::cvar::InvokeCommand(name, args);
-    scroll_to_bottom_ = true;
-    return;
+    feedback(spdlog::level::info, tag + "> " + name + (args.empty() ? "" : " " + args));
+    if (!rex::cvar::InvokeCommand(name, args)) {
+      return {ConsoleLineStatus::kUnknownCommand, {}};
+    }
+    return {};
+  }
+
+  if (!info) {
+    feedback(spdlog::level::warn, tag + "unknown cvar: " + name);
+    return {ConsoleLineStatus::kUnknownCommand, {}};
   }
 
   if (sep == std::string_view::npos) {
     // No args: treat as "get" - show current value.
-    std::string val = rex::cvar::GetFlagByName(name);
-    if (val.empty() && !info) {
-      AddLocal(spdlog::level::warn, "[console] unknown cvar: " + name);
-    } else {
-      AddLocal(spdlog::level::info, "[console] " + name + " = " + val);
-    }
-    return;
+    std::string line = name + " = " + rex::cvar::GetFlagByName(name);
+    feedback(spdlog::level::info, tag + line);
+    return {ConsoleLineStatus::kOk, std::move(line)};
   }
 
   // Has args, non-command: set.
   if (rex::cvar::SetFlagByName(name, args)) {
-    AddLocal(spdlog::level::info, "[console] " + name + " = " + args);
-  } else {
-    AddLocal(spdlog::level::warn, "[console] unknown cvar: " + name);
+    feedback(spdlog::level::info, tag + name + " = " + args);
+    return {};
   }
+  feedback(spdlog::level::warn, tag + "invalid value for " + name + ": " + args);
+  return {ConsoleLineStatus::kError, "invalid value for " + name};
+}
+
+void ConsoleDialog::ExecuteCommand(std::string_view cmd) {
+  // Trim whitespace.
+  while (!cmd.empty() && cmd.front() == ' ')
+    cmd.remove_prefix(1);
+  while (!cmd.empty() && cmd.back() == ' ')
+    cmd.remove_suffix(1);
+  if (cmd.empty())
+    return;
+
+  // Record in history.
+  if (history_.empty() || history_.back() != cmd) {
+    if (history_.size() >= kMaxHistory)
+      history_.pop_front();
+    history_.push_back(std::string(cmd));
+  }
+  history_pos_ = -1;
+
+  ExecuteConsoleLine(cmd, "console", [this](spdlog::level::level_enum level, std::string text) {
+    AddLocal(level, std::move(text));
+  });
   scroll_to_bottom_ = true;
 }
 

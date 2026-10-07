@@ -11,9 +11,11 @@
 
 #include <rex/rex_app.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <string>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -22,6 +24,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -38,7 +41,9 @@
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
+#include <rex/ui/debug_command_pipe.h>
 #include <rex/ui/graphics_provider.h>
+#include <rex/ui/image_encode.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
@@ -46,6 +51,8 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
+#include <vector>
 #include <filesystem>
 #include <string_view>
 
@@ -60,6 +67,160 @@ REXCVAR_DEFINE_STRING(quick_menu_buttons, "back+start", "UI",
     .allowed({"back+start", "l3+r3", "none"});
 
 REXCVAR_DEFINE_BOOL(debug_overlay, false, "UI", "Show the frame rate overlay (F3)");
+
+REXCVAR_DEFINE_STRING(debug_command_pipe, "", "Debug",
+                      "Test automation: run console lines sent to the local named pipe "
+                      "\\\\.\\pipe\\<name>, each acknowledged on the pipe (empty = off)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .debug_only();
+
+namespace rex {
+
+namespace {
+
+// The running app's presenter, for the screenshot command. UI thread.
+std::function<ui::Presenter*()> g_screenshot_presenter;
+
+// screenshot <path.png>: saves the frame the presenter shows - the guest
+// output, at its render resolution, without the overlays - as a PNG. Needs
+// neither the window in front nor visible. The capture is taken here (UI
+// thread); the PNG is written on its own thread, and a debug command pipe
+// acknowledges the line once the file is complete.
+void ScreenshotCommand(std::string_view args) {
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  while (!args.empty() && (args.front() == ' ' || args.front() == '\t')) {
+    args.remove_prefix(1);
+  }
+  while (!args.empty() && (args.back() == ' ' || args.back() == '\t')) {
+    args.remove_suffix(1);
+  }
+  if (args.size() >= 2 && args.front() == '"' && args.back() == '"') {
+    args = args.substr(1, args.size() - 2);
+  }
+  if (args.empty()) {
+    REXLOG_WARN("screenshot: usage: screenshot <path.png>");
+    done(false, "usage: screenshot <path.png>");
+    return;
+  }
+  std::string path_text(args);
+  ui::Presenter* presenter = g_screenshot_presenter ? g_screenshot_presenter() : nullptr;
+  auto image = std::make_shared<ui::RawImage>();
+  if (!presenter || !presenter->CaptureGuestOutput(*image)) {
+    REXLOG_WARN("screenshot: no game frame to capture yet ({})", path_text);
+    done(false, "no game frame yet");
+    return;
+  }
+  std::filesystem::path path(std::u8string(path_text.begin(), path_text.end()));
+  std::thread([image, path = std::move(path), path_text = std::move(path_text),
+               done = std::move(done)]() {
+    const auto start = std::chrono::steady_clock::now();
+    std::string error;
+    if (!ui::WriteImagePng(*image, path, &error)) {
+      REXLOG_WARN("screenshot: could not save {}: {}", path_text, error);
+      done(false, error);
+      return;
+    }
+    std::error_code ec;
+    const uintmax_t bytes = std::filesystem::file_size(path, ec);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    REXLOG_INFO("screenshot: saved {} ({}x{}, {} bytes, {} ms)", path_text, image->width,
+                image->height, ec ? 0 : bytes, ms);
+    done(true, fmt::format("{}x{}", image->width, image->height));
+  }).detach();
+}
+
+}  // namespace
+
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND_ARGS(screenshot, rex::ScreenshotCommand, "Debug",
+                            "Save the game frame (guest output, render resolution) as PNG: "
+                            "<path.png>");
+
+namespace rex {
+
+namespace {
+
+// perf_report [seconds]: measures the game for that long (default 10) and logs
+// the average guest frame rate, frame time percentiles and the texture cache
+// activity per second. Test automation: a debug command pipe acknowledges the
+// line with the summary when the measurement is done.
+void PerfReportCommand(std::string_view args) {
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  double seconds = 10.0;
+  {
+    std::string text(args);
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end != text.c_str() && value > 0.0) {
+      seconds = std::min(value, 600.0);
+    }
+  }
+  std::thread([seconds, done = std::move(done)]() {
+    using clock = std::chrono::steady_clock;
+    perf::TextureCacheStats& tc = perf::GetTextureCacheStats();
+    auto snap = [&tc]() {
+      return std::array<uint64_t, 9>{
+          tc.created.load(),             tc.destroyed.load(),
+          tc.loaded.load(),              tc.replacement_uploads.load(),
+          tc.replacement_lookups.load(), tc.replacement_hashes.load(),
+          tc.replacement_hash_ns.load(), tc.replacement_decodes.load(),
+          tc.replacement_decode_ns.load()};
+    };
+    const auto before = snap();
+    const uint64_t start_swaps = perf::GetGuestSwapCount();
+    const auto start = clock::now();
+    std::vector<float> frame_ms;
+    uint64_t seen_swaps = start_swaps;
+    float recent[255];
+    uint64_t peak_memory = 0;
+    while (std::chrono::duration<double>(clock::now() - start).count() < seconds) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const uint64_t swaps = perf::GetGuestSwapCount();
+      const size_t count = perf::GetGuestFrameTimes(recent, 255);
+      const size_t take = size_t(std::min<uint64_t>(swaps - seen_swaps, count));
+      frame_ms.insert(frame_ms.end(), recent + (count - take), recent + count);
+      seen_swaps = swaps;
+      peak_memory = std::max(peak_memory, tc.memory_bytes.load());
+    }
+    const double elapsed = std::chrono::duration<double>(clock::now() - start).count();
+    const uint64_t frames = perf::GetGuestSwapCount() - start_swaps;
+    const auto after = snap();
+    std::sort(frame_ms.begin(), frame_ms.end());
+    auto percentile = [&frame_ms](double p) -> double {
+      if (frame_ms.empty()) {
+        return 0.0;
+      }
+      return frame_ms[std::min(frame_ms.size() - 1, size_t(p * double(frame_ms.size())))];
+    };
+    auto per_second = [&](size_t i) { return double(after[i] - before[i]) / elapsed; };
+    const perf::RenderInfo render = perf::GetRenderInfo();
+    const std::string summary = fmt::format(
+        "fps {:.1f} frames {} in {:.1f} s | frame ms p50 {:.2f} p95 {:.2f} p99 {:.2f} max {:.2f} | "
+        "scale {}x{} (target {}x{}) | textures/s created {:.1f} destroyed {:.1f} loaded {:.1f} "
+        "repl_uploads {:.1f} repl_lookups {:.1f} repl_hashes {:.1f} ({:.2f} ms/s) repl_decodes "
+        "{:.1f} ({:.2f} ms/s) | cache {} MB (peak {} MB) limits {}/{} MB | vram {} / {} MB",
+        double(frames) / elapsed, frames, elapsed, percentile(0.5), percentile(0.95),
+        percentile(0.99), frame_ms.empty() ? 0.0 : double(frame_ms.back()), render.scale_x,
+        render.scale_y, render.requested_scale_x, render.requested_scale_y, per_second(0),
+        per_second(1), per_second(2), per_second(3), per_second(4), per_second(5),
+        double(after[6] - before[6]) * 1.0e-6 / elapsed, per_second(7),
+        double(after[8] - before[8]) * 1.0e-6 / elapsed, tc.memory_bytes.load() >> 20,
+        peak_memory >> 20, tc.limit_soft_mb.load(), tc.limit_hard_mb.load(),
+        tc.vram_usage_bytes.load() >> 20, tc.vram_budget_bytes.load() >> 20);
+    REXLOG_INFO("perf_report: {}", summary);
+    done(true, summary);
+  }).detach();
+}
+
+}  // namespace
+
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND_ARGS(perf_report, rex::PerfReportCommand, "Debug",
+                            "Measure the frame rate and texture cache activity: [seconds]");
 
 namespace rex {
 
@@ -113,6 +274,7 @@ bool ReXApp::OnInitialize() {
     return false;
   if (!SetupPresentation())
     return false;
+  SetupTestControl();
 
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {
@@ -440,7 +602,7 @@ bool ReXApp::SetupPresentation() {
     for (const char* name :
          {"present_effect", "present_cas_additional_sharpness", "present_fsr_max_upsampling_passes",
           "present_fsr_sharpness_reduction", "present_fsr_quality_mode", "present_dither",
-          "present_allow_overscan_cutoff", "dlss_mode"}) {
+          "present_allow_overscan_cutoff", "dlss_mode", "fsr_mode"}) {
       // config_.graphics is handed over to the runtime during setup.
       rex::cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
         app_context().CallInUIThreadDeferred([this] {
@@ -495,8 +657,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();
+      REXLOG_INFO("Console overlay closed");
     } else {
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+      REXLOG_INFO("Console overlay opened");
     }
   });
   rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
@@ -666,6 +830,13 @@ void ReXApp::OnRestored(ui::UIEvent& e) {
 }
 
 void ReXApp::OnDestroy() {
+  // No more pipe lines or screenshots once teardown starts.
+  if (command_pipe_) {
+    command_pipe_->Stop();
+    command_pipe_.reset();
+  }
+  g_screenshot_presenter = nullptr;
+
   // Notify subclass before cleanup
   OnShutdown();
 
@@ -725,6 +896,26 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
   frame_stats_provider_ = provider;
   if (debug_overlay_) {
     debug_overlay_->SetStatsProvider(provider);
+  }
+}
+
+void ReXApp::SetupTestControl() {
+  g_screenshot_presenter = [this]() -> ui::Presenter* {
+    // config_.graphics is handed over to the runtime during setup.
+    auto* graphics = runtime_ ? runtime_->graphics_system() : config_.graphics.get();
+    return graphics ? graphics->presenter() : nullptr;
+  };
+  const std::string pipe_name = REXCVAR_GET(debug_command_pipe);
+  if (pipe_name.empty() || command_pipe_) {
+    return;
+  }
+  // Lines run where the console runs them: on the UI thread.
+  ui::WindowedAppContext* context = &app_context();
+  command_pipe_ = std::make_unique<ui::DebugCommandPipe>();
+  if (!command_pipe_->Start(pipe_name, [context](std::function<void()> function) {
+        return context->CallInUIThread(std::move(function));
+      })) {
+    command_pipe_.reset();
   }
 }
 

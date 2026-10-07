@@ -51,6 +51,7 @@ struct PathConfig {
 namespace ui {
 class AchievementNotificationDialog;
 class ConsoleDialog;
+class DebugCommandPipe;
 class SettingsDialog;
 }  // namespace ui
 
@@ -279,6 +280,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void CloseQuickMenu();
   // Creates or destroys the debug overlay to match the debug_overlay cvar.
   void ApplyDebugOverlaySetting();
+  // Points the screenshot command at this app's presenter and serves the
+  // debug_command_pipe cvar's pipe when it's set. UI thread.
+  void SetupTestControl();
 
   // Stand up the ImGui overlay stack (drawer, F3/Backtick/F4 binds, dialogs)
   // independently of how the presenter/drawer were obtained. `presenter` may be
@@ -333,6 +337,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
+  // Test automation (--debug_command_pipe), null when off.
+  std::unique_ptr<ui::DebugCommandPipe> command_pipe_;
 };
 
 }  // namespace rex

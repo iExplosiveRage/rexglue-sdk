@@ -14,13 +14,35 @@
 #include <rex/ui/imgui_dialog.h>
 #include <imgui.h>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rex::ui {
+
+/// Outcome of one console line (see ExecuteConsoleLine).
+enum class ConsoleLineStatus { kOk, kUnknownCommand, kError };
+
+struct ConsoleLineResult {
+  ConsoleLineStatus status = ConsoleLineStatus::kOk;
+  // Detail for the caller: "name = value" for a read, what went wrong otherwise.
+  std::string message;
+};
+
+/// Receives the feedback lines a console line produces (what the console
+/// shows for it), already tagged "[<source>] ".
+using ConsoleFeedback = std::function<void(spdlog::level::level_enum level, std::string text)>;
+
+/// Runs one line the way the console's input box does: "help", a command and
+/// its arguments, "<cvar>" (read) or "<cvar> <value>" (set). `source` tags the
+/// feedback ("console", "pipe"). Call on the UI thread, where the console runs
+/// its commands.
+ConsoleLineResult ExecuteConsoleLine(std::string_view line, std::string_view source,
+                                     const ConsoleFeedback& feedback);
 
 class ConsoleDialog : public ImGuiDialog {
  public:
