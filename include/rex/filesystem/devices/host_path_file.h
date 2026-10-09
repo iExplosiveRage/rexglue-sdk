@@ -16,6 +16,7 @@
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/file.h>
+#include <rex/filesystem/file_overlay.h>
 
 namespace rex::filesystem {
 
@@ -36,6 +37,24 @@ class HostPathFile : public File {
 
  private:
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
+};
+
+// A host file served through a FileOverlay (read only).
+class HostPathOverlayFile : public File {
+ public:
+  HostPathOverlayFile(uint32_t file_access, HostPathEntry* entry,
+                      std::shared_ptr<FileOverlay> overlay);
+  ~HostPathOverlayFile() override;
+
+  void Destroy() override;
+
+  X_STATUS ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read) override;
+  X_STATUS WriteSync(std::span<const uint8_t> buffer, size_t byte_offset,
+                     size_t* out_bytes_written) override;
+  X_STATUS SetLength(size_t length) override;
+
+ private:
+  std::shared_ptr<FileOverlay> overlay_;
 };
 
 }  // namespace rex::filesystem

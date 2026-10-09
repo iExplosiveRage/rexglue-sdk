@@ -13,8 +13,11 @@
 
 #include <string>
 
+#include <memory>
+
 #include <rex/filesystem.h>
 #include <rex/filesystem/entry.h>
+#include <rex/filesystem/file_overlay.h>
 
 namespace rex::filesystem {
 
@@ -35,7 +38,9 @@ class HostPathEntry : public Entry {
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
 
-  bool can_map() const override { return true; }
+  // Files served through a FileOverlay can't be mapped (the bytes on disk
+  // aren't what the guest sees).
+  bool can_map() const override { return !overlay_; }
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
                                                    size_t length) override;
   void update() override;
@@ -53,6 +58,8 @@ class HostPathEntry : public Entry {
   X_STATUS RenameEntryInternal(const std::vector<std::string_view>& path_parts) override;
 
   std::filesystem::path host_path_;
+  // What the guest reads instead of the file (rex/filesystem/file_overlay.h).
+  std::shared_ptr<FileOverlay> overlay_;
 };
 
 }  // namespace rex::filesystem

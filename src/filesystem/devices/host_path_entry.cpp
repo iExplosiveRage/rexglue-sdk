@@ -45,7 +45,13 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
       entry->attributes_ |= kFileAttributeReadOnly;
     }
     entry->size_ = file_info.total_size;
-    entry->allocation_size_ = rex::round_up(file_info.total_size, device->bytes_per_sector());
+    entry->overlay_ = FindFileOverlay(full_path);
+    if (entry->overlay_) {
+      entry->size_ = entry->overlay_->size();
+      REXFS_INFO("HostPathEntry: {} is served through an overlay ({} bytes, {} on disk)",
+                 rex::path_to_utf8(full_path), entry->size_, file_info.total_size);
+    }
+    entry->allocation_size_ = rex::round_up(entry->size_, device->bytes_per_sector());
   }
   return entry;
 }
@@ -55,6 +61,15 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
       (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
     REXFS_ERROR("Attempting to open file for write access on read-only device");
     return X_STATUS_ACCESS_DENIED;
+  }
+  if (overlay_) {
+    if (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData)) {
+      REXFS_ERROR("Attempting to open {} for write access: it is served through an overlay",
+                  rex::path_to_utf8(host_path_));
+      return X_STATUS_ACCESS_DENIED;
+    }
+    *out_file = new HostPathOverlayFile(desired_access, this, overlay_);
+    return X_STATUS_SUCCESS;
   }
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(
       host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
@@ -68,11 +83,14 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
 
 std::unique_ptr<memory::MappedMemory> HostPathEntry::OpenMapped(memory::MappedMemory::Mode mode,
                                                                 size_t offset, size_t length) {
+  if (overlay_) {
+    return nullptr;
+  }
   return memory::MappedMemory::Open(host_path_, mode, offset, length);
 }
 
 bool HostPathEntry::Truncate() {
-  if (is_read_only() || (attributes_ & kFileAttributeDirectory)) {
+  if (is_read_only() || overlay_ || (attributes_ & kFileAttributeDirectory)) {
     return false;
   }
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(
@@ -157,8 +175,8 @@ void HostPathEntry::update() {
     return;
   }
   if (file_info.type == rex::filesystem::FileInfo::Type::kFile) {
-    size_ = file_info.total_size;
-    allocation_size_ = rex::round_up(file_info.total_size, device()->bytes_per_sector());
+    size_ = overlay_ ? overlay_->size() : file_info.total_size;
+    allocation_size_ = rex::round_up(size_, device()->bytes_per_sector());
   }
 }
 

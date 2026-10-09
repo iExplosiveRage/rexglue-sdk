@@ -259,6 +259,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
                                        const XCONTENT_AGGREGATE_DATA& data) {
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (access_blocked_) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
@@ -276,6 +279,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
 
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (access_blocked_) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
@@ -289,6 +295,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
                                      uint32_t& content_license) {
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (access_blocked_) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
@@ -306,6 +315,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
 
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (access_blocked_) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
@@ -351,6 +363,9 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
+  if (access_blocked_) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto package_path = ResolvePackagePath(xuid, data);
   std::filesystem::create_directories(package_path);
   if (std::filesystem::exists(package_path)) {
@@ -366,6 +381,9 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 
 X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto global_lock = global_critical_region_.Acquire();
+  if (access_blocked_) {
+    return X_ERROR_ACCESS_DENIED;
+  }
 
   if (IsContentOpen(data)) {
     // TODO(Gliniak): Get real error code for this case.
@@ -412,6 +430,9 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
   ContentPackage* package = nullptr;
   {
     auto global_lock = global_critical_region_.Acquire();
+    if (access_blocked_) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     auto it = FindOpenPackageByData(data);
     if (it != open_packages_.end()) {
       package = DetachPackage(it);
@@ -485,6 +506,25 @@ ContentPackage* ContentManager::DetachPackage(
   ContentPackage* package = it->second;
   open_packages_.erase(it);
   return package;
+}
+
+bool ContentManager::BlockContentAccess() {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!open_packages_.empty()) {
+    return false;
+  }
+  access_blocked_ = true;
+  return true;
+}
+
+void ContentManager::UnblockContentAccess() {
+  auto global_lock = global_critical_region_.Acquire();
+  access_blocked_ = false;
+}
+
+bool ContentManager::IsAnyContentOpen() {
+  auto global_lock = global_critical_region_.Acquire();
+  return !open_packages_.empty();
 }
 
 bool ContentManager::IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const {

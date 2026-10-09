@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -177,6 +178,16 @@ class ContentManager {
   // Returns the host filesystem path for an open content package, or empty.
   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
 
+  // Stops the guest from creating, opening or deleting content (for example
+  // after a save was replaced on disk, until the game restarts): returns false
+  // and changes nothing while content is open (the game is saving or loading
+  // right now). Any thread.
+  bool BlockContentAccess();
+  void UnblockContentAccess();
+  bool IsContentAccessBlocked() const { return access_blocked_; }
+  // Whether the guest has any content package mounted. Any thread.
+  bool IsAnyContentOpen();
+
   // Installs an STFS content package from an arbitrary host path.
   // Extracts the package into root_path_/0000000000000000/{title_id}/00000002/{filename}/
   // and writes a .header file for XAM enumeration.
@@ -203,6 +214,8 @@ class ContentManager {
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
       open_packages_;
+  // Set under global_critical_region_ (see BlockContentAccess).
+  std::atomic<bool> access_blocked_{false};
 };
 
 }  // namespace xam

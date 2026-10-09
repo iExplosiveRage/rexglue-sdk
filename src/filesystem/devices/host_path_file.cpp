@@ -63,4 +63,42 @@ X_STATUS HostPathFile::SetLength(size_t length) {
   }
 }
 
+HostPathOverlayFile::HostPathOverlayFile(uint32_t file_access, HostPathEntry* entry,
+                                         std::shared_ptr<FileOverlay> overlay)
+    : File(file_access, entry), overlay_(std::move(overlay)) {}
+
+HostPathOverlayFile::~HostPathOverlayFile() = default;
+
+void HostPathOverlayFile::Destroy() {
+  delete this;
+}
+
+X_STATUS HostPathOverlayFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+                                       size_t* out_bytes_read) {
+  if (!(file_access_ & (FileAccess::kGenericRead | FileAccess::kFileReadData))) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  size_t bytes_read = 0;
+  if (!overlay_->Read(byte_offset, buffer.data(), buffer.size(), &bytes_read)) {
+    return X_STATUS_END_OF_FILE;
+  }
+  if (out_bytes_read) {
+    *out_bytes_read = bytes_read;
+  }
+  return bytes_read || buffer.empty() ? X_STATUS_SUCCESS : X_STATUS_END_OF_FILE;
+}
+
+X_STATUS HostPathOverlayFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_offset,
+                                        size_t* out_bytes_written) {
+  (void)buffer;
+  (void)byte_offset;
+  (void)out_bytes_written;
+  return X_STATUS_ACCESS_DENIED;
+}
+
+X_STATUS HostPathOverlayFile::SetLength(size_t length) {
+  (void)length;
+  return X_STATUS_ACCESS_DENIED;
+}
+
 }  // namespace rex::filesystem
