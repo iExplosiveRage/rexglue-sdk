@@ -13,6 +13,7 @@
 #include <system_error>
 #include <thread>
 
+#include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging.h>
@@ -69,6 +70,8 @@ static constexpr uint32_t kDxgiFormatB8G8R8A8UNorm = 87;
 static constexpr uint32_t kDxgiFormatB8G8R8X8UNorm = 88;
 static constexpr uint32_t kDxgiFormatB8G8R8A8UNormSRGB = 91;
 static constexpr uint32_t kDxgiFormatB8G8R8X8UNormSRGB = 93;
+static constexpr uint32_t kDxgiFormatBC7UNorm = 98;
+static constexpr uint32_t kDxgiFormatBC7UNormSRGB = 99;
 
 #pragma pack(push, 1)
 struct DdsPixelFormat {
@@ -314,6 +317,28 @@ static void DecodeBC3AlphaBlock(const uint8_t* block, uint8_t alpha[16]) {
   }
 }
 
+// Runs body(begin, end) over the rows [0, count), split across a few threads
+// when the image is big (a 4096x4096 replacement decodes and mips about 8x
+// faster on 8 threads, which is what the frame waits for).
+template <typename Body>
+static void ParallelRows(uint32_t count, uint64_t pixels, Body&& body) {
+  const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
+  if (threads <= 1 || pixels < uint64_t(512) * 512 || count < threads * 4) {
+    body(0u, count);
+    return;
+  }
+  const uint32_t step = (count + threads - 1) / threads;
+  std::vector<std::thread> workers;
+  for (uint32_t begin = step; begin < count; begin += step) {
+    const uint32_t end = std::min(count, begin + step);
+    workers.emplace_back([&body, begin, end] { body(begin, end); });
+  }
+  body(0u, std::min(count, step));
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+}
+
 enum class DdsDecodeFormat {
   kRGBA8,
   kBGRA8,
@@ -321,7 +346,260 @@ enum class DdsDecodeFormat {
   kBC1,
   kBC2,
   kBC3,
+  kBC7,
 };
+
+// BC7 block decoder (D3D11 functional spec, 3.1 "BC7 Format").
+
+static constexpr uint8_t kBc7Partition2[64][16] = {
+    {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1}, {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1},
+    {0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1}, {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1},
+    {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1},
+    {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+    {0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1},
+    {0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1},
+    {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1},
+    {0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0}, {0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0},
+    {0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0}, {0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1},
+    {0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0}, {0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0},
+    {0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0}, {0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0},
+    {0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0}, {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+    {0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0}, {0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0},
+    {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1}, {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1},
+    {0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0}, {0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0},
+    {0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0}, {0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0},
+    {0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1}, {0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1},
+    {0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0}, {0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0},
+    {0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0}, {0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0},
+    {0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0}, {0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1},
+    {0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1}, {0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+    {0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}, {0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0}, {0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0},
+    {0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1},
+    {0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0}, {0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0},
+    {0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1}, {0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1},
+    {0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1}, {0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1},
+    {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+    {0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0}, {0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1},
+};
+
+static constexpr uint8_t kBc7Partition3[64][16] = {
+    {0, 0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 1, 2, 2, 2, 2}, {0, 0, 0, 1, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 2, 1},
+    {0, 0, 0, 0, 2, 0, 0, 1, 2, 2, 1, 1, 2, 2, 1, 1}, {0, 2, 2, 2, 0, 0, 2, 2, 0, 0, 1, 1, 0, 1, 1, 1},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2}, {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 2, 2},
+    {0, 0, 2, 2, 0, 0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1}, {0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2}, {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2},
+    {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2}, {0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2},
+    {0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 1, 2}, {0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2},
+    {0, 0, 1, 1, 0, 1, 1, 2, 1, 1, 2, 2, 1, 2, 2, 2}, {0, 0, 1, 1, 2, 0, 0, 1, 2, 2, 0, 0, 2, 2, 2, 0},
+    {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 2, 1, 1, 2, 2}, {0, 1, 1, 1, 0, 0, 1, 1, 2, 0, 0, 1, 2, 2, 0, 0},
+    {0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2}, {0, 0, 2, 2, 0, 0, 2, 2, 0, 0, 2, 2, 1, 1, 1, 1},
+    {0, 1, 1, 1, 0, 1, 1, 1, 0, 2, 2, 2, 0, 2, 2, 2}, {0, 0, 0, 1, 0, 0, 0, 1, 2, 2, 2, 1, 2, 2, 2, 1},
+    {0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 2, 0, 1, 2, 2}, {0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 1, 0, 2, 2, 1, 0},
+    {0, 1, 2, 2, 0, 1, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0}, {0, 0, 1, 2, 0, 0, 1, 2, 1, 1, 2, 2, 2, 2, 2, 2},
+    {0, 1, 1, 0, 1, 2, 2, 1, 1, 2, 2, 1, 0, 1, 1, 0}, {0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 2, 1, 1, 2, 2, 1},
+    {0, 0, 2, 2, 1, 1, 0, 2, 1, 1, 0, 2, 0, 0, 2, 2}, {0, 1, 1, 0, 0, 1, 1, 0, 2, 0, 0, 2, 2, 2, 2, 2},
+    {0, 0, 1, 1, 0, 1, 2, 2, 0, 1, 2, 2, 0, 0, 1, 1}, {0, 0, 0, 0, 2, 0, 0, 0, 2, 2, 1, 1, 2, 2, 2, 1},
+    {0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 2, 2, 2}, {0, 2, 2, 2, 0, 0, 2, 2, 0, 0, 1, 2, 0, 0, 1, 1},
+    {0, 0, 1, 1, 0, 0, 1, 2, 0, 0, 2, 2, 0, 2, 2, 2}, {0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0},
+    {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0}, {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0},
+    {0, 1, 2, 0, 2, 0, 1, 2, 1, 2, 0, 1, 0, 1, 2, 0}, {0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2, 0, 0, 1, 1},
+    {0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0, 1, 1}, {0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2},
+    {0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 2, 1}, {0, 0, 2, 2, 1, 1, 2, 2, 0, 0, 2, 2, 1, 1, 2, 2},
+    {0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1}, {0, 2, 2, 0, 1, 2, 2, 1, 0, 2, 2, 0, 1, 2, 2, 1},
+    {0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 1, 0, 1}, {0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1},
+    {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2}, {0, 2, 2, 2, 0, 1, 1, 1, 0, 2, 2, 2, 0, 1, 1, 1},
+    {0, 0, 0, 2, 1, 1, 1, 2, 0, 0, 0, 2, 1, 1, 1, 2}, {0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2},
+    {0, 2, 2, 2, 0, 1, 1, 1, 0, 1, 1, 1, 0, 2, 2, 2}, {0, 0, 0, 2, 1, 1, 1, 2, 1, 1, 1, 2, 0, 0, 0, 2},
+    {0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 2, 2}, {0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 1, 2},
+    {0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2}, {0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 2, 2},
+    {0, 0, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 0, 0, 2, 2}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2},
+    {0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1}, {0, 2, 2, 2, 1, 2, 2, 2, 0, 2, 2, 2, 1, 2, 2, 2},
+    {0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2}, {0, 1, 1, 1, 2, 0, 1, 1, 2, 2, 0, 1, 2, 2, 2, 0},
+};
+
+// Pixel whose index has one bit less: subset 1 of 2, subsets 1 and 2 of 3
+// (subset 0 always uses pixel 0).
+static constexpr uint8_t kBc7Anchor2[64] = {
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 2,  8,  2,  2, 8,
+    8,  15, 2,  8,  2,  2,  8,  8,  2,  2,  15, 15, 6,  8,  2,  8,  15, 15, 2,  8,  2, 2,
+    2,  15, 15, 6,  6,  2,  6,  8,  15, 15, 2,  2,  15, 15, 15, 15, 15, 2,  2,  15};
+static constexpr uint8_t kBc7Anchor3a[64] = {
+    3,  3,  15, 15, 8, 3,  15, 15, 8,  8,  6,  6,  6,  5,  3,  3,  3,  3,  8,  15, 3, 3,
+    6,  10, 5,  8,  8, 6,  8,  5,  15, 15, 8,  15, 3,  5,  6,  10, 8,  15, 15, 3,  15, 5,
+    15, 15, 15, 15, 3, 15, 5,  5,  5,  8,  5,  10, 5,  10, 8,  13, 15, 12, 3,  3};
+static constexpr uint8_t kBc7Anchor3b[64] = {
+    15, 8,  8,  3,  15, 15, 3,  8,  15, 15, 15, 15, 15, 15, 15, 8,  15, 8,  15, 3,  15, 8,
+    15, 8,  3,  15, 6,  10, 15, 15, 10, 8,  15, 3,  15, 10, 10, 8,  9,  10, 6,  15, 8,  15,
+    3,  6,  6,  8,  15, 3,  15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 3,  15, 15, 8};
+
+static constexpr uint8_t kBc7Weights2[4] = {0, 21, 43, 64};
+static constexpr uint8_t kBc7Weights3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+static constexpr uint8_t kBc7Weights4[16] = {0,  4,  9,  13, 17, 21, 26, 30,
+                                            34, 38, 43, 47, 51, 55, 60, 64};
+
+struct Bc7Bits {
+  uint64_t lo, hi;
+  uint32_t pos = 0;
+  uint32_t Read(uint32_t count) {
+    uint32_t value;
+    if (pos >= 64) {
+      value = uint32_t(hi >> (pos - 64));
+    } else if (pos + count <= 64) {
+      value = uint32_t(lo >> pos);
+    } else {
+      value = uint32_t((lo >> pos) | (hi << (64 - pos)));
+    }
+    pos += count;
+    return count >= 32 ? value : value & ((1u << count) - 1);
+  }
+};
+
+static uint8_t Bc7Interpolate(uint32_t e0, uint32_t e1, uint32_t index, uint32_t bits) {
+  const uint32_t w = bits == 2 ? kBc7Weights2[index] : bits == 3 ? kBc7Weights3[index]
+                                                                  : kBc7Weights4[index];
+  return uint8_t(((64 - w) * e0 + w * e1 + 32) >> 6);
+}
+
+// One 16-byte BC7 block -> 16 RGBA8 pixels (row-major in the 4x4 block).
+static void DecodeBC7Block(const uint8_t* block, uint8_t out[16][4]) {
+  Bc7Bits bits;
+  std::memcpy(&bits.lo, block, 8);
+  std::memcpy(&bits.hi, block + 8, 8);
+
+  uint32_t mode = 0;
+  while (mode < 8 && !bits.Read(1)) {
+    ++mode;
+  }
+  if (mode >= 8) {
+    // Reserved: transparent black.
+    std::memset(out, 0, 16 * 4);
+    return;
+  }
+
+  struct ModeInfo {
+    uint8_t subsets, partition_bits, rotation_bits, index_mode_bits, color_bits, alpha_bits,
+        endpoint_pbits, shared_pbits, index_bits, index2_bits;
+  };
+  static constexpr ModeInfo kModes[8] = {
+      {3, 4, 0, 0, 4, 0, 1, 0, 3, 0}, {2, 6, 0, 0, 6, 0, 0, 1, 3, 0},
+      {3, 6, 0, 0, 5, 0, 0, 0, 2, 0}, {2, 6, 0, 0, 7, 0, 1, 0, 2, 0},
+      {1, 0, 2, 1, 5, 6, 0, 0, 2, 3}, {1, 0, 2, 0, 7, 8, 0, 0, 2, 2},
+      {1, 0, 0, 0, 7, 7, 1, 0, 4, 0}, {2, 6, 0, 0, 5, 5, 1, 0, 2, 0},
+  };
+  const ModeInfo& m = kModes[mode];
+  const uint32_t partition = bits.Read(m.partition_bits);
+  const uint32_t rotation = bits.Read(m.rotation_bits);
+  const uint32_t index_mode = bits.Read(m.index_mode_bits);
+  const uint32_t endpoint_count = m.subsets * 2u;
+
+  uint32_t endpoints[6][4];
+  for (uint32_t c = 0; c < 3; ++c) {
+    for (uint32_t e = 0; e < endpoint_count; ++e) {
+      endpoints[e][c] = bits.Read(m.color_bits);
+    }
+  }
+  for (uint32_t e = 0; e < endpoint_count; ++e) {
+    endpoints[e][3] = m.alpha_bits ? bits.Read(m.alpha_bits) : 255;
+  }
+  uint32_t color_bits = m.color_bits, alpha_bits = m.alpha_bits;
+  if (m.endpoint_pbits || m.shared_pbits) {
+    uint32_t pbits[6];
+    if (m.endpoint_pbits) {
+      for (uint32_t e = 0; e < endpoint_count; ++e) {
+        pbits[e] = bits.Read(1);
+      }
+    } else {
+      for (uint32_t s = 0; s < m.subsets; ++s) {
+        pbits[s * 2] = pbits[s * 2 + 1] = bits.Read(1);
+      }
+    }
+    for (uint32_t e = 0; e < endpoint_count; ++e) {
+      for (uint32_t c = 0; c < 3; ++c) {
+        endpoints[e][c] = (endpoints[e][c] << 1) | pbits[e];
+      }
+      if (m.alpha_bits) {
+        endpoints[e][3] = (endpoints[e][3] << 1) | pbits[e];
+      }
+    }
+    ++color_bits;
+    if (m.alpha_bits) {
+      ++alpha_bits;
+    }
+  }
+  // Expand to 8 bits by replicating the top bits.
+  for (uint32_t e = 0; e < endpoint_count; ++e) {
+    for (uint32_t c = 0; c < 3; ++c) {
+      const uint32_t v = endpoints[e][c] << (8 - color_bits);
+      endpoints[e][c] = v | (v >> color_bits);
+    }
+    if (m.alpha_bits) {
+      const uint32_t v = endpoints[e][3] << (8 - alpha_bits);
+      endpoints[e][3] = v | (v >> alpha_bits);
+    }
+  }
+
+  auto subset_of = [&](uint32_t i) -> uint32_t {
+    return m.subsets == 2 ? kBc7Partition2[partition][i]
+           : m.subsets == 3 ? kBc7Partition3[partition][i]
+                            : 0;
+  };
+  auto is_anchor = [&](uint32_t i) -> bool {
+    if (i == 0) {
+      return true;
+    }
+    if (m.subsets == 2) {
+      return i == kBc7Anchor2[partition];
+    }
+    if (m.subsets == 3) {
+      return i == kBc7Anchor3a[partition] || i == kBc7Anchor3b[partition];
+    }
+    return false;
+  };
+
+  uint32_t index1[16], index2[16];
+  for (uint32_t i = 0; i < 16; ++i) {
+    index1[i] = bits.Read(is_anchor(i) ? m.index_bits - 1 : m.index_bits);
+  }
+  if (m.index2_bits) {
+    for (uint32_t i = 0; i < 16; ++i) {
+      index2[i] = bits.Read(i == 0 ? m.index2_bits - 1 : m.index2_bits);
+    }
+  }
+
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t s = subset_of(i);
+    const uint32_t* e0 = endpoints[s * 2];
+    const uint32_t* e1 = endpoints[s * 2 + 1];
+    uint8_t* p = out[i];
+    if (m.index2_bits) {
+      // Modes 4/5: colour and alpha have their own indices (swapped by the
+      // index mode in mode 4).
+      const bool swap = index_mode != 0;
+      const uint32_t ci = swap ? index2[i] : index1[i];
+      const uint32_t cb = swap ? m.index2_bits : m.index_bits;
+      const uint32_t ai = swap ? index1[i] : index2[i];
+      const uint32_t ab = swap ? m.index_bits : m.index2_bits;
+      for (uint32_t c = 0; c < 3; ++c) {
+        p[c] = Bc7Interpolate(e0[c], e1[c], ci, cb);
+      }
+      p[3] = Bc7Interpolate(e0[3], e1[3], ai, ab);
+    } else {
+      for (uint32_t c = 0; c < 4; ++c) {
+        p[c] = Bc7Interpolate(e0[c], e1[c], index1[i], m.index_bits);
+      }
+    }
+    switch (rotation) {
+      case 1: std::swap(p[0], p[3]); break;
+      case 2: std::swap(p[1], p[3]); break;
+      case 3: std::swap(p[2], p[3]); break;
+      default: break;
+    }
+  }
+}
 
 static bool DecodeBCToRGBA8(const uint8_t* blocks, size_t block_bytes, uint32_t width,
                             uint32_t height, DdsDecodeFormat format, std::vector<uint8_t>& rgba) {
@@ -336,10 +614,22 @@ static bool DecodeBCToRGBA8(const uint8_t* blocks, size_t block_bytes, uint32_t 
 
   rgba.assign(static_cast<size_t>(width) * height * 4, 0);
 
-  for (uint32_t by = 0; by < block_count_y; ++by) {
+  ParallelRows(block_count_y, uint64_t(width) * height, [&](uint32_t by_begin, uint32_t by_end) {
+  for (uint32_t by = by_begin; by < by_end; ++by) {
     for (uint32_t bx = 0; bx < block_count_x; ++bx) {
       const uint8_t* block =
           blocks + (static_cast<size_t>(by) * block_count_x + bx) * bytes_per_block;
+
+      if (format == DdsDecodeFormat::kBC7) {
+        uint8_t pixels[16][4];
+        DecodeBC7Block(block, pixels);
+        for (uint32_t py = 0; py < 4 && by * 4 + py < height; ++py) {
+          const uint32_t columns = std::min(4u, width - bx * 4);
+          std::memcpy(rgba.data() + ((static_cast<size_t>(by) * 4 + py) * width + bx * 4) * 4,
+                      pixels[py * 4], columns * 4);
+        }
+        continue;
+      }
 
       uint8_t colors[16][4]{};
       uint8_t alpha[16];
@@ -374,6 +664,7 @@ static bool DecodeBCToRGBA8(const uint8_t* blocks, size_t block_bytes, uint32_t 
       }
     }
   }
+  });
 
   return true;
 }
@@ -583,6 +874,11 @@ bool TextureReplacement::ReadDDS(const std::filesystem::path& path, TextureRepla
           case kDxgiFormatBC3UNorm:
           case kDxgiFormatBC3UNormSRGB:
             decode_format = DdsDecodeFormat::kBC3;
+            compressed = true;
+            break;
+          case kDxgiFormatBC7UNorm:
+          case kDxgiFormatBC7UNormSRGB:
+            decode_format = DdsDecodeFormat::kBC7;
             compressed = true;
             break;
           default:
@@ -900,7 +1196,9 @@ std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* p
     const uint32_t mip_width = std::max(source_width >> 1, uint32_t(1));
     const uint32_t mip_height = std::max(source_height >> 1, uint32_t(1));
     std::vector<uint8_t>& mip = mips.emplace_back(size_t(mip_width) * mip_height * 4);
-    for (uint32_t y = 0; y < mip_height; ++y) {
+    ParallelRows(mip_height, uint64_t(source_width) * source_height,
+                 [&](uint32_t y_begin, uint32_t y_end) {
+    for (uint32_t y = y_begin; y < y_end; ++y) {
       const uint32_t y0 = std::min(y * 2, source_height - 1);
       const uint32_t y1 = std::min(y * 2 + 1, source_height - 1);
       for (uint32_t x = 0; x < mip_width; ++x) {
@@ -928,6 +1226,7 @@ std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* p
         out[3] = uint8_t((alpha_sum + 2) / 4);
       }
     }
+    });
     source = mip.data();
     source_width = mip_width;
     source_height = mip_height;
@@ -990,6 +1289,15 @@ void TextureReplacement::MarkFailed(uint64_t content_hash) const {
 
 bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& width,
                                              uint32_t& height) const {
+  // The program's own replacements first, also without a texture pack.
+  if (auto image = FindTextureMemoryReplacement(content_hash)) {
+    width = image->width;
+    height = image->height;
+    return true;
+  }
+  if (!REXCVAR_GET(texture_replace_enabled)) {
+    return false;
+  }
   std::filesystem::path path;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -1169,6 +1477,24 @@ void TextureReplacement::PreloadWorker() const {
 // FindReplacement
 // ---------------------------------------------------------------------------
 const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t content_hash) const {
+  if (auto image = FindTextureMemoryReplacement(content_hash)) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = memory_cache_.find(content_hash);
+    if (it == memory_cache_.end()) {
+      TextureReplacementData data;
+      data.width = image->width;
+      data.height = image->height;
+      data.pixels = image->rgba;
+      data.mips = BuildMips(data.pixels.data(), data.width, data.height);
+      it = memory_cache_.emplace(content_hash, std::move(data)).first;
+      REXLOG_INFO("TextureReplacement: in-memory replacement {}x{} for {:016x}", image->width,
+                  image->height, content_hash);
+    }
+    return &it->second;
+  }
+  if (!REXCVAR_GET(texture_replace_enabled)) {
+    return nullptr;
+  }
   std::filesystem::path path;
   {
     std::unique_lock<std::mutex> lock(cache_mutex_);

@@ -36,6 +36,9 @@
 #include <rex/math.h>
 #include <rex/perf/frame_rate.h>
 
+// d3d12/command_processor.cpp: also logs the texture loads.
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -811,6 +814,19 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     if (uploaded_replacement) {
       stats.replacement_uploads.fetch_add(1, std::memory_order_relaxed);
     }
+    if (rex::perf::IsGpuProfiling()) {
+      rex::perf::GpuProfileStats& gpu_stats = rex::perf::GetGpuProfileStats();
+      gpu_stats.texture_loads.fetch_add(1, std::memory_order_relaxed);
+      gpu_stats.texture_load_bytes.fetch_add(texture.GetHostMemoryUsage(),
+                                             std::memory_order_relaxed);
+    }
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      REXGPU_INFO("TEXLOAD {:08X} {}x{} fmt {} scaled {} mips {} host {} KB{}",
+                  texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+                  uint32_t(texture_key.format), uint32_t(texture_key.scaled_resolve),
+                  uint32_t(texture_key.mip_max_level), texture.GetHostMemoryUsage() >> 10,
+                  uploaded_replacement ? " replacement" : "");
+    }
   }
 
   return true;
@@ -1228,7 +1244,9 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   bool has_replacement = false;
   uint64_t replacement_content_hash = 0;
 
-  if (replacement_ && REXCVAR_GET(texture_replace_enabled) &&
+  // (The program's in-memory replacements count too, with or without a pack.)
+  if (replacement_ &&
+      (REXCVAR_GET(texture_replace_enabled) || rex::graphics::HasTextureMemoryReplacements()) &&
       key.base_page != 0 && !key.scaled_resolve) {
     original_guest_layout = key.GetGuestLayout();
     const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;

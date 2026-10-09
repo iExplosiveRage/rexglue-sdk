@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -90,5 +91,28 @@ FsrAvailability GetFsrAvailability();
 // using it.
 void SetFsrProviderName(std::string_view name);
 std::string GetFsrProviderName();
+
+// Replacement images the program supplies from memory, used like the files of
+// a texture pack (any size, mipmapped when loaded) whether or not
+// texture_replace_enabled is on, and before the pack's files. `key` is the
+// texture pack key of the guest texture they replace (see
+// TiledTexture2DReplacementKey). A key keeps its image once set. Thread-safe.
+struct TextureMemoryReplacement {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::vector<uint8_t> rgba;  // R8G8B8A8, straight alpha, width * height * 4
+};
+void SetTextureMemoryReplacement(uint64_t key, uint32_t width, uint32_t height,
+                                 std::vector<uint8_t> rgba);
+std::shared_ptr<const TextureMemoryReplacement> FindTextureMemoryReplacement(uint64_t key);
+bool HasTextureMemoryReplacements();
+
+// The texture pack key of a 2D texture with one level, tiled as the GPU reads
+// it, whose blocks (4x4-texel blocks of `bytes_per_block` - 8 or 16 - or
+// single texels of 1, 2, 4 or 8 bytes with `block_texels` 1) are `blocks`,
+// row by row, each as the guest stores it: XXH3 of the tiled base level with
+// the padding taken as zero, like the texture cache (and the files' names).
+uint64_t TiledTexture2DReplacementKey(const uint8_t* blocks, uint32_t width, uint32_t height,
+                                      uint32_t bytes_per_block, uint32_t block_texels = 4);
 
 }  // namespace rex::graphics

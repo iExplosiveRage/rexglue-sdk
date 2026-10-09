@@ -166,6 +166,9 @@ class TextureReplacement {
   // added; the least recently used ones are dropped past texture_replace_ram_mb
   // (TrimPixelCache).
   mutable std::unordered_map<uint64_t, TextureReplacementData> pixel_cache_;
+  // The program's in-memory replacements (SetTextureMemoryReplacement), with
+  // their mips, once asked for. Never dropped (their keys keep their images).
+  mutable std::unordered_map<uint64_t, TextureReplacementData> memory_cache_;
   // Per cached texture: its size and when it was last asked for.
   struct PixelCacheUse {
     uint64_t bytes = 0;
