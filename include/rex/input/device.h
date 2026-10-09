@@ -28,6 +28,9 @@ struct DeviceInfo {
   std::string name;
   std::string guid;
   uint8_t subtype = 0x01;  // XINPUT_DEVSUBTYPE_*
+  // SDL_GamepadType of a real controller (3 Xbox One, 6 PS5, 7 Switch Pro...), 0 when
+  // unknown or synthetic. Lets the game show the controller's own button glyphs.
+  uint8_t gamepad_type = 0;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
 };
 

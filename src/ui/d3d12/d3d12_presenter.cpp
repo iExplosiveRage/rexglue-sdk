@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <memory>
@@ -19,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -342,6 +344,16 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   return true;
 }
 
+bool D3D12Presenter::RequestPresentedFrameCapture(
+    std::function<void(std::shared_ptr<RawImage> image)> callback) {
+  if (!callback) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(presented_capture_mutex_);
+  presented_capture_callbacks_.push_back(std::move(callback));
+  return true;
+}
+
 Presenter::SurfacePaintConnectResult
 D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_surface,
                                                                 uint32_t new_surface_width,
@@ -563,6 +575,33 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   swap_chain_width = 0;
 }
 
+void D3D12Presenter::ProfilePaintSlotCompleted(size_t slot) {
+  if (slot >= profile_slot_pending_.size() || !profile_slot_pending_[slot]) {
+    return;
+  }
+  profile_slot_pending_[slot] = 0;
+  rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+  if (!profile_readback_mapping_ || !stats.enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t* ticks = profile_readback_mapping_ + slot * 3;
+  if (ticks[1] < ticks[0] || ticks[2] < ticks[1]) {
+    return;
+  }
+  const uint64_t guest_ns = uint64_t(double(ticks[1] - ticks[0]) * profile_ns_per_tick_);
+  const uint64_t ui_ns = uint64_t(double(ticks[2] - ticks[1]) * profile_ns_per_tick_);
+  stats.pass_ns[size_t(rex::perf::GpuPass::kPresenterGuest)].fetch_add(guest_ns,
+                                                                       std::memory_order_relaxed);
+  stats.pass_count[size_t(rex::perf::GpuPass::kPresenterGuest)].fetch_add(
+      1, std::memory_order_relaxed);
+  stats.pass_ns[size_t(rex::perf::GpuPass::kPresenterUi)].fetch_add(ui_ns,
+                                                                    std::memory_order_relaxed);
+  stats.pass_count[size_t(rex::perf::GpuPass::kPresenterUi)].fetch_add(1,
+                                                                       std::memory_order_relaxed);
+  stats.paint_ns.fetch_add(guest_ns + ui_ns, std::memory_order_relaxed);
+  stats.paints.fetch_add(1, std::memory_order_relaxed);
+}
+
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
@@ -579,6 +618,43 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   command_list->Reset(command_allocator, nullptr);
 
   ID3D12Device* device = provider_.GetDevice();
+
+  // gpu_profile: the previous paint with this command allocator is complete.
+  const size_t profile_slot = size_t(current_paint_submission % command_allocator_count);
+  ProfilePaintSlotCompleted(profile_slot);
+  bool profile_paint = false;
+  if (rex::perf::IsGpuProfiling() && !profile_failed_) {
+    if (!profile_query_heap_) {
+      UINT64 frequency = 0;
+      D3D12_QUERY_HEAP_DESC heap_desc = {};
+      heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+      heap_desc.Count = UINT(3 * command_allocator_count);
+      D3D12_RESOURCE_DESC buffer_desc;
+      util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * heap_desc.Count,
+                                   D3D12_RESOURCE_FLAG_NONE);
+      void* mapping = nullptr;
+      D3D12_RANGE read_range = {0, sizeof(uint64_t) * heap_desc.Count};
+      if (FAILED(provider_.GetDirectQueue()->GetTimestampFrequency(&frequency)) || !frequency ||
+          FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&profile_query_heap_))) ||
+          FAILED(device->CreateCommittedResource(
+              &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&profile_readback_))) ||
+          FAILED(profile_readback_->Map(0, &read_range, &mapping))) {
+        profile_query_heap_.Reset();
+        profile_readback_.Reset();
+        profile_failed_ = true;
+      } else {
+        profile_ns_per_tick_ = 1.0e9 / double(frequency);
+        profile_readback_mapping_ = static_cast<const uint64_t*>(mapping);
+        profile_slot_pending_.assign(command_allocator_count, 0);
+      }
+    }
+    profile_paint = profile_query_heap_ && profile_slot < profile_slot_pending_.size();
+  }
+  if (profile_paint) {
+    command_list->EndQuery(profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(profile_slot * 3));
+  }
 
   // Obtain the RTV heap and the back buffer.
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
@@ -1140,6 +1216,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     back_buffer_clear_needed = false;
   }
 
+  if (profile_paint) {
+    command_list->EndQuery(profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(profile_slot * 3 + 1));
+  }
+
   if (execute_ui_drawers) {
     // Draw the UI.
     if (!back_buffer_bound) {
@@ -1153,6 +1234,31 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
+  // RequestPresentedFrameCapture: copy the finished frame (with the UI) to a
+  // readback buffer, read once this paint has completed on the GPU.
+  std::vector<std::function<void(std::shared_ptr<RawImage> image)>> captures;
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT capture_footprint = {};
+  UINT64 capture_size = 0;
+  if (execute_ui_drawers) {
+    std::lock_guard<std::mutex> lock(presented_capture_mutex_);
+    captures.swap(presented_capture_callbacks_);
+  }
+  if (!captures.empty()) {
+    D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
+    device->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &capture_footprint, nullptr, nullptr,
+                                  &capture_size);
+    D3D12_RESOURCE_DESC buffer_desc;
+    util::FillBufferResourceDesc(buffer_desc, capture_size, D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesReadback,
+                                               D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&capture_buffer)))) {
+      REXLOG_ERROR("D3D12Presenter: Failed to create the presented frame capture buffer");
+      capture_buffer.Reset();
+    }
+  }
+
   // End drawing to the back buffer.
   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1161,7 +1267,31 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   barrier_rtv_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  if (capture_buffer) {
+    barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+    D3D12_TEXTURE_COPY_LOCATION capture_dest;
+    capture_dest.pResource = capture_buffer.Get();
+    capture_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    capture_dest.PlacedFootprint = capture_footprint;
+    D3D12_TEXTURE_COPY_LOCATION capture_source;
+    capture_source.pResource = back_buffer;
+    capture_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    capture_source.SubresourceIndex = 0;
+    command_list->CopyTextureRegion(&capture_dest, 0, 0, 0, &capture_source, nullptr);
+    barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  }
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+
+  if (profile_paint) {
+    command_list->EndQuery(profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(profile_slot * 3 + 2));
+    command_list->ResolveQueryData(profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                   UINT(profile_slot * 3), 3, profile_readback_.Get(),
+                                   sizeof(uint64_t) * profile_slot * 3);
+    profile_slot_pending_[profile_slot] = 1;
+  }
 
   // Execute and present.
   command_list->Close();
@@ -1170,7 +1300,40 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   if (execute_ui_drawers) {
     ui_submission_tracker_.NextSubmission();
   }
+  const UINT64 painted_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
   paint_context_.paint_submission_tracker.NextSubmission();
+  if (!captures.empty()) {
+    std::shared_ptr<RawImage> image;
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {SIZE_T(capture_footprint.Offset), SIZE_T(capture_size)};
+    if (capture_buffer &&
+        paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(painted_submission) &&
+        SUCCEEDED(capture_buffer->Map(0, &read_range, &mapping))) {
+      image = std::make_shared<RawImage>();
+      image->width = capture_footprint.Footprint.Width;
+      image->height = capture_footprint.Footprint.Height;
+      image->stride = sizeof(uint32_t) * image->width;
+      image->data.resize(image->stride * image->height);
+      for (uint32_t y = 0; y < image->height; ++y) {
+        const uint8_t* source = reinterpret_cast<const uint8_t*>(mapping) +
+                                capture_footprint.Offset +
+                                size_t(capture_footprint.Footprint.RowPitch) * y;
+        uint8_t* dest = image->data.data() + image->stride * y;
+        // B8G8R8A8 -> R8 G8 B8 X8.
+        for (uint32_t x = 0; x < image->width; ++x) {
+          dest[x * 4 + 0] = source[x * 4 + 2];
+          dest[x * 4 + 1] = source[x * 4 + 1];
+          dest[x * 4 + 2] = source[x * 4 + 0];
+          dest[x * 4 + 3] = 255;
+        }
+      }
+      D3D12_RANGE written_range = {0, 0};
+      capture_buffer->Unmap(0, &written_range);
+    }
+    for (auto& capture : captures) {
+      capture(image);
+    }
+  }
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
@@ -1179,9 +1342,20 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  const bool profile_present = rex::perf::IsGpuProfiling();
+  const auto present_start = profile_present ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point();
   HRESULT present_result = paint_context_.swap_chain->Present(
       0, DXGI_PRESENT_RESTART |
              (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  if (profile_present) {
+    rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+    stats.present_calls.fetch_add(1, std::memory_order_relaxed);
+    stats.present_cpu_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - present_start)
+                                                .count()),
+                                   std::memory_order_relaxed);
+  }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

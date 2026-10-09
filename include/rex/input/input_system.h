@@ -80,6 +80,10 @@ class InputSystem : public system::IInputSystem {
   std::bitset<kMaxGuestUsers> GetConnectedUsers() const { return connected_users_; }
   /// Guest user whose device most recently produced a button press.
   uint32_t GetLastUsedUser() const { return last_used_user_; }
+  /// SDL_GamepadType (DeviceInfo::gamepad_type) of the controller `user_index` is
+  /// using - the one most recently in the player's hands - or 0 when that is
+  /// unknown, the keyboard or no controller. Any thread.
+  uint8_t GetGamepadType(uint32_t user_index);
 
  private:
   using JoystickValue = std::pair<uint16_t, uint16_t>;

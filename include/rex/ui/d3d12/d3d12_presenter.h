@@ -12,8 +12,11 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -86,6 +89,8 @@ class D3D12Presenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool RequestPresentedFrameCapture(
+      std::function<void(std::shared_ptr<RawImage> image)> callback) override;
 
   void AwaitUISubmissionCompletionFromUIThread(UINT64 submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -311,6 +316,20 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // RequestPresentedFrameCapture: callbacks waiting for the next painted frame.
+  std::mutex presented_capture_mutex_;
+  std::vector<std::function<void(std::shared_ptr<RawImage> image)>> presented_capture_callbacks_;
+
+  // gpu_profile: timestamps of each paint (start, after the guest output,
+  // end), 3 per command allocator slot; read when the slot is reused.
+  void ProfilePaintSlotCompleted(size_t slot);
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> profile_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> profile_readback_;
+  const uint64_t* profile_readback_mapping_ = nullptr;
+  double profile_ns_per_tick_ = 0.0;
+  bool profile_failed_ = false;
+  std::vector<uint8_t> profile_slot_pending_;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

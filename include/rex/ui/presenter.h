@@ -362,6 +362,15 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // Captures the next frame shown on the surface - the guest output with the
+  // overlays drawn over it, at the surface's size - and calls `callback` with
+  // it (R8 G8 B8 X8) on the UI thread once the frame was painted. Returns
+  // false (and never calls back) when the presenter can't do that.
+  virtual bool RequestPresentedFrameCapture(
+      std::function<void(std::shared_ptr<RawImage> image)> callback) {
+    (void)callback;
+    return false;
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }

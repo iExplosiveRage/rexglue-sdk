@@ -11,6 +11,7 @@
 
 #include <rex/rex_app.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
@@ -143,6 +144,85 @@ namespace rex {
 
 namespace {
 
+// screenshot_ui <path.png>: like screenshot, but the next frame shown in the
+// window - the game with the overlays (menus, panels) drawn over it - at the
+// window's size. The window has to be painting (not minimized).
+void ScreenshotUiCommand(std::string_view args) {
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  while (!args.empty() && (args.front() == ' ' || args.front() == '\t')) {
+    args.remove_prefix(1);
+  }
+  while (!args.empty() && (args.back() == ' ' || args.back() == '\t')) {
+    args.remove_suffix(1);
+  }
+  if (args.size() >= 2 && args.front() == '"' && args.back() == '"') {
+    args = args.substr(1, args.size() - 2);
+  }
+  if (args.empty()) {
+    REXLOG_WARN("screenshot_ui: usage: screenshot_ui <path.png>");
+    done(false, "usage: screenshot_ui <path.png>");
+    return;
+  }
+  std::string path_text(args);
+  ui::Presenter* presenter = g_screenshot_presenter ? g_screenshot_presenter() : nullptr;
+  // Answered once: by the capture, or after a few seconds without a painted
+  // frame.
+  struct Pending {
+    std::atomic<bool> answered{false};
+    ui::CommandCompletion done;
+  };
+  auto pending = std::make_shared<Pending>();
+  pending->done = std::move(done);
+  auto answer = [pending](bool ok, std::string message) {
+    if (!pending->answered.exchange(true)) {
+      pending->done(ok, std::move(message));
+    }
+  };
+  std::filesystem::path path(std::u8string(path_text.begin(), path_text.end()));
+  const bool requested =
+      presenter &&
+      presenter->RequestPresentedFrameCapture(
+          [answer, path, path_text](std::shared_ptr<ui::RawImage> image) {
+            if (!image) {
+              REXLOG_WARN("screenshot_ui: the frame couldn't be read ({})", path_text);
+              answer(false, "capture failed");
+              return;
+            }
+            std::thread([image, path, path_text, answer]() {
+              std::string error;
+              if (!ui::WriteImagePng(*image, path, &error)) {
+                REXLOG_WARN("screenshot_ui: could not save {}: {}", path_text, error);
+                answer(false, error);
+                return;
+              }
+              REXLOG_INFO("screenshot_ui: saved {} ({}x{})", path_text, image->width,
+                          image->height);
+              answer(true, fmt::format("{}x{}", image->width, image->height));
+            }).detach();
+          });
+  if (!requested) {
+    REXLOG_WARN("screenshot_ui: not supported by this renderer ({})", path_text);
+    answer(false, "not supported");
+    return;
+  }
+  std::thread([answer]() {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    answer(false, "no frame painted (minimized?)");
+  }).detach();
+}
+
+}  // namespace
+
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND_ARGS(screenshot_ui, rex::ScreenshotUiCommand, "Debug",
+                            "Save the next frame shown in the window, with the overlays, as "
+                            "PNG: <path.png>");
+
+namespace rex {
+
+namespace {
+
 // perf_report [seconds]: measures the game for that long (default 10) and logs
 // the average guest frame rate, frame time percentiles and the texture cache
 // activity per second. Test automation: a debug command pipe acknowledges the
@@ -221,6 +301,119 @@ void PerfReportCommand(std::string_view args) {
 
 REXCVAR_DEFINE_COMMAND_ARGS(perf_report, rex::PerfReportCommand, "Debug",
                             "Measure the frame rate and texture cache activity: [seconds]");
+
+namespace rex {
+
+namespace {
+
+// gpu_profile [seconds]: GPU time per part of a frame from timestamp queries
+// (D3D12), plus the command processor's waits for the GPU. Values are averages
+// per guest frame in milliseconds.
+void GpuProfileCommand(std::string_view args) {
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  double seconds = 10.0;
+  {
+    std::string text(args);
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end != text.c_str() && value > 0.0) {
+      seconds = std::min(value, 600.0);
+    }
+  }
+  std::thread([seconds, done = std::move(done)]() {
+    using clock = std::chrono::steady_clock;
+    perf::GpuProfileStats& stats = perf::GetGpuProfileStats();
+    constexpr size_t kPasses = size_t(perf::GpuPass::kCount);
+    struct Snapshot {
+      uint64_t pass_ns[kPasses], pass_count[kPasses];
+      uint64_t submission_ns, submissions, unprofiled, paint_ns, paints, gap_ns, fence_waits,
+          fence_wait_ns, occlusion_queries, draws, resolves, clears, upload_batches, upload_bytes,
+          texture_loads, texture_load_bytes, cp_submissions, present_calls,
+          present_cpu_ns, swaps;
+    };
+    auto snap = [&stats]() {
+      Snapshot s;
+      for (size_t i = 0; i < kPasses; ++i) {
+        s.pass_ns[i] = stats.pass_ns[i].load();
+        s.pass_count[i] = stats.pass_count[i].load();
+      }
+      s.submission_ns = stats.submission_ns.load();
+      s.submissions = stats.submissions.load();
+      s.unprofiled = stats.submissions_unprofiled.load();
+      s.paint_ns = stats.paint_ns.load();
+      s.paints = stats.paints.load();
+      s.gap_ns = stats.gap_ns.load();
+      s.fence_waits = stats.fence_waits.load();
+      s.fence_wait_ns = stats.fence_wait_ns.load();
+      s.occlusion_queries = stats.occlusion_queries.load();
+      s.draws = stats.draws.load();
+      s.resolves = stats.resolves.load();
+      s.clears = stats.clears_in_place.load();
+      s.upload_batches = stats.memory_upload_batches.load();
+      s.upload_bytes = stats.memory_upload_bytes.load();
+      s.texture_loads = stats.texture_loads.load();
+      s.texture_load_bytes = stats.texture_load_bytes.load();
+      s.cp_submissions = stats.cp_submissions.load();
+      s.present_calls = stats.present_calls.load();
+      s.present_cpu_ns = stats.present_cpu_ns.load();
+      s.swaps = perf::GetGuestSwapCount();
+      return s;
+    };
+    stats.enabled.store(true);
+    // Results arrive a few frames late - let the pipeline fill first.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const Snapshot before = snap();
+    const auto start = clock::now();
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    const Snapshot after = snap();
+    const double elapsed = std::chrono::duration<double>(clock::now() - start).count();
+    stats.enabled.store(false);
+    const double frames = double(std::max<uint64_t>(after.swaps - before.swaps, 1));
+    auto ms = [frames](uint64_t a, uint64_t b) { return double(b - a) * 1.0e-6 / frames; };
+    std::string parts;
+    double total = 0.0;
+    for (size_t i = 0; i < kPasses; ++i) {
+      const double value = ms(before.pass_ns[i], after.pass_ns[i]);
+      total += value;
+      if (after.pass_count[i] == before.pass_count[i]) {
+        continue;
+      }
+      parts += fmt::format(" {} {:.3f}", perf::GetGpuPassName(perf::GpuPass(i)), value);
+    }
+    const double busy =
+        ms(before.submission_ns, after.submission_ns) + ms(before.paint_ns, after.paint_ns);
+    const std::string summary = fmt::format(
+        "fps {:.1f} frame {:.2f} ms | gpu ms/frame:{} | sum {:.3f} busy {:.3f} gaps {:.3f} | "
+        "per frame: submissions {:.1f} (unprofiled {:.2f}) paints {:.2f} draws {:.0f} resolves "
+        "{:.1f} clears_in_place {:.1f} occlusion {:.1f} uploads {:.1f} ({:.2f} MB) texture loads {:.1f} ({:.1f} MB) | cpu: fence waits {:.2f} ({:.3f} ms) present {:.3f} ms",
+        frames / elapsed, elapsed * 1000.0 / frames, parts, total, busy,
+        ms(before.gap_ns, after.gap_ns), double(after.cp_submissions - before.cp_submissions) / frames,
+        double(after.unprofiled - before.unprofiled) / frames,
+        double(after.paints - before.paints) / frames, double(after.draws - before.draws) / frames,
+        double(after.resolves - before.resolves) / frames,
+        double(after.clears - before.clears) / frames,
+        double(after.occlusion_queries - before.occlusion_queries) / frames,
+        double(after.upload_batches - before.upload_batches) / frames,
+        double(after.upload_bytes - before.upload_bytes) / frames / 1048576.0,
+        double(after.texture_loads - before.texture_loads) / frames,
+        double(after.texture_load_bytes - before.texture_load_bytes) / frames / 1048576.0,
+        double(after.fence_waits - before.fence_waits) / frames,
+        ms(before.fence_wait_ns, after.fence_wait_ns),
+        after.present_calls > before.present_calls
+            ? double(after.present_cpu_ns - before.present_cpu_ns) * 1.0e-6 /
+                  double(after.present_calls - before.present_calls)
+            : 0.0);
+    REXLOG_INFO("gpu_profile: {}", summary);
+    done(true, summary);
+  }).detach();
+}
+
+}  // namespace
+
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND_ARGS(gpu_profile, rex::GpuProfileCommand, "Debug",
+                            "Measure the GPU time of each part of a frame: [seconds]");
 
 namespace rex {
 

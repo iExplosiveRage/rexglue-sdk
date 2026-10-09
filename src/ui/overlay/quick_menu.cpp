@@ -55,6 +55,74 @@ void DrawText(ImDrawList* draw_list, float size, ImVec2 position, ImU32 color,
   overlay_text::Draw(draw_list, size, position, color, text, wrap_width);
 }
 
+std::atomic<int> g_button_glyphs{int(ButtonGlyphs::kXbox)};
+
+// Face buttons by position (Xbox A, B, X, Y).
+enum class Face { kBottom, kRight, kLeft, kTop };
+
+// What the glyph of `face` is called in the hints' text.
+const char* FaceName(Face face) {
+  static constexpr const char* kNames[3][4] = {{"A", "B", "X", "Y"},
+                                               {"Cross", "Circle", "Square", "Triangle"},
+                                               {"B", "A", "Y", "X"}};
+  return kNames[g_button_glyphs.load(std::memory_order_relaxed)][int(face)];
+}
+
+// LB or RB as the controller calls it.
+const char* ShoulderName(bool right) {
+  static constexpr const char* kNames[3][2] = {{"LB", "RB"}, {"L1", "R1"}, {"L", "R"}};
+  return kNames[g_button_glyphs.load(std::memory_order_relaxed)][right ? 1 : 0];
+}
+
+// A face button's glyph: Xbox's colored letters, PlayStation's symbols,
+// Nintendo's letters on a dark button.
+void DrawFaceGlyph(ImDrawList* draw_list, ImVec2 center, float radius, Face face, float alpha) {
+  auto color = [alpha](int r, int g, int b) { return IM_COL32(r, g, b, int(255.0f * alpha)); };
+  const auto glyphs = ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed));
+  if (glyphs == ButtonGlyphs::kPlayStation) {
+    draw_list->AddCircleFilled(center, radius, color(34, 38, 46), 32);
+    draw_list->AddCircle(center, radius - 0.75f, color(92, 100, 114), 32, 1.5f);
+    const float r = radius * 0.46f, thickness = std::max(1.5f, radius * 0.15f);
+    switch (face) {
+      case Face::kBottom:
+        draw_list->AddLine(ImVec2(center.x - r, center.y - r), ImVec2(center.x + r, center.y + r),
+                           color(124, 178, 236), thickness);
+        draw_list->AddLine(ImVec2(center.x - r, center.y + r), ImVec2(center.x + r, center.y - r),
+                           color(124, 178, 236), thickness);
+        break;
+      case Face::kRight:
+        draw_list->AddCircle(center, r * 1.05f, color(238, 98, 108), 24, thickness);
+        break;
+      case Face::kLeft:
+        draw_list->AddRect(ImVec2(center.x - r * 0.9f, center.y - r * 0.9f),
+                           ImVec2(center.x + r * 0.9f, center.y + r * 0.9f), color(228, 138, 206),
+                           0.0f, 0, thickness);
+        break;
+      case Face::kTop:
+        draw_list->AddTriangle(ImVec2(center.x, center.y - r * 1.05f),
+                               ImVec2(center.x + r * 1.05f, center.y + r * 0.75f),
+                               ImVec2(center.x - r * 1.05f, center.y + r * 0.75f),
+                               color(76, 208, 168), thickness);
+        break;
+    }
+    return;
+  }
+  const char* letter = FaceName(face);
+  if (glyphs == ButtonGlyphs::kNintendo) {
+    draw_list->AddCircleFilled(center, radius, color(58, 60, 66), 32);
+    draw_list->AddCircle(center, radius - 0.75f, color(116, 120, 128), 32, 1.5f);
+  } else {
+    static constexpr int kColors[4][3] = {
+        {22, 150, 62}, {206, 44, 44}, {32, 108, 214}, {222, 168, 18}};
+    const int* c = kColors[int(face)];
+    draw_list->AddCircleFilled(center, radius, color(c[0], c[1], c[2]), 32);
+  }
+  const float letter_size = radius * 1.27f;
+  const ImVec2 extent = TextSize(letter_size, letter);
+  DrawText(draw_list, letter_size, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f),
+           color(255, 255, 255), letter);
+}
+
 // Colors faded in with the menu.
 struct Palette {
   float alpha = 1.0f;
@@ -162,6 +230,14 @@ std::atomic<int> open_menus{0};
 QuickMenuDialog* capturing_menu = nullptr;
 
 }  // namespace
+
+void SetButtonGlyphs(ButtonGlyphs glyphs) {
+  g_button_glyphs.store(int(glyphs), std::memory_order_relaxed);
+}
+
+ButtonGlyphs GetButtonGlyphs() {
+  return ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed));
+}
 
 struct QuickMenuDialog::SharedPad {
   PadState state;
@@ -296,7 +372,7 @@ void QuickMenuDialog::StopCapture() {
 }
 
 bool QuickMenuDialog::IsShown(const QuickMenuItem& item) const {
-  if (!rex::cvar::GetFlagInfo(item.cvar)) {
+  if (item.kind != QuickMenuItem::Kind::kAction && !rex::cvar::GetFlagInfo(item.cvar)) {
     return false;
   }
   if (item.kind == QuickMenuItem::Kind::kChoice && AllowedChoices(item).empty()) {
@@ -374,7 +450,63 @@ void QuickMenuDialog::Change(const QuickMenuItem& item, int direction) {
         StartCapture(item);
       }
       break;
+    case QuickMenuItem::Kind::kAction: {
+      const QuickMenuSection& section = config_.sections[section_];
+      if (section.items.empty() || &item < &section.items.front() ||
+          &item > &section.items.back()) {
+        break;
+      }
+      const size_t index = size_t(&item - &section.items.front());
+      std::string value;
+      if (item.list) {
+        if (index >= lists_.size() || lists_[index].empty()) {
+          break;
+        }
+        const size_t count = lists_[index].size();
+        size_t& pick = list_picks_[index];
+        pick = std::min(pick, count - 1);
+        if (direction) {
+          pick = size_t(std::clamp(int(pick) + direction, 0, int(count) - 1));
+          break;
+        }
+        value = lists_[index][pick].first;
+      } else if (direction) {
+        break;
+      }
+      if (item.action && callbacks_.defer) {
+        callbacks_.defer([action = item.action, value]() { action(value); });
+        // The lists may change (a new file): read again on the next paint,
+        // which comes after the deferred action.
+        lists_stale_ = true;
+      }
+    } break;
   }
+}
+
+void QuickMenuDialog::RefreshLists() {
+  lists_stale_ = false;
+  const QuickMenuSection& section = config_.sections[section_];
+  std::vector<std::vector<std::pair<std::string, std::string>>> lists(section.items.size());
+  std::vector<size_t> picks(section.items.size(), 0);
+  for (size_t i = 0; i < section.items.size(); ++i) {
+    const QuickMenuItem& item = section.items[i];
+    if (item.kind != QuickMenuItem::Kind::kAction || !item.list) {
+      continue;
+    }
+    lists[i] = item.list();
+    // Keep the picked entry when it's still there.
+    if (i < lists_.size() && i < list_picks_.size() && list_picks_[i] < lists_[i].size()) {
+      const std::string& picked = lists_[i][list_picks_[i]].first;
+      for (size_t j = 0; j < lists[i].size(); ++j) {
+        if (lists[i][j].first == picked) {
+          picks[i] = j;
+          break;
+        }
+      }
+    }
+  }
+  lists_ = std::move(lists);
+  list_picks_ = std::move(picks);
 }
 
 void QuickMenuDialog::Set(const QuickMenuItem& item, const std::string& value) {
@@ -595,10 +727,14 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   const int section_count = int(config_.sections.size());
   if (section_step) {
     section_ = size_t((int(section_) + section_step + section_count) % section_count);
+    lists_stale_ = true;
     std::vector<size_t> shown = ShownItems(config_.sections[section_]);
     selected_item_ = shown.empty() ? 0 : shown.front();
   }
   section_ = std::min(section_, config_.sections.size() - 1);
+  if (lists_stale_ || lists_.size() != config_.sections[section_].items.size()) {
+    RefreshLists();
+  }
   const QuickMenuSection& section = config_.sections[section_];
   const std::vector<size_t> rows = ShownItems(section);
   if (!rows.empty() && std::find(rows.begin(), rows.end(), selected_item_) == rows.end()) {
@@ -740,7 +876,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
                color(225, 230, 238), text);
       return chip_max.x;
     };
-    float x = draw_chip(content_left, "LB") + 18.0f * u;
+    float x = draw_chip(content_left, ShoulderName(false)) + 18.0f * u;
     for (int i = 0; i < section_count; ++i) {
       const std::string& title = config_.sections[size_t(i)].title;
       const ImVec2 text_size = TextSize(size, title);
@@ -755,12 +891,13 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       }
       if (row_clicked && ImGui::IsMouseHoveringRect(tab_min, tab_max) && !active) {
         section_ = size_t(i);
+        lists_stale_ = true;
         std::vector<size_t> shown = ShownItems(config_.sections[section_]);
         selected_item_ = shown.empty() ? 0 : shown.front();
       }
       x += text_size.x + 28.0f * u;
     }
-    draw_chip(x - 10.0f * u, "RB");
+    draw_chip(x - 10.0f * u, ShoulderName(true));
   }
   y += kTabsHeight * u;
   draw_list->AddLine(ImVec2(content_left, y), ImVec2(content_right, y), color(255, 255, 255, 28),
@@ -842,10 +979,33 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       draw_list->AddRect(cap_min, cap_max, color(255, 255, 255, 70), 8.0f * u, 0, 1.5f * u);
       DrawText(draw_list, value_size, ImVec2(cap_min.x + 16.0f * u, center_y - key_extent.y * 0.5f),
                waiting || selected ? color(255, 255, 255) : color(132, 222, 232), key_text);
+    } else if (item.kind == QuickMenuItem::Kind::kAction && !item.list) {
+      // A button.
+      const std::string& text = item.action_label.empty() ? item.label : item.action_label;
+      const ImVec2 text_extent = TextSize(value_size, text);
+      const ImVec2 cap_min(right - text_extent.x - 40.0f * u, center_y - 19.0f * u);
+      const ImVec2 cap_max(right, center_y + 19.0f * u);
+      draw_list->AddRectFilled(cap_min, cap_max,
+                               selected ? color(255, 206, 38, 200) : color(46, 54, 70), 8.0f * u);
+      draw_list->AddRect(cap_min, cap_max, color(255, 255, 255, 70), 8.0f * u, 0, 1.5f * u);
+      DrawText(draw_list, value_size, ImVec2(cap_min.x + 20.0f * u, center_y - text_extent.y * 0.5f),
+               selected ? color(20, 24, 32) : color(132, 222, 232), text);
     } else {
       std::string value_text;
       bool can_lower = true, can_raise = true;
-      if (item.kind == QuickMenuItem::Kind::kChoice) {
+      if (item.kind == QuickMenuItem::Kind::kAction) {
+        const std::vector<std::pair<std::string, std::string>>* list =
+            item_index < lists_.size() ? &lists_[item_index] : nullptr;
+        if (!list || list->empty()) {
+          value_text = item.empty_text;
+          can_lower = can_raise = false;
+        } else {
+          const size_t pick = std::min(list_picks_[item_index], list->size() - 1);
+          value_text = (*list)[pick].second;
+          can_lower = pick > 0;
+          can_raise = pick + 1 < list->size();
+        }
+      } else if (item.kind == QuickMenuItem::Kind::kChoice) {
         const std::vector<const Choice*> choices = AllowedChoices(item);
         const int index = ChoiceIndex(choices, current);
         value_text = index >= 0 ? choices[size_t(index)]->second : current;
@@ -902,14 +1062,32 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   if (capturing_) {
     const std::string text =
         capture_message_.empty()
-            ? "Press the key to use for " + capturing_->label + ". Esc or B cancels."
-            : capture_message_ + " Press another key, or Esc or B to cancel.";
+            ? "Press the key to use for " + capturing_->label + ". Esc or " +
+                  FaceName(Face::kRight) + " cancels."
+            : capture_message_ + " Press another key, or Esc or " + FaceName(Face::kRight) +
+                  " to cancel.";
     DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u),
              capture_message_.empty() ? color(255, 206, 38) : color(255, 140, 90), text,
              content_right - content_left);
-  } else if (!rows.empty()) {
-    DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u), color(196, 204, 216),
-             section.items[selected_item_].help, content_right - content_left);
+  } else {
+    // A section's status line (like what an action did) goes first.
+    float help_y = y + 6.0f * u;
+    const QuickMenuStatus status = section.status ? section.status() : QuickMenuStatus{};
+    if (!status.text.empty()) {
+      const float status_size = 23.0f * u;
+      DrawText(draw_list, status_size, ImVec2(content_left, help_y),
+               status.error ? color(255, 140, 90) : color(255, 206, 38), status.text,
+               content_right - content_left);
+      // Wrapped: about one line per width of text.
+      const ImVec2 extent = TextSize(status_size, status.text);
+      const float lines =
+          std::max(1.0f, std::ceil(extent.x * 1.08f / std::max(1.0f, content_right - content_left)));
+      help_y += extent.y * lines + 6.0f * u;
+    }
+    if (!rows.empty() && help_y < y + (kHelpHeight - 20.0f) * u) {
+      DrawText(draw_list, 23.0f * u, ImVec2(content_left, help_y), color(196, 204, 216),
+               section.items[selected_item_].help, content_right - content_left);
+    }
   }
 
   // Button hints.
@@ -917,24 +1095,19 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     const float hint_size = 21.0f * u;
     const float center_y = panel_max.y - kHintsHeight * u * 0.5f - 6.0f * u;
     float x = content_left;
-    auto draw_button = [&](const char* letter, ImU32 fill, const char* text) {
+    auto draw_button = [&](Face face, const char* text) {
       const float radius = 15.0f * u;
-      draw_list->AddCircleFilled(ImVec2(x + radius, center_y), radius, fill, 24);
-      const float letter_size = 19.0f * u;
-      const ImVec2 letter_extent = TextSize(letter_size, letter);
-      DrawText(draw_list, letter_size,
-               ImVec2(x + radius - letter_extent.x * 0.5f, center_y - letter_extent.y * 0.5f),
-               color(255, 255, 255), letter);
+      DrawFaceGlyph(draw_list, ImVec2(x + radius, center_y), radius, face, color.alpha);
       x += radius * 2.0f + 9.0f * u;
       DrawText(draw_list, hint_size, ImVec2(x, center_y - TextSize(hint_size, text).y * 0.5f),
                color(196, 204, 216), text);
       x += TextSize(hint_size, text).x + 26.0f * u;
     };
-    draw_button("A", color(22, 150, 62), "Change");
-    draw_button("B", color(206, 44, 44), "Close");
+    draw_button(Face::kBottom, "Change");
+    draw_button(Face::kRight, "Close");
     if (!config_.quick_toggle_label.empty() &&
         rex::cvar::GetFlagInfo(config_.quick_toggle_cvar)) {
-      draw_button("Y", color(222, 168, 18), config_.quick_toggle_label.c_str());
+      draw_button(Face::kTop, config_.quick_toggle_label.c_str());
     }
     const char* saved = "Saved automatically";
     DrawText(draw_list, hint_size,

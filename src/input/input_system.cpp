@@ -217,6 +217,12 @@ DeviceId InputSystem::ChooseDeviceForUser(uint32_t user_index) const {
   return chosen;
 }
 
+uint8_t InputSystem::GetGamepadType(uint32_t user_index) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  const DeviceInfo* info = DeviceInfoFor(ChooseDeviceForUser(user_index));
+  return info && !info->synthetic ? info->gamepad_type : 0;
+}
+
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
@@ -306,27 +312,6 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     out_state->gamepad.buttons = static_cast<uint16_t>(buttons & ~consumed_buttons_[user_index]);
   }
 
-  if (result == X_ERROR_SUCCESS && out_state && user_index < kMaxGuestUsers &&
-      (injected_buttons_[user_index] || injected_left_trigger_[user_index] ||
-       injected_right_trigger_[user_index])) {
-    const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now().time_since_epoch())
-                                         .count());
-    if (now_ms < injected_until_ms_[user_index]) {
-      out_state->gamepad.buttons =
-          static_cast<uint16_t>(uint16_t(out_state->gamepad.buttons) | injected_buttons_[user_index]);
-      out_state->gamepad.left_trigger = std::max<uint8_t>(uint8_t(out_state->gamepad.left_trigger),
-                                                          injected_left_trigger_[user_index]);
-      out_state->gamepad.right_trigger = std::max<uint8_t>(
-          uint8_t(out_state->gamepad.right_trigger), injected_right_trigger_[user_index]);
-      out_state->packet_number = uint32_t(out_state->packet_number) + 1;
-    } else {
-      injected_buttons_[user_index] = 0;
-      injected_left_trigger_[user_index] = 0;
-      injected_right_trigger_[user_index] = 0;
-    }
-  }
-
   return result;
 }
 
@@ -385,6 +370,28 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
   AdjustDeadzoneLevels(user_index, &merged.gamepad);
   if (static_cast<uint16_t>(merged.gamepad.buttons) != 0 && user_index < kMaxGuestUsers) {
     last_used_user_ = user_index;
+  }
+  // Buttons injected for automation (InjectButtons) count as held for the
+  // emulator's own UI too, so tests can drive its dialogs.
+  if (user_index < kMaxGuestUsers &&
+      (injected_buttons_[user_index] || injected_left_trigger_[user_index] ||
+       injected_right_trigger_[user_index])) {
+    const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    if (now_ms < injected_until_ms_[user_index]) {
+      merged.gamepad.buttons =
+          static_cast<uint16_t>(uint16_t(merged.gamepad.buttons) | injected_buttons_[user_index]);
+      merged.gamepad.left_trigger = std::max<uint8_t>(uint8_t(merged.gamepad.left_trigger),
+                                                      injected_left_trigger_[user_index]);
+      merged.gamepad.right_trigger = std::max<uint8_t>(uint8_t(merged.gamepad.right_trigger),
+                                                       injected_right_trigger_[user_index]);
+      merged.packet_number = uint32_t(merged.packet_number) + 1;
+    } else {
+      injected_buttons_[user_index] = 0;
+      injected_left_trigger_[user_index] = 0;
+      injected_right_trigger_[user_index] = 0;
+    }
   }
   if (out_state) {
     *out_state = merged;

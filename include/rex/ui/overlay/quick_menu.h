@@ -22,6 +22,14 @@
 
 namespace rex::ui {
 
+// The controller whose button glyphs the overlay's hints show (A / B / Y, LB /
+// RB), by physical position: kPlayStation shows Cross / Circle / Triangle and
+// L1 / R1, kNintendo B / A / X and L / R (the bottom face button is Nintendo's
+// B). Any thread; a game sets it from its own setting.
+enum class ButtonGlyphs { kXbox, kPlayStation, kNintendo };
+void SetButtonGlyphs(ButtonGlyphs glyphs);
+ButtonGlyphs GetButtonGlyphs();
+
 // A setting in the quick menu, backed by a cvar.
 struct QuickMenuItem {
   enum class Kind {
@@ -34,6 +42,10 @@ struct QuickMenuItem {
     // A key bind (the cvar of a RegisterBind): activating it waits for the
     // next key press and binds that key.
     kKey,
+    // A command, not a setting (no cvar): A / Enter / a click runs `action`.
+    // With `list` set, left / right first pick one of the values it returns
+    // and `action` gets that value.
+    kAction,
   };
 
   Kind kind = Kind::kToggle;
@@ -57,11 +69,30 @@ struct QuickMenuItem {
   // Only shown while the cvar `shown_if_cvar` has one of `shown_if_values`.
   std::string shown_if_cvar;
   std::vector<std::string> shown_if_values;
+
+  // kAction: runs on the UI thread after the paint; `value` is the picked
+  // entry of `list` (empty without a list).
+  std::function<void(const std::string& value)> action;
+  // kAction: the text shown on the right without a list (like "Export").
+  std::string action_label;
+  // kAction: values to pick from and their text, read when the menu opens,
+  // when the section is shown and after every action. Nothing to pick ->
+  // `empty_text` is shown and A does nothing.
+  std::function<std::vector<std::pair<std::string, std::string>>()> list;
+  std::string empty_text = "None";
+};
+
+// A result line under the help of a section, e.g. what an action did.
+struct QuickMenuStatus {
+  std::string text;
+  bool error = false;
 };
 
 struct QuickMenuSection {
   std::string title;
   std::vector<QuickMenuItem> items;
+  // Read every frame while the section is shown; empty text = no line.
+  std::function<QuickMenuStatus()> status;
 };
 
 struct QuickMenuConfig {
@@ -118,8 +149,14 @@ class QuickMenuDialog : public ImGuiDialog {
   void StartCapture(const QuickMenuItem& item);
   void FinishCapture(VirtualKey key);
   void StopCapture();
+  // Reads the lists of the current section's action items.
+  void RefreshLists();
 
   QuickMenuConfig config_;
+  // kAction lists of the current section by item index, and the picked entry.
+  std::vector<std::vector<std::pair<std::string, std::string>>> lists_;
+  std::vector<size_t> list_picks_;
+  bool lists_stale_ = true;
   Callbacks callbacks_;
   std::shared_ptr<SharedPad> pad_;
 
