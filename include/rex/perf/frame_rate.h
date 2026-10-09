@@ -61,4 +61,66 @@ struct TextureCacheStats {
 };
 TextureCacheStats& GetTextureCacheStats();
 
+// GPU time per part of a frame, from timestamp queries (gpu_profile debug
+// command). Off unless a measurement is running.
+enum class GpuPass : uint32_t {
+  kOther,          // everything not below (uploads, index conversion, barriers)
+  kDraw,           // the game's draws
+  kDrawMemexport,  // the game's draws exporting to memory (with their barriers)
+  kRenderTargets,  // render target cache: ownership transfers between host RTs (color)
+  kRtTransferDepth,    // ownership transfers into depth render targets (depth part)
+  kRtTransferStencil,  // ... their stencil, bit by bit (no stencil reference output)
+  kResolve,        // resolves: render target dump to the EDRAM buffer
+  kResolveCopy,    // resolves: EDRAM buffer -> (scaled) resolve memory
+  kResolveClear,   // clears done as part of resolves
+  kTextureLoad,    // texture loading / untiling (incl. resolved textures)
+  kSharedMemory,   // guest memory uploads for vertex buffers etc.
+  kDlssInputs,     // DLSS/FSR: depth + motion vector compute
+  kDlssEvaluate,   // NGX evaluate / FSR dispatch
+  kDlssCopyBack,   // upscaler output back into the render target (+ downsample)
+  kDlssMirror,     // HUD draws mirrored into the output-size picture
+  kDlssFreezeHud,  // copy of the render target at its first resolve
+  kDlssCompose,    // compose of the upscaled picture with the presented frame
+  kSwap,           // gamma ramp / FXAA of the frontbuffer
+  kPresenterGuest, // presenter: guest output effects (CAS, FSR, bilinear)
+  kPresenterUi,    // presenter: overlays and UI
+  kCount,
+};
+const char* GetGpuPassName(GpuPass pass);
+
+struct GpuProfileStats {
+  std::atomic<bool> enabled{false};
+  std::atomic<uint64_t> pass_ns[size_t(GpuPass::kCount)] = {};
+  std::atomic<uint64_t> pass_count[size_t(GpuPass::kCount)] = {};  // timestamped intervals
+  // GPU time from the first to the last timestamp of each command processor
+  // submission / presenter paint.
+  std::atomic<uint64_t> submission_ns{0};
+  std::atomic<uint64_t> submissions{0};
+  std::atomic<uint64_t> submissions_unprofiled{0};
+  std::atomic<uint64_t> paint_ns{0};
+  std::atomic<uint64_t> paints{0};
+  // GPU idle time between consecutive command processor submissions (presenter
+  // paints in between included).
+  std::atomic<uint64_t> gap_ns{0};
+  // CPU side, command processor thread.
+  std::atomic<uint64_t> fence_waits{0};      // waits for the GPU (submission fences)
+  std::atomic<uint64_t> fence_wait_ns{0};
+  std::atomic<uint64_t> occlusion_queries{0};
+  std::atomic<uint64_t> draws{0};
+  std::atomic<uint64_t> resolves{0};
+  std::atomic<uint64_t> clears_in_place{0};
+  std::atomic<uint64_t> memory_upload_batches{0};  // shared memory UploadRanges with work
+  std::atomic<uint64_t> memory_upload_bytes{0};
+  std::atomic<uint64_t> texture_loads{0};
+  std::atomic<uint64_t> texture_load_bytes{0};  // host texture bytes written by loads  // clear draws done as clears (gpu_clear_draws_in_place)
+  std::atomic<uint64_t> cp_submissions{0};
+  // Presenter (UI thread): time in PaintAndPresent, and in Present itself.
+  std::atomic<uint64_t> present_calls{0};
+  std::atomic<uint64_t> present_cpu_ns{0};
+};
+GpuProfileStats& GetGpuProfileStats();
+inline bool IsGpuProfiling() {
+  return GetGpuProfileStats().enabled.load(std::memory_order_relaxed);
+}
+
 }  // namespace rex::perf

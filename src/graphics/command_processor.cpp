@@ -38,9 +38,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "At the end of every frame, forget which pages the GPU has from the CPU, so "
+                    "everything used is uploaded again (a coherency safety net for titles writing "
+                    "memory unnoticed; CPU writes are normally caught by write watches). Costly: "
+                    "about 10 MB of uploads a frame in Burst Limit.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")

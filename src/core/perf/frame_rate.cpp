@@ -87,4 +87,56 @@ TextureCacheStats& GetTextureCacheStats() {
   return stats;
 }
 
+const char* GetGpuPassName(GpuPass pass) {
+  switch (pass) {
+    case GpuPass::kOther:
+      return "other";
+    case GpuPass::kDraw:
+      return "draws";
+    case GpuPass::kDrawMemexport:
+      return "draws_memexport";
+    case GpuPass::kRenderTargets:
+      return "rt_transfers";
+    case GpuPass::kRtTransferDepth:
+      return "rt_transfers_depth";
+    case GpuPass::kRtTransferStencil:
+      return "rt_transfers_stencil";
+    case GpuPass::kResolve:
+      return "resolve_dumps";
+    case GpuPass::kResolveCopy:
+      return "resolve_copies";
+    case GpuPass::kResolveClear:
+      return "resolve_clears";
+    case GpuPass::kTextureLoad:
+      return "texture_loads";
+    case GpuPass::kSharedMemory:
+      return "memory_uploads";
+    case GpuPass::kDlssInputs:
+      return "dlss_inputs";
+    case GpuPass::kDlssEvaluate:
+      return "dlss_evaluate";
+    case GpuPass::kDlssCopyBack:
+      return "dlss_copy_back";
+    case GpuPass::kDlssMirror:
+      return "dlss_hud_mirror";
+    case GpuPass::kDlssFreezeHud:
+      return "dlss_freeze_hud";
+    case GpuPass::kDlssCompose:
+      return "dlss_compose";
+    case GpuPass::kSwap:
+      return "swap_gamma";
+    case GpuPass::kPresenterGuest:
+      return "present_effects";
+    case GpuPass::kPresenterUi:
+      return "present_ui";
+    default:
+      return "?";
+  }
+}
+
+GpuProfileStats& GetGpuProfileStats() {
+  static GpuProfileStats stats;
+  return stats;
+}
+
 }  // namespace rex::perf

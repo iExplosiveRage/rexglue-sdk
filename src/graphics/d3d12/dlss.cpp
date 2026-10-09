@@ -912,6 +912,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   uint32_t group_count_y = (height + 7) / 8;
 
   // Depth and motion vectors.
+  command_processor.SetGpuProfilePass(rex::perf::GpuPass::kDlssInputs);
   ui::d3d12::util::DescriptorCpuGpuHandlePair inputs_descriptors[3];
   if (!command_processor.RequestOneUseSingleViewDescriptors(3, inputs_descriptors)) {
     return color_state;
@@ -940,6 +941,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   command_processor.SubmitBarriers();
 
   bool create = false;
+  command_processor.SetGpuProfilePass(rex::perf::GpuPass::kDlssEvaluate);
   if (debug_view == 1 || debug_view == 2) {
     ui::d3d12::util::DescriptorCpuGpuHandlePair debug_descriptors[3];
     if (!command_processor.RequestOneUseSingleViewDescriptors(3, debug_descriptors)) {
@@ -1089,6 +1091,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
 #endif
   }
 
+  command_processor.SetGpuProfilePass(rex::perf::GpuPass::kDlssCopyBack);
   if (upscale) {
     // The upscaled scene back at the render resolution, for the frame the game
     // goes on with.
