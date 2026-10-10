@@ -558,6 +558,13 @@ class TextureCache {
       Texture& texture, const TextureReplacementData& data) {
     return false;
   }
+  // On a loading thread: the decoded replacement put into upload memory the
+  // way LoadTextureDataFromReplacementImpl will copy it from (null = it uses
+  // the pixels instead).
+  virtual std::shared_ptr<void> PrepareReplacementUploadImpl(const TextureReplacementData& data) {
+    (void)data;
+    return nullptr;
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the

@@ -178,6 +178,7 @@ class D3D12TextureCache final : public TextureCache {
 
   bool LoadTextureDataFromReplacementImpl(
       Texture& texture, const TextureReplacementData& data) override;
+  std::shared_ptr<void> PrepareReplacementUploadImpl(const TextureReplacementData& data) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 

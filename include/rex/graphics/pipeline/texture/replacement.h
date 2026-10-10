@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -68,6 +69,12 @@ struct TextureReplacementData {
   // Smaller levels made from `pixels` (level 1 first, down to 1x1), RGBA8 like
   // it.
   std::vector<std::vector<uint8_t>> mips;
+  // The image already in the renderer's upload memory, made on the loading
+  // thread (TextureCache::PrepareReplacementUploadImpl), so the frame that
+  // first uses it only records copies; `pixels` and `mips` are dropped then,
+  // and `prepared_bytes` is what it takes.
+  std::shared_ptr<void> prepared_upload;
+  uint64_t prepared_bytes = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +125,22 @@ class TextureReplacement {
   // take): it isn't offered again, so the original texture is used.
   void MarkFailed(uint64_t content_hash) const;
 
+  // Asynchronous loading (texture_replace_async): whether FindReplacement
+  // would answer at once - the image is decoded in RAM (or is one of the
+  // program's own), or it can't be used anyway.
+  bool IsResident(uint64_t content_hash) const;
+  // Decodes the replacement on a background thread, the most recently asked
+  // first; the ready callback runs (on that thread) once it's in RAM. Does
+  // nothing when it's already there or on its way.
+  void RequestAsync(uint64_t content_hash) const;
+  void SetReadyCallback(std::function<void()> callback) { ready_callback_ = std::move(callback); }
+  // Puts a decoded image into the renderer's upload memory on the loading
+  // threads (see TextureReplacementData::prepared_upload); null = not done.
+  void SetPrepareCallback(
+      std::function<std::shared_ptr<void>(const TextureReplacementData&)> callback) {
+    prepare_callback_ = std::move(callback);
+  }
+
   // The smaller mips of an RGBA8 image down to 1x1: each texel is the average
   // of 2x2 of the level above, weighted by alpha so the color of transparent
   // texels doesn't bleed into the edges of cutouts.
@@ -156,6 +179,9 @@ class TextureReplacement {
   void StartPreload() const;
   void StopPreload();
   void PreloadWorker() const;
+  // The RequestAsync threads.
+  void AsyncWorker() const;
+  void StopAsync();
 
   std::filesystem::path textures_dir_;
   std::unordered_map<uint64_t, std::filesystem::path> replacements_;
@@ -198,6 +224,17 @@ class TextureReplacement {
   mutable std::atomic<bool> preload_stop_{false};
   mutable std::chrono::steady_clock::time_point preload_start_time_;
   mutable std::vector<std::unique_ptr<rex::thread::Thread>> preload_threads_;
+
+  // RequestAsync: the hashes waiting (newest at the back, taken first), the
+  // threads (started with the first request) and their wake-up.
+  mutable std::vector<uint64_t> async_queue_;
+  mutable std::vector<std::unique_ptr<rex::thread::Thread>> async_threads_;
+  mutable std::condition_variable async_wake_;
+  mutable bool async_stop_ = false;
+  std::function<void()> ready_callback_;
+  std::function<std::shared_ptr<void>(const TextureReplacementData&)> prepare_callback_;
+  // Makes the upload data of an image just decoded on a loading thread.
+  void Prepare(TextureReplacementData& data) const;
 
   static bool WriteDDS_RGBA8(const std::filesystem::path& path, uint32_t width, uint32_t height,
                              const uint8_t* rgba8_rows, uint32_t row_pitch_bytes);

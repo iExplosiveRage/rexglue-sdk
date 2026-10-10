@@ -943,10 +943,12 @@ TextureReplacement::TextureReplacement(std::filesystem::path textures_dir)
 }
 
 TextureReplacement::~TextureReplacement() {
+  StopAsync();
   StopPreload();
 }
 
 void TextureReplacement::Rescan() {
+  StopAsync();
   StopPreload();
   std::lock_guard<std::mutex> lock(cache_mutex_);
   replacements_.clear();
@@ -1337,7 +1339,7 @@ bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& wi
 }
 
 uint64_t TextureReplacement::CachedSize(const TextureReplacementData& data) {
-  uint64_t bytes = data.pixels.size();
+  uint64_t bytes = data.pixels.size() + data.prepared_bytes;
   for (const auto& mip : data.mips) {
     bytes += mip.size();
   }
@@ -1453,6 +1455,9 @@ void TextureReplacement::PreloadWorker() const {
     if (needed) {
       TextureReplacementData loaded;
       const bool ok = LoadFile(path, loaded);
+      if (ok) {
+        Prepare(loaded);
+      }
       {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (ok) {
@@ -1471,6 +1476,127 @@ void TextureReplacement::PreloadWorker() const {
                       .count());
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Asynchronous loading
+// ---------------------------------------------------------------------------
+bool TextureReplacement::IsResident(uint64_t content_hash) const {
+  if (FindTextureMemoryReplacement(content_hash)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return pixel_cache_.count(content_hash) || failed_cache_.count(content_hash) ||
+         !replacements_.count(content_hash);
+}
+
+void TextureReplacement::RequestAsync(uint64_t content_hash) const {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (pixel_cache_.count(content_hash) || failed_cache_.count(content_hash) ||
+        preload_in_progress_.count(content_hash) || !replacements_.count(content_hash) ||
+        std::find(async_queue_.begin(), async_queue_.end(), content_hash) !=
+            async_queue_.end()) {
+      return;
+    }
+    async_queue_.push_back(content_hash);
+    if (async_threads_.empty() && !async_stop_) {
+      // Normal priority: what's on screen now waits for these. Each big image
+      // is also split across threads (ParallelRows).
+      for (uint32_t i = 0; i < 2; ++i) {
+        rex::thread::Thread::CreationParameters params;
+        params.stack_size = 1024 * 1024;
+        auto thread = rex::thread::Thread::Create(params, [this]() { AsyncWorker(); });
+        if (!thread) {
+          break;
+        }
+        thread->set_name("Texture Async Load");
+        async_threads_.push_back(std::move(thread));
+      }
+    }
+  }
+  async_wake_.notify_one();
+}
+
+void TextureReplacement::AsyncWorker() const {
+  for (;;) {
+    uint64_t hash;
+    std::filesystem::path path;
+    {
+      std::unique_lock<std::mutex> lock(cache_mutex_);
+      async_wake_.wait(lock, [this]() { return async_stop_ || !async_queue_.empty(); });
+      if (async_stop_) {
+        return;
+      }
+      hash = async_queue_.back();
+      async_queue_.pop_back();
+      auto it = replacements_.find(hash);
+      if (it == replacements_.end() || pixel_cache_.count(hash) || failed_cache_.count(hash) ||
+          !preload_in_progress_.insert(hash).second) {
+        continue;
+      }
+      path = it->second;
+    }
+    const auto load_start = std::chrono::steady_clock::now();
+    TextureReplacementData loaded;
+    const bool ok = LoadFile(path, loaded);
+    if (ok) {
+      Prepare(loaded);
+    }
+    {
+      rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+      stats.replacement_async_loads.fetch_add(1, std::memory_order_relaxed);
+      stats.replacement_async_ns.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - load_start)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      if (ok) {
+        // Not trimmed here: FindReplacement's pointers must stay valid until
+        // its next call, which trims.
+        AddToPixelCache(hash, std::move(loaded));
+      } else {
+        failed_cache_.insert(hash);
+      }
+      preload_in_progress_.erase(hash);
+    }
+    preload_done_.notify_all();
+    if (ok && ready_callback_) {
+      ready_callback_();
+    }
+  }
+}
+
+void TextureReplacement::Prepare(TextureReplacementData& data) const {
+  if (!prepare_callback_) {
+    return;
+  }
+  std::shared_ptr<void> prepared = prepare_callback_(data);
+  if (!prepared) {
+    return;
+  }
+  data.prepared_bytes = CachedSize(data);
+  data.prepared_upload = std::move(prepared);
+  std::vector<uint8_t>().swap(data.pixels);
+  std::vector<std::vector<uint8_t>>().swap(data.mips);
+}
+
+void TextureReplacement::StopAsync() {
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    async_stop_ = true;
+    async_queue_.clear();
+  }
+  async_wake_.notify_all();
+  for (auto& thread : async_threads_) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  async_threads_.clear();
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  async_stop_ = false;
 }
 
 // ---------------------------------------------------------------------------

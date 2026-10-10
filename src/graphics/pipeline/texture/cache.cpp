@@ -117,6 +117,11 @@ REXCVAR_DEFINE_BOOL(texture_replace_preload, true, "GPU/Texture Replacement",
                     "RAM)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(texture_replace_async, true, "GPU/Texture Replacement",
+                    "Never wait for a replacement to decode: the original texture is shown until "
+                    "the replacement is ready (a moment later), so new textures don't stutter the "
+                    "game");
+
 REXCVAR_DEFINE_INT32(texture_replace_ram_mb, 3072, "GPU/Texture Replacement",
                      "RAM for decoded replacement textures (MB). The least recently used ones are "
                      "dropped past it (and decoded again if needed), and a pack bigger than this "
@@ -289,6 +294,13 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
 
 void TextureCache::InitTextureReplacement(const std::filesystem::path& textures_dir) {
   replacement_ = std::make_unique<TextureReplacement>(textures_dir);
+  // A replacement decoded in the background: look the bound textures up again,
+  // so it's used from the next draws.
+  replacement_->SetReadyCallback(
+      [this]() { texture_became_outdated_.store(true, std::memory_order_release); });
+  // Its upload data made on the loading thread too, so the frame only copies.
+  replacement_->SetPrepareCallback(
+      [this](const TextureReplacementData& data) { return PrepareReplacementUploadImpl(data); });
 }
 
 TextureCache::~TextureCache() {
@@ -764,10 +776,21 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   bool uploaded_replacement = false;
   if (texture.replacement_content_hash_ != 0 && replacement_) {
+    const auto upload_start = std::chrono::steady_clock::now();
     const TextureReplacementData* replacement =
         replacement_->FindReplacement(texture.replacement_content_hash_);
+    const auto found = std::chrono::steady_clock::now();
     if (replacement) {
       uploaded_replacement = LoadTextureDataFromReplacementImpl(texture, *replacement);
+    }
+    const auto upload_end = std::chrono::steady_clock::now();
+    const double upload_ms =
+        std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+    if (upload_ms > 8.0 && replacement) {
+      REXLOG_INFO("TextureReplacement: {}x{} took {:.1f} ms (find {:.1f} ms, upload {:.1f} ms)",
+                  replacement->width, replacement->height, upload_ms,
+                  std::chrono::duration<double, std::milli>(found - upload_start).count(),
+                  std::chrono::duration<double, std::milli>(upload_end - found).count());
     }
     // The texture has the replacement's size and format: the guest data can't
     // go in. The file is marked failed and the bindings looked up again, so
@@ -1299,18 +1322,29 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           const uint32_t original_width = key.GetWidth();
           const uint32_t original_height = key.GetHeight();
 
-          key.width_minus_1 = replacement_width - 1;
-          key.height_minus_1 = replacement_height - 1;
-          key.format = xenos::TextureFormat::k_8_8_8_8;
+          TextureKey replacement_key = key;
+          replacement_key.width_minus_1 = replacement_width - 1;
+          replacement_key.height_minus_1 = replacement_height - 1;
+          replacement_key.format = xenos::TextureFormat::k_8_8_8_8;
           // A full mip chain (made when the replacement is loaded), so it
           // doesn't shimmer when it's far away - the guest's sampler state
           // still picks which levels are used.
-          key.mip_max_level =
+          replacement_key.mip_max_level =
               std::min(rex::log2_floor(std::max(replacement_width, replacement_height)),
                        uint32_t(xenos::kTextureMaxMips - 1));
-          key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
+          replacement_key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
 
-          has_replacement = true;
+          // Not decoded yet: the original texture this time, the replacement
+          // decoded in the background (its ready callback has the bindings
+          // looked up again). A replacement texture already made is used.
+          if (REXCVAR_GET(texture_replace_async) &&
+              textures_.find(replacement_key) == textures_.end() &&
+              !replacement_->IsResident(replacement_content_hash)) {
+            replacement_->RequestAsync(replacement_content_hash);
+          } else {
+            key = replacement_key;
+            has_replacement = true;
+          }
 
           REXGPU_DEBUG(
               "TextureReplacement: injecting {}x{} replacement for original {}x{} "
@@ -1333,7 +1367,15 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Create the texture and add it to the map.
   Texture* texture;
   {
+    const auto create_start = std::chrono::steady_clock::now();
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
+    const double create_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - create_start)
+                                 .count();
+    if (create_ms > 4.0) {
+      REXLOG_INFO("Texture cache: creating a {}x{} texture took {:.1f} ms", key.GetWidth(),
+                  key.GetHeight(), create_ms);
+    }
     if (!new_texture) {
       key.LogAction("Failed to create");
       return nullptr;
