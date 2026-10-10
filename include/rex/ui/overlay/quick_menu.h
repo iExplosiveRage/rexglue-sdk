@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string_view>
 #include <memory>
 #include <string>
 #include <utility>
@@ -19,6 +20,8 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/virtual_key.h>
+
+struct ImDrawList;
 
 namespace rex::ui {
 
@@ -95,8 +98,98 @@ struct QuickMenuSection {
   std::function<QuickMenuStatus()> status;
 };
 
+// A color of the menu, 0-255 each.
+struct QuickMenuColor {
+  uint8_t r = 0, g = 0, b = 0, a = 255;
+};
+
+// The menu's look. The defaults are the SDK's dark one; a game can match its
+// own menus.
+struct QuickMenuTheme {
+  // The panel: `panel_top` fading to `panel_bottom`.
+  QuickMenuColor panel_top{13, 17, 26, 236};
+  QuickMenuColor panel_bottom{13, 17, 26, 236};
+  QuickMenuColor border{255, 255, 255, 46};
+  float border_width = 2.0f;
+  float rounding = 20.0f;
+  QuickMenuColor title{255, 206, 38};
+  // The render resolution and FPS beside the title.
+  QuickMenuColor status{160, 172, 188};
+  QuickMenuColor tab{140, 150, 166};
+  QuickMenuColor tab_active{255, 255, 255};
+  QuickMenuColor tab_underline{0, 196, 206};
+  // The LB / RB chips.
+  QuickMenuColor chip{58, 66, 82};
+  QuickMenuColor chip_text{225, 230, 238};
+  QuickMenuColor divider{255, 255, 255, 28};
+  // The selected row: `row` on the left fading to `row_end` on the right, and
+  // a bar on its left edge (alpha 0 = none).
+  QuickMenuColor row{0, 128, 146, 226};
+  QuickMenuColor row_end{0, 128, 146, 226};
+  QuickMenuColor row_accent{255, 206, 38};
+  float row_rounding = 10.0f;
+  QuickMenuColor label{222, 228, 236};
+  QuickMenuColor label_selected{255, 255, 255};
+  QuickMenuColor value{132, 222, 232};
+  QuickMenuColor value_selected{255, 255, 255};
+  QuickMenuColor switch_on{0, 200, 160};
+  QuickMenuColor switch_off{66, 74, 90};
+  QuickMenuColor knob{245, 247, 250};
+  // Key caps and action buttons.
+  QuickMenuColor cap{46, 54, 70};
+  QuickMenuColor cap_selected{255, 206, 38, 200};
+  QuickMenuColor cap_selected_text{20, 24, 32};
+  QuickMenuColor help{196, 204, 216};
+  // Status lines and a key setting waiting for its key.
+  QuickMenuColor highlight{255, 206, 38};
+  QuickMenuColor warning{255, 140, 90};
+  // "Saved automatically".
+  QuickMenuColor faint{120, 132, 150};
+  // Extras, off with alpha 0: a shadow under all text, an outline around the
+  // title, a band behind the title and tabs with a line under it, a filled
+  // pill behind the current tab (instead of the underline), an inset behind
+  // the settings and an outline around the selected row.
+  QuickMenuColor text_shadow{0, 0, 0, 0};
+  QuickMenuColor title_outline{0, 0, 0, 0};
+  QuickMenuColor header{0, 0, 0, 0};
+  QuickMenuColor header_line{0, 0, 0, 0};
+  QuickMenuColor tab_pill{0, 0, 0, 0};
+  QuickMenuColor tab_pill_text{0, 0, 0};
+  QuickMenuColor list_background{0, 0, 0, 0};
+  QuickMenuColor row_outline{0, 0, 0, 0};
+};
+
+// A game's own art for the menu, drawn instead of the built-in look where set
+// (UI thread, while the menu draws; colors are IM_COL32 values, already faded).
+struct QuickMenuArt {
+  // The panel x0,y0 - x1,y1: its body, the bar behind the title and tabs (down
+  // to header_bottom), the bar behind the button hints (from footer_top) and
+  // its rim. `scale` is screen pixels per 1080p pixel.
+  std::function<void(ImDrawList* draw_list, float x0, float y0, float x1, float y1,
+                     float header_bottom, float footer_top, float scale, float alpha)>
+      panel;
+  // Text `size` pixels a line, its top-left at x,y; returns its width. Measures
+  // only with a null draw list. Empty: the overlay font.
+  std::function<float(ImDrawList* draw_list, float size, float x, float y, uint32_t color,
+                      std::string_view text)>
+      text;
+  // A face button (0 bottom, 1 right, 2 left, 3 top) centered at x,y; false to
+  // draw the built-in glyph.
+  std::function<bool(ImDrawList* draw_list, int face, float x, float y, float radius,
+                     float alpha)>
+      button;
+};
+
+// What a menu sound is for (QuickMenuConfig::sound).
+enum class QuickMenuSound { kOpen, kClose, kMove, kChange };
+
 struct QuickMenuConfig {
   std::string title = "SETTINGS";
+  QuickMenuTheme theme;
+  // Plays a sound for the menu's actions (a game's own menu sounds); none
+  // when empty. UI thread.
+  std::function<void(QuickMenuSound)> sound;
+  QuickMenuArt art;
   std::vector<QuickMenuSection> sections;
   // Y on the controller turns this boolean cvar on or off and closes the menu,
   // a shortcut to a mode like a free camera. Empty = none.
@@ -186,5 +279,13 @@ class QuickMenuDialog : public ImGuiDialog {
   double fps_time_ = -1.0;
   float fps_ = 0.0f;
 };
+
+// The controllers read straight from SDL (Xbox, PlayStation, Switch, ...),
+// for UI shown before the game's input system runs; the stick pushed the
+// furthest. UI thread.
+QuickMenuDialog::PadState ReadGamepadsBeforeGame();
+// The kind of the controller last pressed there (or the first one seen):
+// -1 none yet, 0 Xbox or other, 1 PlayStation, 2 Nintendo. Any thread.
+int GamepadStyleBeforeGame();
 
 }  // namespace rex::ui

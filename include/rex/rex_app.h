@@ -92,6 +92,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
  public:
   ~ReXApp() override;
 
+  /// The quick_menu_toggle debug command: opens / closes the settings menu of
+  /// the running app (tests through the command pipe).
+  static void ToggleQuickMenuCommand();
+
  protected:
   ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo ppc_info,
          std::string_view usage = "");

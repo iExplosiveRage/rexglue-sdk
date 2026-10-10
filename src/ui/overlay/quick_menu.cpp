@@ -47,11 +47,59 @@ constexpr double kRepeatDelay = 0.4;
 constexpr double kRepeatIntervalVertical = 0.09;
 constexpr double kRepeatIntervalHorizontal = 0.12;
 
+// The game's text drawing while the menu draws (QuickMenuArt::text), if any.
+const std::function<float(ImDrawList*, float, float, float, uint32_t, std::string_view)>*
+    g_art_text = nullptr;
+// The game's font draws a line `size` tall; the overlay font's letters are
+// smaller for the same size.
+constexpr float kArtTextScale = 1.18f;
+
 ImVec2 TextSize(float size, std::string_view text) {
+  if (g_art_text) {
+    return ImVec2((*g_art_text)(nullptr, size * kArtTextScale, 0, 0, 0, text),
+                  size * kArtTextScale);
+  }
   return overlay_text::Measure(size, text);
 }
+// The theme's text shadow while the menu draws (0 = none).
+ImU32 g_text_shadow = 0;
+
 void DrawText(ImDrawList* draw_list, float size, ImVec2 position, ImU32 color,
               std::string_view text, float wrap_width = 0.0f) {
+  if (g_art_text) {
+    // The game's font: words wrapped by hand to wrap_width.
+    const float art_size = size * kArtTextScale;
+    const float line_height = art_size * 0.95f;
+    auto width = [&](std::string_view line) {
+      return (*g_art_text)(nullptr, art_size, 0, 0, 0, line);
+    };
+    std::string line;
+    float y = position.y - art_size * 0.08f;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+      size_t end = text.find(' ', pos);
+      if (end == std::string_view::npos) end = text.size();
+      const std::string_view word = text.substr(pos, end - pos);
+      const std::string candidate = line.empty() ? std::string(word) : line + " " + std::string(word);
+      if (wrap_width > 0.0f && !line.empty() && width(candidate) > wrap_width) {
+        (*g_art_text)(draw_list, art_size, position.x, y, color, line);
+        y += line_height;
+        line = std::string(word);
+      } else {
+        line = candidate;
+      }
+      pos = end + 1;
+    }
+    if (!line.empty()) {
+      (*g_art_text)(draw_list, art_size, position.x, y, color, line);
+    }
+    return;
+  }
+  if (g_text_shadow) {
+    const float offset = std::max(1.0f, size * 0.06f);
+    overlay_text::Draw(draw_list, size, ImVec2(position.x + offset, position.y + offset),
+                       g_text_shadow, text, wrap_width);
+  }
   overlay_text::Draw(draw_list, size, position, color, text, wrap_width);
 }
 
@@ -76,7 +124,13 @@ const char* ShoulderName(bool right) {
 
 // A face button's glyph: Xbox's colored letters, PlayStation's symbols,
 // Nintendo's letters on a dark button.
+// The game's button drawing while the menu draws (QuickMenuArt::button), if any.
+const std::function<bool(ImDrawList*, int, float, float, float, float)>* g_art_button = nullptr;
+
 void DrawFaceGlyph(ImDrawList* draw_list, ImVec2 center, float radius, Face face, float alpha) {
+  if (g_art_button && (*g_art_button)(draw_list, int(face), center.x, center.y, radius, alpha)) {
+    return;
+  }
   auto color = [alpha](int r, int g, int b) { return IM_COL32(r, g, b, int(255.0f * alpha)); };
   const auto glyphs = ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed));
   if (glyphs == ButtonGlyphs::kPlayStation) {
@@ -129,7 +183,19 @@ struct Palette {
   ImU32 operator()(int r, int g, int b, int a = 255) const {
     return IM_COL32(r, g, b, int(float(a) * alpha));
   }
+  ImU32 operator()(const QuickMenuColor& c) const { return (*this)(c.r, c.g, c.b, c.a); }
 };
+
+// A rectangle filled `left` to `right` (rounded only without a fade: ImGui's
+// gradient fill has no rounding).
+void FillFade(ImDrawList* draw_list, ImVec2 min, ImVec2 max, ImU32 left, ImU32 right,
+              float rounding, ImDrawFlags flags = 0) {
+  if (left == right) {
+    draw_list->AddRectFilled(min, max, left, rounding, flags);
+  } else {
+    draw_list->AddRectFilledMultiColor(min, max, left, right, right, left);
+  }
+}
 
 bool IsOn(const std::string& value) {
   return rex::string::from_string<bool>(value, false);
@@ -400,6 +466,9 @@ std::vector<size_t> QuickMenuDialog::ShownItems(const QuickMenuSection& section)
 }
 
 void QuickMenuDialog::Change(const QuickMenuItem& item, int direction) {
+  if (config_.sound) {
+    config_.sound(QuickMenuSound::kChange);
+  }
   const std::string current = rex::cvar::GetFlagByName(item.cvar);
   switch (item.kind) {
     case QuickMenuItem::Kind::kToggle: {
@@ -536,6 +605,9 @@ void QuickMenuDialog::RequestClose() {
     return;
   }
   close_requested_ = true;
+  if (config_.sound) {
+    config_.sound(QuickMenuSound::kClose);
+  }
   callbacks_.defer(callbacks_.close);
 }
 
@@ -543,6 +615,9 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   const double now = ImGui::GetTime();
   if (open_time_ < 0.0) {
     open_time_ = now;
+    if (config_.sound) {
+      config_.sound(QuickMenuSound::kOpen);
+    }
   }
   if (config_.sections.empty()) {
     RequestClose();
@@ -726,6 +801,9 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
 
   const int section_count = int(config_.sections.size());
   if (section_step) {
+    if (config_.sound) {
+      config_.sound(QuickMenuSound::kMove);
+    }
     section_ = size_t((int(section_) + section_step + section_count) % section_count);
     lists_stale_ = true;
     std::vector<size_t> shown = ShownItems(config_.sections[section_]);
@@ -743,6 +821,9 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     selected_item_ = next != rows.end() ? *next : rows.back();
   }
   if (move && !rows.empty()) {
+    if (config_.sound) {
+      config_.sound(QuickMenuSound::kMove);
+    }
     const int row_count = int(rows.size());
     const int row = int(std::find(rows.begin(), rows.end(), selected_item_) - rows.begin());
     selected_item_ = rows[size_t((row + move + row_count) % row_count)];
@@ -799,6 +880,13 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   const float content_right = panel_max.x - padding;
 
   const Palette color{float(std::clamp((now - open_time_) / 0.15, 0.0, 1.0))};
+  const QuickMenuTheme& theme = config_.theme;
+  g_text_shadow = theme.text_shadow.a ? color(theme.text_shadow) : 0;
+  g_art_text = config_.art.text ? &config_.art.text : nullptr;
+  g_art_button = config_.art.button ? &config_.art.button : nullptr;
+  if (g_art_text) {
+    g_text_shadow = 0;  // the game's font has its own outline
+  }
 
   ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
   ImGui::SetNextWindowSize(display);
@@ -811,6 +899,9 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
           ImGuiWindowFlags_NoScrollWithMouse);
   ImGui::PopStyleVar(2);
   if (!window_open) {
+    g_text_shadow = 0;
+    g_art_text = nullptr;
+    g_art_button = nullptr;
     ImGui::End();
     return;
   }
@@ -822,13 +913,61 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   draw_list->AddRectFilled(ImVec2(panel_min.x + 8.0f * u, panel_min.y + 10.0f * u),
                            ImVec2(panel_max.x + 8.0f * u, panel_max.y + 10.0f * u),
                            color(0, 0, 0, 90), 22.0f * u);
-  draw_list->AddRectFilled(panel_min, panel_max, color(13, 17, 26, 236), 20.0f * u);
-  draw_list->AddRect(panel_min, panel_max, color(255, 255, 255, 46), 20.0f * u, 0, 2.0f * u);
+  if (config_.art.panel) {
+    config_.art.panel(draw_list, panel_min.x, panel_min.y, panel_max.x, panel_max.y,
+                      panel_min.y + padding + (kTitleHeight + kTabsHeight) * u - 2.0f * u,
+                      panel_max.y - kHintsHeight * u - 10.0f * u, u, color.alpha);
+  } else {
+    const float radius = theme.rounding * u;
+    const ImU32 top = color(theme.panel_top), bottom = color(theme.panel_bottom);
+    if (top == bottom) {
+      draw_list->AddRectFilled(panel_min, panel_max, top, radius);
+    } else {
+      // Rounded ends, the fade between them.
+      draw_list->AddRectFilled(panel_min, ImVec2(panel_max.x, panel_min.y + radius * 2.0f), top,
+                               radius, ImDrawFlags_RoundCornersTop);
+      draw_list->AddRectFilled(ImVec2(panel_min.x, panel_max.y - radius * 2.0f), panel_max,
+                               bottom, radius, ImDrawFlags_RoundCornersBottom);
+      draw_list->AddRectFilledMultiColor(ImVec2(panel_min.x, panel_min.y + radius),
+                                         ImVec2(panel_max.x, panel_max.y - radius), top, top,
+                                         bottom, bottom);
+    }
+    if (theme.header.a) {
+      const float bottom = panel_min.y + padding + (kTitleHeight + kTabsHeight) * u - 2.0f * u;
+      const float inset = theme.border_width * u * 0.5f;
+      draw_list->AddRectFilled(ImVec2(panel_min.x + inset, panel_min.y + inset),
+                               ImVec2(panel_max.x - inset, bottom), color(theme.header),
+                               radius - inset, ImDrawFlags_RoundCornersTop);
+      if (theme.header_line.a) {
+        draw_list->AddRectFilledMultiColor(
+            ImVec2(panel_min.x + inset, bottom), ImVec2(panel_max.x - inset, bottom + 3.0f * u),
+            color(theme.header_line), color(theme.header_line), color(theme.header_line),
+            color(theme.header_line));
+      }
+    }
+    draw_list->AddRect(panel_min, panel_max, color(theme.border), radius, 0,
+                       theme.border_width * u);
+  }
 
   // Title and what the game renders at.
   float y = panel_min.y + padding;
-  DrawText(draw_list, 42.0f * u, ImVec2(content_left, y - 4.0f * u), color(255, 206, 38),
-           config_.title);
+  if (theme.title_outline.a) {
+    const ImU32 shadow = g_text_shadow;
+    g_text_shadow = 0;
+    const float o = 2.5f * u;
+    for (const ImVec2 d : {ImVec2(-o, 0), ImVec2(o, 0), ImVec2(0, -o), ImVec2(0, o),
+                           ImVec2(-o, -o), ImVec2(o, -o), ImVec2(-o, o), ImVec2(o, o),
+                           ImVec2(o * 1.6f, o * 1.8f)}) {
+      DrawText(draw_list, 42.0f * u, ImVec2(content_left + d.x, y - 4.0f * u + d.y),
+               color(theme.title_outline), config_.title);
+    }
+    DrawText(draw_list, 42.0f * u, ImVec2(content_left, y - 4.0f * u), color(theme.title),
+             config_.title);
+    g_text_shadow = shadow;
+  } else {
+    DrawText(draw_list, 42.0f * u, ImVec2(content_left, y - 4.0f * u), color(theme.title),
+             config_.title);
+  }
   {
     std::string status;
     const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
@@ -857,23 +996,35 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const float size = 22.0f * u;
       DrawText(draw_list, size,
                ImVec2(content_right - TextSize(size, status).x, y + 12.0f * u),
-               color(160, 172, 188), status);
+               color(theme.status), status);
     }
   }
   y += kTitleHeight * u;
 
-  // Section tabs, LB / RB.
+  // Section tabs, LB / RB - smaller when they wouldn't fit (a wide font).
   {
-    const float size = 24.0f * u;
+    float size = 24.0f * u;
+    {
+      float tabs = 0.0f;
+      for (const QuickMenuSection& tab : config_.sections) {
+        tabs += TextSize(size, tab.title).x + 28.0f * u;
+      }
+      const float chips = TextSize(18.0f * u, ShoulderName(false)).x +
+                          TextSize(18.0f * u, ShoulderName(true)).x + 60.0f * u;
+      const float room = content_right - content_left - chips;
+      if (tabs > room && tabs > 0.0f) {
+        size *= room / tabs;
+      }
+    }
     const float chip_size = 18.0f * u;
     auto draw_chip = [&](float x, std::string_view text) {
       const ImVec2 text_size = TextSize(chip_size, text);
       const ImVec2 chip_min(x, y + 6.0f * u);
       const ImVec2 chip_max(x + text_size.x + 16.0f * u, y + 36.0f * u);
-      draw_list->AddRectFilled(chip_min, chip_max, color(58, 66, 82), 6.0f * u);
+      draw_list->AddRectFilled(chip_min, chip_max, color(theme.chip), 6.0f * u);
       DrawText(draw_list, chip_size,
                ImVec2(chip_min.x + 8.0f * u, chip_min.y + (chip_max.y - chip_min.y - text_size.y) * 0.5f),
-               color(225, 230, 238), text);
+               color(theme.chip_text), text);
       return chip_max.x;
     };
     float x = draw_chip(content_left, ShoulderName(false)) + 18.0f * u;
@@ -883,13 +1034,29 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const ImVec2 tab_min(x - 6.0f * u, y);
       const ImVec2 tab_max(x + text_size.x + 6.0f * u, y + 44.0f * u);
       const bool active = size_t(i) == section_;
+      if (active && theme.tab_pill.a) {
+        draw_list->AddRectFilled(ImVec2(x - 12.0f * u, y + 2.0f * u),
+                                 ImVec2(x + text_size.x + 12.0f * u, y + 40.0f * u),
+                                 color(theme.tab_pill), 19.0f * u);
+      }
+      // No shadow on the pill: dark text on a light fill.
+      const ImU32 shadow = g_text_shadow;
+      if (active && theme.tab_pill.a) {
+        g_text_shadow = 0;
+      }
       DrawText(draw_list, size, ImVec2(x, y + 6.0f * u),
-               active ? color(255, 255, 255) : color(140, 150, 166), title);
-      if (active) {
+               active ? (theme.tab_pill.a ? color(theme.tab_pill_text) : color(theme.tab_active))
+                      : color(theme.tab),
+               title);
+      g_text_shadow = shadow;
+      if (active && !theme.tab_pill.a) {
         draw_list->AddRectFilled(ImVec2(x, y + 40.0f * u), ImVec2(x + text_size.x, y + 44.0f * u),
-                                 color(0, 196, 206), 2.0f * u);
+                                 color(theme.tab_underline), 2.0f * u);
       }
       if (row_clicked && ImGui::IsMouseHoveringRect(tab_min, tab_max) && !active) {
+        if (config_.sound) {
+          config_.sound(QuickMenuSound::kMove);
+        }
         section_ = size_t(i);
         lists_stale_ = true;
         std::vector<size_t> shown = ShownItems(config_.sections[section_]);
@@ -900,12 +1067,20 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     draw_chip(x - 10.0f * u, ShoulderName(true));
   }
   y += kTabsHeight * u;
-  draw_list->AddLine(ImVec2(content_left, y), ImVec2(content_right, y), color(255, 255, 255, 28),
-                     1.5f * u);
+  if (!theme.header_line.a) {
+    draw_list->AddLine(ImVec2(content_left, y), ImVec2(content_right, y), color(theme.divider),
+                       1.5f * u);
+  }
   y += 14.0f * u;
 
   // Settings.
   const float row_height = kRowHeight * u;
+  if (theme.list_background.a) {
+    const ImVec2 list_min(panel_min.x + padding * 0.3f, y - 6.0f * u);
+    const ImVec2 list_max(panel_max.x - padding * 0.3f, y + float(max_rows) * row_height);
+    draw_list->AddRectFilled(list_min, list_max, color(theme.list_background), 12.0f * u);
+    draw_list->AddRect(list_min, list_max, color(theme.divider), 12.0f * u, 0, 1.0f * u);
+  }
   const float label_size = 29.0f * u;
   const float value_size = 27.0f * u;
   for (size_t row = 0; row < rows.size(); ++row) {
@@ -915,21 +1090,32 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     const ImVec2 row_max(panel_max.x - padding * 0.45f, row_min.y + row_height - 6.0f * u);
     const float center_y = (row_min.y + row_max.y) * 0.5f;
     const bool hovered = ImGui::IsMouseHoveringRect(row_min, row_max);
-    if (hovered && mouse_moved) {
+    if (hovered && mouse_moved && selected_item_ != item_index) {
       selected_item_ = item_index;
+      if (config_.sound) {
+        config_.sound(QuickMenuSound::kMove);
+      }
     }
     const bool selected = item_index == selected_item_;
     if (selected) {
-      draw_list->AddRectFilled(row_min, row_max, color(0, 128, 146, 226), 10.0f * u);
-      draw_list->AddRectFilled(row_min, ImVec2(row_min.x + 6.0f * u, row_max.y),
-                               color(255, 206, 38), 10.0f * u, ImDrawFlags_RoundCornersLeft);
+      FillFade(draw_list, row_min, row_max, color(theme.row), color(theme.row_end),
+               theme.row_rounding * u);
+      if (theme.row_outline.a) {
+        draw_list->AddRect(row_min, row_max, color(theme.row_outline), theme.row_rounding * u, 0,
+                           1.5f * u);
+      }
+      if (theme.row_accent.a) {
+        draw_list->AddRectFilled(row_min, ImVec2(row_min.x + 6.0f * u, row_max.y),
+                                 color(theme.row_accent), theme.row_rounding * u,
+                                 ImDrawFlags_RoundCornersLeft);
+      }
     }
 
     // Label.
     const ImVec2 label_extent = TextSize(label_size, item.label);
     const float label_x = row_min.x + 30.0f * u;
     DrawText(draw_list, label_size, ImVec2(label_x, center_y - label_extent.y * 0.5f),
-             selected ? color(255, 255, 255) : color(222, 228, 236), item.label);
+             selected ? color(theme.label_selected) : color(theme.label), item.label);
     const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(item.cvar);
     if (info && info->lifecycle == rex::cvar::Lifecycle::kRequiresRestart) {
       const float badge_size = 17.0f * u;
@@ -948,19 +1134,20 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const float switch_width = 72.0f * u, switch_height = 34.0f * u;
       const ImVec2 track_min(right - switch_width, center_y - switch_height * 0.5f);
       const ImVec2 track_max(right, center_y + switch_height * 0.5f);
-      draw_list->AddRectFilled(track_min, track_max, on ? color(0, 200, 160) : color(66, 74, 90),
+      draw_list->AddRectFilled(track_min, track_max,
+                               on ? color(theme.switch_on) : color(theme.switch_off),
                                switch_height * 0.5f);
       const float knob_radius = switch_height * 0.5f - 4.0f * u;
       draw_list->AddCircleFilled(
           ImVec2(on ? track_max.x - switch_height * 0.5f : track_min.x + switch_height * 0.5f,
                  center_y),
-          knob_radius, color(245, 247, 250), 24);
+          knob_radius, color(theme.knob), 24);
       const char* state_text = on ? "ON" : "OFF";
       const float state_size = 21.0f * u;
       const ImVec2 state_extent = TextSize(state_size, state_text);
       DrawText(draw_list, state_size,
                ImVec2(track_min.x - 12.0f * u - state_extent.x, center_y - state_extent.y * 0.5f),
-               selected ? color(255, 255, 255) : color(150, 160, 175), state_text);
+               selected ? color(theme.label_selected) : color(theme.tab), state_text);
     } else if (item.kind == QuickMenuItem::Kind::kKey) {
       // The key on a key cap, pulsing while it waits for a key.
       const bool waiting = capturing_ == &item;
@@ -971,14 +1158,15 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const ImVec2 cap_max(right, center_y + 19.0f * u);
       if (waiting) {
         const float pulse = 0.5f + 0.5f * float(std::sin(now * 6.0));
-        draw_list->AddRectFilled(cap_min, cap_max, color(255, 206, 38, 70 + int(110.0f * pulse)),
-                                 8.0f * u);
+        QuickMenuColor glow = theme.highlight;
+        glow.a = uint8_t(70 + int(110.0f * pulse));
+        draw_list->AddRectFilled(cap_min, cap_max, color(glow), 8.0f * u);
       } else {
-        draw_list->AddRectFilled(cap_min, cap_max, color(46, 54, 70), 8.0f * u);
+        draw_list->AddRectFilled(cap_min, cap_max, color(theme.cap), 8.0f * u);
       }
       draw_list->AddRect(cap_min, cap_max, color(255, 255, 255, 70), 8.0f * u, 0, 1.5f * u);
       DrawText(draw_list, value_size, ImVec2(cap_min.x + 16.0f * u, center_y - key_extent.y * 0.5f),
-               waiting || selected ? color(255, 255, 255) : color(132, 222, 232), key_text);
+               waiting || selected ? color(theme.value_selected) : color(theme.value), key_text);
     } else if (item.kind == QuickMenuItem::Kind::kAction && !item.list) {
       // A button.
       const std::string& text = item.action_label.empty() ? item.label : item.action_label;
@@ -986,10 +1174,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const ImVec2 cap_min(right - text_extent.x - 40.0f * u, center_y - 19.0f * u);
       const ImVec2 cap_max(right, center_y + 19.0f * u);
       draw_list->AddRectFilled(cap_min, cap_max,
-                               selected ? color(255, 206, 38, 200) : color(46, 54, 70), 8.0f * u);
+                               selected ? color(theme.cap_selected) : color(theme.cap), 8.0f * u);
       draw_list->AddRect(cap_min, cap_max, color(255, 255, 255, 70), 8.0f * u, 0, 1.5f * u);
       DrawText(draw_list, value_size, ImVec2(cap_min.x + 20.0f * u, center_y - text_extent.y * 0.5f),
-               selected ? color(20, 24, 32) : color(132, 222, 232), text);
+               selected ? color(theme.cap_selected_text) : color(theme.value), text);
     } else {
       std::string value_text;
       bool can_lower = true, can_raise = true;
@@ -1026,7 +1214,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       const float right_arrow_x = right - arrow_width;
       const float value_x = right_arrow_x - gap - value_extent.x;
       const float left_arrow_x = value_x - gap - arrow_width;
-      const ImU32 value_color = selected ? color(255, 255, 255) : color(132, 222, 232);
+      const ImU32 value_color = selected ? color(theme.value_selected) : color(theme.value);
       auto arrow_color = [&](bool enabled) {
         return enabled ? value_color : color(255, 255, 255, 50);
       };
@@ -1058,7 +1246,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
 
   // Help for the selected setting.
   draw_list->AddLine(ImVec2(content_left, y - 8.0f * u), ImVec2(content_right, y - 8.0f * u),
-                     color(255, 255, 255, 28), 1.5f * u);
+                     color(theme.divider), 1.5f * u);
   if (capturing_) {
     const std::string text =
         capture_message_.empty()
@@ -1067,7 +1255,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
             : capture_message_ + " Press another key, or Esc or " + FaceName(Face::kRight) +
                   " to cancel.";
     DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u),
-             capture_message_.empty() ? color(255, 206, 38) : color(255, 140, 90), text,
+             capture_message_.empty() ? color(theme.highlight) : color(theme.warning), text,
              content_right - content_left);
   } else {
     // A section's status line (like what an action did) goes first.
@@ -1076,7 +1264,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     if (!status.text.empty()) {
       const float status_size = 23.0f * u;
       DrawText(draw_list, status_size, ImVec2(content_left, help_y),
-               status.error ? color(255, 140, 90) : color(255, 206, 38), status.text,
+               status.error ? color(theme.warning) : color(theme.highlight), status.text,
                content_right - content_left);
       // Wrapped: about one line per width of text.
       const ImVec2 extent = TextSize(status_size, status.text);
@@ -1085,7 +1273,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       help_y += extent.y * lines + 6.0f * u;
     }
     if (!rows.empty() && help_y < y + (kHelpHeight - 20.0f) * u) {
-      DrawText(draw_list, 23.0f * u, ImVec2(content_left, help_y), color(196, 204, 216),
+      DrawText(draw_list, 23.0f * u, ImVec2(content_left, help_y), color(theme.help),
                section.items[selected_item_].help, content_right - content_left);
     }
   }
@@ -1100,7 +1288,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
       DrawFaceGlyph(draw_list, ImVec2(x + radius, center_y), radius, face, color.alpha);
       x += radius * 2.0f + 9.0f * u;
       DrawText(draw_list, hint_size, ImVec2(x, center_y - TextSize(hint_size, text).y * 0.5f),
-               color(196, 204, 216), text);
+               color(theme.help), text);
       x += TextSize(hint_size, text).x + 26.0f * u;
     };
     draw_button(Face::kBottom, "Change");
@@ -1113,9 +1301,12 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     DrawText(draw_list, hint_size,
              ImVec2(content_right - TextSize(hint_size, saved).x,
                     center_y - TextSize(hint_size, saved).y * 0.5f),
-             color(120, 132, 150), saved);
+             color(theme.faint), saved);
   }
 
+  g_text_shadow = 0;
+  g_art_text = nullptr;
+  g_art_button = nullptr;
   ImGui::End();
 }
 

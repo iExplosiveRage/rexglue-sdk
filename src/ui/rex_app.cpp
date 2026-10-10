@@ -57,6 +57,17 @@
 #include <filesystem>
 #include <string_view>
 
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
@@ -301,6 +312,117 @@ void PerfReportCommand(std::string_view args) {
 
 REXCVAR_DEFINE_COMMAND_ARGS(perf_report, rex::PerfReportCommand, "Debug",
                             "Measure the frame rate and texture cache activity: [seconds]");
+
+namespace rex {
+
+namespace {
+
+// hitch_start / hitch_stop: records every guest frame time in between (the
+// pipe stays free meanwhile, unlike perf_report) and stop answers with the
+// slow frames - for stutter tests across menus and loads.
+struct HitchRecorder {
+  std::mutex mutex;
+  std::thread thread;
+  std::atomic<bool> running{false};
+  std::vector<float> frame_ms;
+  std::array<uint64_t, 4> before{};
+  std::chrono::steady_clock::time_point start;
+};
+
+HitchRecorder& Hitches() {
+  static HitchRecorder recorder;
+  return recorder;
+}
+
+std::array<uint64_t, 4> HitchStats() {
+  perf::TextureCacheStats& tc = perf::GetTextureCacheStats();
+  return {tc.replacement_decodes.load(), tc.replacement_decode_ns.load(),
+          tc.replacement_async_loads.load(), tc.replacement_uploads.load()};
+}
+
+void HitchStartCommand() {
+  HitchRecorder& r = Hitches();
+  if (r.running.exchange(true)) {
+    return;
+  }
+  if (r.thread.joinable()) {
+    r.thread.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(r.mutex);
+    r.frame_ms.clear();
+    r.before = HitchStats();
+    r.start = std::chrono::steady_clock::now();
+  }
+  r.thread = std::thread([&r]() {
+    uint64_t seen = perf::GetGuestSwapCount();
+    float recent[255];
+    while (r.running.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const uint64_t swaps = perf::GetGuestSwapCount();
+      const size_t count = perf::GetGuestFrameTimes(recent, 255);
+      const size_t take = size_t(std::min<uint64_t>(swaps - seen, count));
+      seen = swaps;
+      std::lock_guard<std::mutex> lock(r.mutex);
+      r.frame_ms.insert(r.frame_ms.end(), recent + (count - take), recent + count);
+    }
+  });
+}
+
+void HitchStopCommand() {
+  HitchRecorder& r = Hitches();
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  if (!r.running.exchange(false)) {
+    done(false, "not recording (hitch_start first)");
+    return;
+  }
+  if (r.thread.joinable()) {
+    r.thread.join();
+  }
+  std::vector<float> frames;
+  std::array<uint64_t, 4> before;
+  double seconds;
+  {
+    std::lock_guard<std::mutex> lock(r.mutex);
+    frames = r.frame_ms;
+    before = r.before;
+    seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - r.start).count();
+  }
+  const std::array<uint64_t, 4> after = HitchStats();
+  int over_25 = 0, over_50 = 0, over_100 = 0;
+  float worst = 0.0f;
+  for (float ms : frames) {
+    over_25 += ms > 25.0f;
+    over_50 += ms > 50.0f;
+    over_100 += ms > 100.0f;
+    worst = std::max(worst, ms);
+  }
+  std::vector<float> sorted = frames;
+  std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+  std::string top;
+  for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+    top += fmt::format("{}{:.0f}", i ? " " : "", sorted[i]);
+  }
+  const std::string summary = fmt::format(
+      "{:.0f} s, {} frames | slow frames >25 ms {} >50 ms {} >100 ms {} | worst {:.1f} ms | top "
+      "[{}] | sync decodes {} ({:.0f} ms) async loads {} replacement uploads {}",
+      seconds, frames.size(), over_25, over_50, over_100, double(worst), top,
+      after[0] - before[0], double(after[1] - before[1]) * 1.0e-6, after[2] - before[2],
+      after[3] - before[3]);
+  REXLOG_INFO("hitch_report: {}", summary);
+  done(true, summary);
+}
+
+}  // namespace
+
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND(quick_menu_toggle, rex::ReXApp::ToggleQuickMenuCommand, "Debug",
+                       "Open or close the settings menu (F1)");
+REXCVAR_DEFINE_COMMAND(hitch_start, rex::HitchStartCommand, "Debug",
+                       "Start recording frame times (stutter test); hitch_stop reports");
+REXCVAR_DEFINE_COMMAND(hitch_stop, rex::HitchStopCommand, "Debug",
+                       "Stop recording frame times and report the slow frames");
 
 namespace rex {
 
@@ -820,7 +942,18 @@ bool ReXApp::SetupPresentation() {
   return true;
 }
 
+namespace {
+std::atomic<ReXApp*> g_quick_menu_app{nullptr};
+}  // namespace
+
+void ReXApp::ToggleQuickMenuCommand() {
+  if (ReXApp* app = g_quick_menu_app.load()) {
+    app->app_context().CallInUIThreadDeferred([app]() { app->ToggleQuickMenu(); });
+  }
+}
+
 void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDrawer* drawer) {
+  g_quick_menu_app.store(this);
   OnConfigureQuickMenu(quick_menu_config_);
   imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(
       window_.get(), 64,
@@ -1140,7 +1273,8 @@ void ReXApp::ToggleQuickMenu() {
   callbacks.read_pad = [input_sys]() {
     ui::QuickMenuDialog::PadState pad;
     if (!input_sys) {
-      return pad;
+      // Before the game runs (a start screen): the controllers from SDL.
+      return ui::ReadGamepadsBeforeGame();
     }
     // Any controller can drive the menu; the stick pushed the furthest wins.
     int stick_distance = 0;

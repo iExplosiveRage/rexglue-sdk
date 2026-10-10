@@ -33,6 +33,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/overlay_text.cpp
     overlay/quick_menu.cpp
     overlay/settings_overlay.cpp
+    overlay/system_gamepads.cpp
 )
 
 # Vulkan UI backend
