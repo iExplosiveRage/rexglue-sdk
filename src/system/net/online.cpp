@@ -955,7 +955,9 @@ class Service {
     }
     REXSYS_WARN("[Lobby] disconnected ({}), reconnecting", why);
     if (was_welcomed || lobby_failures_++ == 0) {
-      PostNotice("Online lobby connection lost: " + why);
+      PostNotice(peer_ && peer_connected_
+                     ? "Online lobby connection lost (" + why + "), the match goes on"
+                     : "Online lobby connection lost: " + why);
     }
   }
 
@@ -963,6 +965,13 @@ class Service {
     if (!host_.active || host_.create_sent) {
       return;
     }
+    if (peer_ && peer_connected_) {
+      host_.create_deferred = true;
+      REXSYS_WARN("[Lobby] create deferred: a match with {} is still connected",
+                  peer_name_.empty() ? "a player" : peer_name_);
+      return;
+    }
+    host_.create_deferred = false;
     host_.create_sent = true;
     std::string name = PlayerName();
     lobby_->Send(json{{"t", "create"},
@@ -1137,6 +1146,14 @@ class Service {
         return;
       }
       const std::string peer_name = JsonString(message, "peer_name");
+      const std::string peer_id = JsonString(message, "peer_id");
+      if (peer_ && peer_connected_ && !peer_left_ && peer_id != peer_client_id_) {
+        // A match is on (its room was re-created after a lobby reconnect, say):
+        // it isn't dropped for a newcomer, who times out ("the host didn't
+        // answer") and leaves the seat.
+        REXSYS_WARN("[Lobby] peer_joined {} ignored: in a match with {}", peer_name, peer_name_);
+        return;
+      }
       REXSYS_WARN("[Lobby] peer_joined {}", peer_name);
       ClosePeer("another guest joined");
       peer_client_id_ = JsonString(message, "peer_id");
@@ -1157,6 +1174,7 @@ class Service {
         return;
       }
       REXSYS_WARN("[Lobby] peer_left {}", peer_name_);
+      peer_left_ = true;
       auto closing = peer_;
       PostAt(NowMs() + 2000, [this, closing] {
         if (closing && peer_ == closing) {
@@ -1571,8 +1589,17 @@ class Service {
     peer_connected_ = false;
     hello_ok_ = false;
     remote_hello_ = false;
+    peer_left_ = false;
     if (host_.active) {
       peer_client_id_.clear();
+      if (host_.create_deferred) {
+        // Posted: a new session (host_ reset) right after this has its own create.
+        Post([this] {
+          if (host_.active && host_.create_deferred && welcomed_.load()) {
+            SendCreate();
+          }
+        });
+      }
     }
   }
 
@@ -1655,6 +1682,9 @@ class Service {
     bool active = false;
     bool listed = true;
     bool create_sent = false;
+    // The lobby reconnected during a match: the room is re-created only once
+    // that match's peer is gone, so nobody joins (and replaces it) meanwhile.
+    bool create_deferred = false;
     uint8_t kid[8] = {};
     std::string session;
     std::string room;
@@ -1683,6 +1713,7 @@ class Service {
   int64_t peer_started_ms_ = 0;
   bool peer_connected_ = false;
   bool hello_ok_ = false;
+  bool peer_left_ = false;  // the lobby said the match's guest left the room
   bool remote_hello_ = false;
   int hellos_sent_ = 0;
   bool relay_logged_ = false;
@@ -1697,6 +1728,10 @@ class Service {
 
 void SetGameVersion(std::string_view version) {
   Service::Get().SetGameVersion(std::string(version));
+}
+
+std::string LobbyVersion() {
+  return Service::Get().Version();
 }
 
 void SetSyncedCvars(std::vector<std::string> names) {

@@ -36,6 +36,11 @@ namespace rex::net::online {
 /// online_version overrides it.
 void SetGameVersion(std::string_view version);
 
+/// The version string actually sent to the lobby (the game's version or the
+/// online_version override, plus the transport's "/net<n>"), for example to
+/// ask the lobby about this version's rooms.
+std::string LobbyVersion();
+
 /// Game cvars both players must share (for example the frame driver step).
 /// The guest adopts the host's values for the session, and both sides lock
 /// them until the session is deleted.
