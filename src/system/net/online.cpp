@@ -39,6 +39,7 @@
 #include <rex/version.h>
 
 #include "lobby_client.h"
+#include "online_stats_internal.h"
 #include "peer_transport.h"
 
 REXCVAR_DEFINE_STRING(online_lobby_url, "", "Online",
@@ -462,6 +463,7 @@ class Service {
       }
       url_ = url;
       lobby_mode_.store(true);
+      stats::internal::OnLobbyMode(url_);  // online identity (ranked / stats)
       SetIceLogLevel(REXCVAR_GET(online_ice_log));
       if (const int port = REXCVAR_GET(online_debug_turn_server); port > 0 && port < 65536) {
         StartDebugTurnServer(uint16_t(port));
@@ -558,6 +560,20 @@ class Service {
     });
   }
 
+  // A frame for the lobby from the stats layer (online_stats.cpp).
+  void SendLobbyText(std::string text) {
+    if (!lobby_mode()) {
+      return;
+    }
+    Post([this, text = std::move(text)] {
+      if (lobby_ && welcomed_.load()) {
+        lobby_->Send(text);
+      } else {
+        REXSYS_WARN("[Lobby] not connected: dropped {}", text.substr(0, 120));
+      }
+    });
+  }
+
   void HostModify() {
     if (!lobby_mode()) {
       return;
@@ -621,6 +637,7 @@ class Service {
 
   void SessionDelete() {
     sync_.Unlock();
+    stats::internal::OnSessionEnded();
     {
       std::lock_guard<std::mutex> lock(shared_mutex_);
       joining_kid_.clear();
@@ -926,13 +943,18 @@ class Service {
     if (open) {
       lobby_failures_ = 0;
       REXSYS_INFO("[Lobby] connected, sending hello");
-      lobby_->Send(json{{"t", "hello"},
-                        {"game", "burstlimit"},
-                        {"version", Version()},
-                        {"name", PlayerName()}}
-                       .dump());
+      json hello{{"t", "hello"},
+                 {"game", "burstlimit"},
+                 {"version", Version()},
+                 {"name", PlayerName()}};
+      // The install's online identity, when it has one (ranked / stats).
+      if (json auth = stats::internal::HelloAuth(3000); auth.is_object()) {
+        hello["auth"] = std::move(auth);
+      }
+      lobby_->Send(hello.dump());
       return;
     }
+    stats::internal::OnLobbyClosed();
     const bool was_welcomed = welcomed_.exchange(false);
     host_.create_sent = false;
     host_.room.clear();
@@ -1098,6 +1120,10 @@ class Service {
       return;
     }
     const std::string type = JsonString(message, "t");
+    if (type == "welcome" || type == "joined" || type == "peer_joined" || type == "result_ack" ||
+        type == "battle_result" || type == "me" || type == "error") {
+      stats::internal::OnLobbyMessage(type, message);
+    }
     if (type == "welcome") {
       client_id_ = JsonString(message, "id");
       servers_ = ServersFrom(message);
@@ -1755,6 +1781,18 @@ std::string PlayerName() {
 
 bool GetNotice(Notice* out) {
   return Service::Get().GetNotice(out);
+}
+
+void SendLobbyText(std::string text) {
+  Service::Get().SendLobbyText(std::move(text));
+}
+
+void PostOnlineNotice(std::string text, double seconds) {
+  Service::Get().PostNotice(std::move(text), seconds);
+}
+
+std::string LobbyUrl() {
+  return Service::Get().lobby_mode() ? REXCVAR_GET(online_lobby_url) : std::string();
 }
 
 bool IsLobbyMode() {

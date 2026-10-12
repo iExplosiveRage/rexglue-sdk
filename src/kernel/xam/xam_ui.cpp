@@ -646,7 +646,6 @@ REX_EXPORT_STUB(__imp__XamShowFriendsUIp);
 REX_EXPORT_STUB(__imp__XamShowGameInviteUI);
 REX_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);
 REX_EXPORT_STUB(__imp__XamShowGamerCardUI);
-REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUID);
 REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUIDp);
 REX_EXPORT_STUB(__imp__XamShowGamesUI);
 REX_EXPORT_STUB(__imp__XamShowGenericOnlineAppUI);

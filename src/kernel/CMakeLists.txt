@@ -20,6 +20,7 @@ set(REXKERNEL_SOURCES
     xam/xam_task.cpp
     xam/xam_ui.cpp
     xam/xam_user.cpp
+    xam/xam_stats.cpp
     xam/xam_video.cpp
     xam/xam_voice.cpp
     xam/xam_misc.cpp

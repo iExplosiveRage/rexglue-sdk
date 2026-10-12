@@ -749,7 +749,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);

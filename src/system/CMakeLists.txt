@@ -21,6 +21,7 @@ set(REXSYSTEM_SOURCES
 
     # Online lobby + ICE transport (see include/rex/net/online.h)
     net/online.cpp
+    net/online_stats.cpp
     net/peer_transport.cpp
     xobject.cpp
     xmodule.cpp
@@ -119,10 +120,10 @@ endif()
 # Windows (and under Wine), a stub elsewhere.
 target_link_libraries(rexruntime PRIVATE juice)
 if(WIN32)
-    target_sources(rexruntime PRIVATE net/lobby_client_win.cpp)
+    target_sources(rexruntime PRIVATE net/lobby_client_win.cpp net/http_client_win.cpp)
     target_link_libraries(rexruntime PRIVATE winhttp)
 else()
-    target_sources(rexruntime PRIVATE net/lobby_client_stub.cpp)
+    target_sources(rexruntime PRIVATE net/lobby_client_stub.cpp net/http_client_stub.cpp)
 endif()
 
 if(REXGLUE_USE_D3D12)

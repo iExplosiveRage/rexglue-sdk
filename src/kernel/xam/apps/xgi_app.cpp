@@ -22,6 +22,7 @@
 #include <rex/logging.h>
 #include <rex/net/online.h>
 #include <rex/net/session.h>
+#include <rex/system/kernel_state.h>
 #include <rex/thread.h>
 
 namespace rex {
@@ -29,6 +30,11 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+// xam_stats.cpp: XUserReadStats answered from the online lobby (ranked data).
+X_HRESULT XamReadStatsFromLobby(memory::Memory* memory, uint32_t xuid_count, uint32_t xuids_ptr,
+                                uint32_t spec_count, uint32_t specs_ptr, uint32_t results_size,
+                                uint32_t results_ptr);
+
 namespace apps {
 using namespace rex::system;
 
@@ -604,6 +610,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionArbitrationRegister({:08X}, {:08X}, {:016X}, {:08X}, {:08X}, {:08X})",
                     obj_ptr, flags, session_nonce, session_duration_sec, results_buffer_size,
                     results_ptr);
+      // XSESSION_REGISTRATION_RESULTS with no registrants (the buffer is the
+      // game's uninitialised allocation otherwise). Games that drop peers
+      // missing from the list mark them registered on their side
+      // (Burst Limit: burstlimit_ranked.cpp).
+      if (results_ptr && results_buffer_size >= 8) {
+        std::memset(memory_->TranslateVirtual(results_ptr), 0, 8);
+      }
+      REXKRNL_INFO("[RankedLive] XSessionArbitrationRegister (results: no registrants)");
 
       return X_E_SUCCESS;
     }
@@ -664,6 +678,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
 
+      if (rex::net::online::IsLobbyMode()) {
+        // Online lobby: the ranked Power Level / grade the lobby keeps.
+        return XamReadStatsFromLobby(memory_, xuids_count, xuids_ptr, specs_count, specs_ptr,
+                                     results_size, results_ptr);
+      }
       REXKRNL_WARN("[BurstLiveStats] XUserReadStats unavailable; returning logon-not-logged-on");
       return 0x80151802u;
     }
@@ -677,6 +696,26 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
                     views_ptr);
+      // Logged only: online results come from the battle reports to the lobby.
+      if (views_ptr && num_views <= 8) {
+        std::string text;
+        const uint8_t* views = memory_->TranslateVirtual(views_ptr);
+        for (uint32_t v = 0; v < num_views; ++v) {
+          const uint32_t view_id = memory::load_and_swap<uint32_t>(views + v * 12);
+          const uint32_t count = memory::load_and_swap<uint32_t>(views + v * 12 + 4);
+          const uint32_t props = memory::load_and_swap<uint32_t>(views + v * 12 + 8);
+          text += fmt::format(" view {:X}:", view_id);
+          for (uint32_t p = 0; props && p < count && p < 8; ++p) {
+            const uint8_t* prop = memory_->TranslateVirtual(props + p * 24);
+            const uint32_t id = memory::load_and_swap<uint32_t>(prop);
+            const int64_t value = prop[8] == 2
+                                      ? int64_t(memory::load_and_swap<uint64_t>(prop + 16))
+                                      : int64_t(int32_t(memory::load_and_swap<uint32_t>(prop + 16)));
+            text += fmt::format(" {:08X}={}", id, value);
+          }
+        }
+        REXKRNL_INFO("[RankedLive] XSessionWriteStats xuid {:016X}{}", xuid, text);
+      }
 
       return X_E_SUCCESS;
     }
