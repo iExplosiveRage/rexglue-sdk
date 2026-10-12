@@ -10,6 +10,7 @@
  */
 
 #include <rex/net/online.h>
+#include <rex/net/online_stats.h>
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -1121,13 +1123,26 @@ class Service {
     }
     const std::string type = JsonString(message, "t");
     if (type == "welcome" || type == "joined" || type == "peer_joined" || type == "result_ack" ||
-        type == "battle_result" || type == "me" || type == "error") {
+        type == "battle_result" || type == "me" || type == "error" || type == "authed") {
       stats::internal::OnLobbyMessage(type, message);
+    }
+    if (type == "authed") {
+      // The identity fetched after a refused ranked create / join: send it again.
+      const std::string retry = std::exchange(auth_retry_, std::string());
+      REXSYS_WARN("[Lobby] identity accepted{}", retry.empty() ? "" : ", sending " + retry + " again");
+      if (retry == "create" && host_.active && !host_.create_sent) {
+        SendCreate();
+      } else if (retry == "join" && guest_.active && !guest_.join_sent && !guest_.done) {
+        SendJoin();
+      }
+      return;
     }
     if (type == "welcome") {
       client_id_ = JsonString(message, "id");
       servers_ = ServersFrom(message);
       welcomed_.store(true);
+      auth_retried_ = false;
+      auth_retry_.clear();
       REXSYS_WARN("[Lobby] welcome id={} stun={}:{} turn={}", client_id_,
                   servers_.stun_host.empty() ? "-" : servers_.stun_host, servers_.stun_port,
                   servers_.turn.size());
@@ -1219,6 +1234,53 @@ class Service {
       const std::string re = JsonString(message, "re");
       REXSYS_WARN("[Lobby] error {} ({}) for {}", code, JsonString(message, "message"),
                   re.empty() ? "-" : re);
+      if ((re == "create" || re == "join") && code == "auth_required" && !auth_retried_) {
+        // No identity on this connection (the game started while the lobby couldn't give one):
+        // get one now, hand it to the lobby (t:auth) and send the create / join again on authed.
+        auth_retried_ = true;
+        auth_retry_ = re;
+        if (re == "create") {
+          host_.create_sent = false;
+        } else {
+          guest_.join_sent = false;
+        }
+        PostNotice("Getting an online identity for Ranked Match...");
+        std::thread([this] {
+          json auth = stats::internal::HelloAuth(12000);
+          Post([this, auth = std::move(auth)] {
+            if (!lobby_ || !welcomed_.load()) {
+              auth_retry_.clear();
+              return;
+            }
+            if (!auth.is_object()) {
+              const std::string retry = std::exchange(auth_retry_, std::string());
+              PostNotice("Ranked Match needs an online identity: " + stats::IdentityStatus());
+              if (retry == "join") {
+                FailJoin("no online identity");
+              }
+              return;
+            }
+            lobby_->Send(json{{"t", "auth"}, {"auth", auth}}.dump());
+          });
+        }).detach();
+        return;
+      }
+      if (re == "auth") {
+        const std::string retry = std::exchange(auth_retry_, std::string());
+        if (code == "already_authed") {
+          if (retry == "create") {
+            SendCreate();
+          } else if (retry == "join") {
+            SendJoin();
+          }
+          return;
+        }
+        PostNotice("The online lobby refused the online identity: " + code);
+        if (retry == "join") {
+          FailJoin("no online identity");
+        }
+        return;
+      }
       if (re == "join") {
         if (code == "already_in_room") {
           lobby_->Send(R"({"t":"leave"})");
@@ -1744,6 +1806,8 @@ class Service {
   int hellos_sent_ = 0;
   bool relay_logged_ = false;
   bool host_notice_shown_ = false;
+  bool auth_retried_ = false;  // one identity fetch per lobby connection after auth_required
+  std::string auth_retry_;     // "create" / "join" to send again once the lobby says authed
   uint32_t ping_id_ = 0;
   uint64_t quiet_ticks_ = 0;
 };

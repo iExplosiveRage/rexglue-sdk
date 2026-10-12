@@ -233,6 +233,16 @@ class Stats {
       if (!reregister.empty()) {
         std::thread([this] { Register(); }).detach();
       }
+    } else if (type == "authed") {
+      // An identity added after hello (online.cpp: t:auth after a refused ranked create / join).
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (m.contains("player") && m["player"].is_object()) {
+        me_ = ParsePlayer(m["player"]);
+        have_me_ = true;
+        accepted_ = true;
+        REXSYS_WARN("[Ranked] authed: {} power {} grade {} rank {}", me_.name, me_.power, me_.grade,
+                    me_.rank);
+      }
     } else if (type == "joined" || type == "peer_joined") {
       std::lock_guard<std::mutex> lock(mutex_);
       match_ = MatchInfo{};
@@ -308,8 +318,6 @@ class Stats {
       const std::string code = JStr(m, "code");
       if (re == "result") {
         REXSYS_WARN("[Ranked] result refused: {}", code);
-      } else if ((re == "create" || re == "join") && code == "auth_required") {
-        PostOnlineNotice("Ranked Match needs an online identity: restart the game once online", 7.0);
       } else if (re == "join" && code == "same_player") {
         PostOnlineNotice("That Ranked room is your own", 5.0);
       }
