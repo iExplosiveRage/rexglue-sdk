@@ -223,7 +223,11 @@ class Stats {
                       JStr(m, "auth_error"));
           id_.clear();
           key_.clear();
-          SaveIdentityLocked();
+          try {
+            SaveIdentityLocked();
+          } catch (const std::exception& e) {
+            REXSYS_WARN("[Ranked] couldn't save the online identity: {}", e.what());
+          }
           if (!rest_base_.empty() && !registering_) {
             registering_ = true;
             reregister = rest_base_;
@@ -659,15 +663,24 @@ class Stats {
                 "is your password on the online lobby.";
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    const auto temp = path.string() + ".tmp";
+    // Path operations stay wide: path.string() throws on Windows when the folder has a
+    // character the ANSI code page lacks (an Arabic user name on English Windows, say).
+    auto temp = path;
+    temp += ".tmp";
     {
       std::ofstream file(temp, std::ios::binary | std::ios::trunc);
-      file << j.dump(2);
+      file << j.dump(2, ' ', false, json::error_handler_t::replace);
     }
     std::filesystem::rename(temp, path, ec);
     if (ec) {
-      REXSYS_WARN("[Ranked] couldn't save {}: {}", path.string(), ec.message());
+      REXSYS_WARN("[Ranked] couldn't save {}: {}", PathText(path), ec.message());
     }
+  }
+
+  // A path for logs, as UTF-8 (never throws).
+  static std::string PathText(const std::filesystem::path& path) {
+    const auto text = path.u8string();  // std::string with -fno-char8_t
+    return std::string(text.begin(), text.end());
   }
 
   void Register() {
@@ -687,9 +700,14 @@ class Stats {
         id_ = JStr(j, "id");
         key_ = JStr(j, "key");
         if (!id_.empty() && !key_.empty()) {
-          SaveIdentityLocked();
+          try {
+            SaveIdentityLocked();
+          } catch (const std::exception& e) {
+            // Keep the identity for this session even if the file can't be written.
+            REXSYS_WARN("[Ranked] couldn't save the online identity: {}", e.what());
+          }
           REXSYS_WARN("[Ranked] new online identity {} ({}) saved to {}", id_, name,
-                      IdentityPathLocked().string());
+                      PathText(IdentityPathLocked()));
           register_error_.clear();
           registering_ = false;
           cv_.notify_all();
