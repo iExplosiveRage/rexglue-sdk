@@ -180,12 +180,22 @@ void RegisterDrawResolutionScaleCallbacks() {
         [](std::string_view, std::string_view value) { SetDebugSkippedPixelShaders(value); });
     for (const char* name :
          {"draw_resolution_scale_x", "draw_resolution_scale_y", "resolution_scale",
-          "present_effect", "present_fsr_quality_mode", "dlss_mode", "fsr_mode"}) {
+          "present_effect", "present_fsr_quality_mode", "dlss_mode", "fsr_mode",
+          "draw_resolution_percent"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
         D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
       });
     }
   });
+}
+
+// Rendering below 1x the settings ask for at the render scale of the render
+// target cache. Both paths: host render targets and the EDRAM buffer of pixel
+// shader interlock (the default on Intel) keep the 1x layout, and the game is
+// drawn into its top-left part - host pixel (x, y) stays EDRAM pixel (x, y).
+uint32_t ChooseDrawResolutionPercent(const D3D12RenderTargetCache& render_target_cache) {
+  return TextureCache::GetConfigDrawResolutionPercent(
+      render_target_cache.draw_resolution_scale_x(), render_target_cache.draw_resolution_scale_y());
 }
 
 }  // namespace
@@ -312,7 +322,16 @@ bool D3D12CommandProcessor::IsDrawResolutionScaleChangePending() const {
   return scale_x != texture_cache_->draw_resolution_scale_x() ||
          scale_y != texture_cache_->draw_resolution_scale_y() ||
          target_x != draw_resolution_target_scale_x_ ||
-         target_y != draw_resolution_target_scale_y_;
+         target_y != draw_resolution_target_scale_y_ || IsDrawResolutionPercentChangePending();
+}
+
+bool D3D12CommandProcessor::IsDrawResolutionPercentChangePending() const {
+  if (!render_target_cache_ || !texture_cache_) {
+    return false;
+  }
+  // At the current render scale (a scale change recreates the caches anyway).
+  return ChooseDrawResolutionPercent(*render_target_cache_) !=
+         render_target_cache_->draw_resolution_percent();
 }
 
 void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
@@ -339,7 +358,8 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
     target_y = scale_y;
   }
   if (scale_x == texture_cache_->draw_resolution_scale_x() &&
-      scale_y == texture_cache_->draw_resolution_scale_y()) {
+      scale_y == texture_cache_->draw_resolution_scale_y() &&
+      !IsDrawResolutionPercentChangePending()) {
     pending_draw_resolution_scale_ = 0;
     // Only the scale DLSS upscales to may have changed (Performance at 2x and
     // off at 1x both render at 1x).
@@ -411,12 +431,17 @@ bool D3D12CommandProcessor::RecreateDrawResolutionScaledCaches(uint32_t scale_x,
       REXGPU_ERROR("Failed to initialize the render target cache");
       return false;
     }
+    const uint32_t percent = ChooseDrawResolutionPercent(*render_target_cache_);
+    render_target_cache_->SetDrawResolutionPercent(percent);
     texture_cache_ = D3D12TextureCache::Create(*register_file_, *shared_memory_, x, y, *this,
                                                bindless_resources_used_);
     if (!texture_cache_) {
       REXGPU_ERROR("Failed to initialize the texture cache");
       return false;
     }
+    texture_cache_->SetDrawResolutionPercent(percent);
+    rex::perf::SetDrawResolutionPercent(percent);
+    REXGPU_INFO("Draw resolution percent: {}", percent);
     pipeline_cache_ = std::make_unique<PipelineCache>(*this, *register_file_,
                                                       *render_target_cache_.get(),
                                                       bindless_resources_used_);
@@ -1293,6 +1318,8 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
+  const uint32_t draw_resolution_percent = ChooseDrawResolutionPercent(*render_target_cache_);
+  render_target_cache_->SetDrawResolutionPercent(draw_resolution_percent);
 
   // Initialize resource binding.
   constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
@@ -1545,6 +1572,13 @@ bool D3D12CommandProcessor::SetupContext() {
   if (!texture_cache_) {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
+  }
+  texture_cache_->SetDrawResolutionPercent(draw_resolution_percent);
+  rex::perf::SetDrawResolutionPercent(draw_resolution_percent);
+  if (draw_resolution_percent < 100) {
+    REXGPU_INFO("Rendering below 1x: {}% ({}x{} of 1280x720)", draw_resolution_percent,
+                TextureCache::DownscaleCeil(1280, draw_resolution_percent),
+                TextureCache::DownscaleCeil(720, draw_resolution_percent));
   }
 
   pipeline_cache_ = std::make_unique<PipelineCache>(
@@ -2847,6 +2881,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
+  if (pixel_shader && pixel_shader_draw_override &&
+      pixel_shader_draw_override->soft_texture_fetch_mask) {
+    pixel_shader_modification.pixel.soft_texture_fetch_size =
+        std::clamp(pixel_shader_draw_override->soft_texture_fetch_size, uint32_t(1), uint32_t(15));
+  }
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
@@ -4304,7 +4343,6 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   viewport.Height = float(viewport_info.xy_extent[1]);
   viewport.MinDepth = viewport_info.z_min;
   viewport.MaxDepth = viewport_info.z_max;
-  SetViewport(viewport);
 
   // Scissor.
   D3D12_RECT scissor_rect;
@@ -4312,6 +4350,29 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor.offset[1]);
   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
+
+  // Below 1x (draw_resolution_percent): everything the game draws goes into
+  // the top-left part of the render targets - guest pixel position p is host
+  // position p * percent / 100 (the half-pixel offset included, which then
+  // still lands on texel centers of the textures made at that size).
+  const uint32_t draw_resolution_percent = render_target_cache_->draw_resolution_percent();
+  if (draw_resolution_percent < 100) {
+    const float fraction = float(draw_resolution_percent) * 0.01f;
+    viewport.TopLeftX *= fraction;
+    viewport.TopLeftY *= fraction;
+    viewport.Width *= fraction;
+    viewport.Height *= fraction;
+    // Outwards - pixels outside the triangles aren't covered anyway.
+    scissor_rect.left = LONG(uint64_t(std::max(scissor_rect.left, LONG(0))) *
+                             draw_resolution_percent / 100);
+    scissor_rect.top = LONG(uint64_t(std::max(scissor_rect.top, LONG(0))) *
+                            draw_resolution_percent / 100);
+    scissor_rect.right = LONG((uint64_t(std::max(scissor_rect.right, LONG(0))) *
+                                   draw_resolution_percent + 99) / 100);
+    scissor_rect.bottom = LONG((uint64_t(std::max(scissor_rect.bottom, LONG(0))) *
+                                    draw_resolution_percent + 99) / 100);
+  }
+  SetViewport(viewport);
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -6222,6 +6283,11 @@ uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) cons
   uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
   uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
   uint64_t scale = scale_x * scale_y;
+  // Below 1x, fewer samples are drawn (percent^2 / 10000 of them).
+  const uint64_t percent = render_target_cache_ ? render_target_cache_->draw_resolution_percent() : 100;
+  if (percent < 100) {
+    return (samples * 10000 + ((percent * percent) >> 1)) / (percent * percent);
+  }
   if (scale <= 1) {
     return samples;
   }

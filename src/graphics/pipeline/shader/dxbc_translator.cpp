@@ -663,6 +663,12 @@ void DxbcShaderTranslator::StartPixelShader() {
                dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
                              1.0f));
     }
+    if (draw_resolution_percent_ < 100) {
+      // Below 1x, the guest pixel of the host one.
+      const float inverse = 100.0f / float(draw_resolution_percent_);
+      a_.OpMul(dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::R(param_gen_temp),
+               dxbc::Src::LF(inverse, inverse, 1.0f, 1.0f));
+    }
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
       // (the upper bit of Z is 0).

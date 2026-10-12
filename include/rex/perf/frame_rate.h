@@ -29,6 +29,9 @@ void RecordGuestFrontbuffer(uint32_t width, uint32_t height);
 // Draw resolution scale the GPU backend renders with, and the one the config
 // asked for (higher when an upscaler quality mode renders below it).
 void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32_t requested_y);
+// Rendering below 1x: the percent of the 1x resolution the game is drawn at
+// (100 = off).
+void SetDrawResolutionPercent(uint32_t percent);
 
 struct RenderInfo {
   uint32_t frontbuffer_width = 0;
@@ -37,6 +40,7 @@ struct RenderInfo {
   uint32_t scale_y = 0;
   uint32_t requested_scale_x = 0;
   uint32_t requested_scale_y = 0;
+  uint32_t percent = 100;
 };
 RenderInfo GetRenderInfo();
 

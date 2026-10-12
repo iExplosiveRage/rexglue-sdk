@@ -1202,7 +1202,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool fixed_16_truncated_to_minus_1_to_1 = IsFixed16TruncatedToMinus1To1();
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
-                                 fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+                                 fixed_16_truncated_to_minus_1_to_1, resolve_info,
+                                 draw_resolution_percent())) {
     return false;
   }
 
@@ -1550,6 +1551,14 @@ bool D3D12RenderTargetCache::ClearDrawnInPlace(const DrawnClear& clear) {
     rect.right = LONG((sx1 >> owner_x_log2) * draw_resolution_scale_x());
     rect.top = LONG((sy0 >> owner_y_log2) * draw_resolution_scale_y());
     rect.bottom = LONG((sy1 >> owner_y_log2) * draw_resolution_scale_y());
+    if (IsDrawResolutionDownscaled()) {
+      // Below 1x: the part the game is drawn in (outwards, like the draw).
+      const uint64_t percent = draw_resolution_percent();
+      rect.left = LONG(uint64_t(rect.left) * percent / 100);
+      rect.top = LONG(uint64_t(rect.top) * percent / 100);
+      rect.right = LONG((uint64_t(rect.right) * percent + 99) / 100);
+      rect.bottom = LONG((uint64_t(rect.bottom) * percent + 99) / 100);
+    }
     D3D12_RESOURCE_DESC desc = static_cast<D3D12RenderTarget*>(owner)->resource()->GetDesc();
     return uint64_t(rect.right) <= desc.Width && uint32_t(rect.bottom) <= desc.Height;
   };

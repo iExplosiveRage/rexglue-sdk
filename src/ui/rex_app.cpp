@@ -290,12 +290,13 @@ void PerfReportCommand(std::string_view args) {
     const perf::RenderInfo render = perf::GetRenderInfo();
     const std::string summary = fmt::format(
         "fps {:.1f} frames {} in {:.1f} s | frame ms p50 {:.2f} p95 {:.2f} p99 {:.2f} max {:.2f} | "
-        "scale {}x{} (target {}x{}) | textures/s created {:.1f} destroyed {:.1f} loaded {:.1f} "
+        "scale {}x{} (target {}x{}) {}% | textures/s created {:.1f} destroyed {:.1f} loaded {:.1f} "
         "repl_uploads {:.1f} repl_lookups {:.1f} repl_hashes {:.1f} ({:.2f} ms/s) repl_decodes "
         "{:.1f} ({:.2f} ms/s) | cache {} MB (peak {} MB) limits {}/{} MB | vram {} / {} MB",
         double(frames) / elapsed, frames, elapsed, percentile(0.5), percentile(0.95),
         percentile(0.99), frame_ms.empty() ? 0.0 : double(frame_ms.back()), render.scale_x,
-        render.scale_y, render.requested_scale_x, render.requested_scale_y, per_second(0),
+        render.scale_y, render.requested_scale_x, render.requested_scale_y, render.percent,
+        per_second(0),
         per_second(1), per_second(2), per_second(3), per_second(4), per_second(5),
         double(after[6] - before[6]) * 1.0e-6 / elapsed, per_second(7),
         double(after[8] - before[8]) * 1.0e-6 / elapsed, tc.memory_bytes.load() >> 20,

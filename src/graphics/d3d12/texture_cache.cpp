@@ -1515,6 +1515,17 @@ bool D3D12TextureCache::IsScaledResolveSupportedForFormat(TextureKey key) const 
   return load_shader != kLoadShaderIndexUnknown && load_pipelines_scaled_[load_shader] != nullptr;
 }
 
+bool D3D12TextureCache::IsDownscaledResolveSupportedForFormat(TextureKey key) const {
+  // Loaded from the top-left part of the guest data with the regular shaders -
+  // whole blocks only (resolve formats are 1x1 anyway).
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (format_info->block_width != 1 || format_info->block_height != 1) {
+    return false;
+  }
+  LoadShaderIndex load_shader = GetLoadShaderIndex(key);
+  return load_shader != kLoadShaderIndexUnknown && load_pipelines_[load_shader] != nullptr;
+}
+
 uint32_t D3D12TextureCache::GetHostFormatSwizzle(TextureKey key) const {
   // Dense cache-line-aligned swizzle array avoids cache misses from accessing
   // the full HostFormat struct on every texture fetch.
@@ -1578,8 +1589,13 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   desc.Width = key.GetWidth();
   desc.Height = key.GetHeight();
   if (key.scaled_resolve) {
-    desc.Width *= draw_resolution_scale_x();
-    desc.Height *= draw_resolution_scale_y();
+    if (IsDrawResolutionDownscaled()) {
+      desc.Width = DownscaleCeil(key.GetWidth(), draw_resolution_percent());
+      desc.Height = DownscaleCeil(key.GetHeight(), draw_resolution_percent());
+    } else {
+      desc.Width *= draw_resolution_scale_x();
+      desc.Height *= draw_resolution_scale_y();
+    }
   }
   desc.DepthOrArraySize = key.GetDepthOrArraySize();
   desc.MipLevels = key.mip_max_level + 1;
@@ -1615,7 +1631,11 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   if (load_shader == kLoadShaderIndexUnknown) {
     return false;
   }
-  bool texture_resolution_scaled = texture_key.scaled_resolve;
+  // Below 1x, a texture made from resolved data is loaded from the top-left
+  // part of its guest data in the shared memory, at the smaller size (see
+  // FindOrCreateTexture - single-level, not packed, 1x1 blocks).
+  bool texture_downscaled = texture_key.scaled_resolve && IsDrawResolutionDownscaled();
+  bool texture_resolution_scaled = texture_key.scaled_resolve && !texture_downscaled;
   ID3D12PipelineState* pipeline = texture_resolution_scaled
                                       ? load_pipelines_scaled_[load_shader].Get()
                                       : load_pipelines_[load_shader].Get();
@@ -1631,6 +1651,10 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   bool is_3d_tiling = is_3d || d3d12_texture.force_load_3d_tiling();
   uint32_t width = texture_key.GetWidth();
   uint32_t height = texture_key.GetHeight();
+  if (texture_downscaled) {
+    width = DownscaleCeil(width, draw_resolution_percent());
+    height = DownscaleCeil(height, draw_resolution_percent());
+  }
   uint32_t depth_or_array_size = texture_key.GetDepthOrArraySize();
   uint32_t depth = is_3d ? depth_or_array_size : 1;
   uint32_t array_size = is_3d ? 1 : depth_or_array_size;

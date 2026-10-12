@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -52,6 +53,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
                        uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
   ~DxbcShaderTranslator() override;
+
+  // Rendering below 1x (draw_resolution_percent of the render target cache):
+  // host pixel positions are that percent of the guest ones.
+  void SetDrawResolutionPercent(uint32_t percent) {
+    draw_resolution_percent_ = percent ? std::min(percent, uint32_t(100)) : 100;
+  }
 
   // Stage linkage ordering and rules (must be respected not only within the
   // DxbcShaderTranslator, but also by everything else between the VS and the
@@ -176,6 +183,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // PixelShaderDrawOverride::soft_texture_fetch_mask applies with this
+      // soft_texture_fetch_size (0 - not used).
+      uint32_t soft_texture_fetch_size : 4;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -945,6 +955,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t draw_resolution_percent_ = 100;
 
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.

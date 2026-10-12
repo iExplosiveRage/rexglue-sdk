@@ -34,6 +34,16 @@ struct PixelShaderDrawOverride {
   // Follow the scene projection scale (field of view) on every vertex, not
   // only perspective ones - for scene effects drawn as screen-space sprites.
   bool scene_projection_all_vertices = false;
+  // Resolution-scaled filtering for a game's blur passes: each 2D fetch from
+  // these fetch constants (bit N = tfN) of a resolution-scaled texture
+  // averages the host pixels that make up one guest pixel, so a blur that
+  // samples a few taps at fixed 720p distances reads the picture as on the
+  // console instead of thin, sharp copies of the upscaled one. The mask of a
+  // shader must not change (every variant is translated and kept).
+  uint32_t soft_texture_fetch_mask = 0;
+  // Width of the averaged area in guest pixels (1-15) - above 1 it also
+  // widens the blur. Changing it translates the shader again.
+  uint32_t soft_texture_fetch_size = 1;
 };
 
 // Replaces the overrides set under `owner`; the overrides of all owners apply.

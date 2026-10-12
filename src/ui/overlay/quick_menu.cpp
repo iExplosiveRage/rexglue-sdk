@@ -972,8 +972,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     std::string status;
     const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
     if (info.frontbuffer_width && info.scale_x && info.scale_y) {
-      const uint32_t render_width = info.frontbuffer_width * info.scale_x;
-      const uint32_t render_height = info.frontbuffer_height * info.scale_y;
+      const uint32_t render_width =
+          (info.frontbuffer_width * info.scale_x * info.percent + 99) / 100;
+      const uint32_t render_height =
+          (info.frontbuffer_height * info.scale_y * info.percent + 99) / 100;
       const uint32_t output_width =
           info.frontbuffer_width * std::max(info.requested_scale_x, info.scale_x);
       const uint32_t output_height =

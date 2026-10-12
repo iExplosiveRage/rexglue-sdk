@@ -200,6 +200,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   static void RequestDrawResolutionScaleFromSettings();
   // A new draw resolution scale has been asked for and isn't applied yet.
   bool IsDrawResolutionScaleChangePending() const;
+  // The settings ask for another draw_resolution_percent (below 1x) than the
+  // caches use.
+  bool IsDrawResolutionPercentChangePending() const;
   // The scale the 3D scene ends up at: above the render scale (the texture
   // cache's) when NVIDIA DLSS or AMD FSR upscales it.
   uint32_t draw_resolution_target_scale_x() const { return draw_resolution_target_scale_x_; }

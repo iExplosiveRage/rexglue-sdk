@@ -179,8 +179,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   char text[96];
   const rex::perf::RenderInfo render = rex::perf::GetRenderInfo();
   if (render.scale_x && render.frontbuffer_width) {
-    const uint32_t render_width = render.frontbuffer_width * render.scale_x;
-    const uint32_t render_height = render.frontbuffer_height * render.scale_y;
+    // (Below 1x: the part of the 1x frame the game is drawn in.)
+    const uint32_t render_width =
+        (render.frontbuffer_width * render.scale_x * render.percent + 99) / 100;
+    const uint32_t render_height =
+        (render.frontbuffer_height * render.scale_y * render.percent + 99) / 100;
     const uint32_t output_width =
         render.frontbuffer_width * std::max(render.requested_scale_x, render.scale_x);
     const uint32_t output_height =

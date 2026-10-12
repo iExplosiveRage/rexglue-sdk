@@ -18,6 +18,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -765,6 +766,25 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
   dxbc::Src offsets_src(dxbc::Src::LF(offsets[0], offsets[1], offsets[2], 0.0f));
 
+  // Resolution-scaled filtering of a blur pass (see
+  // SetPixelShaderSoftTextureFetches): sample a grid of host pixels per fetch.
+  // soft_fetch_size guest pixels, soft_fetch_grid x soft_fetch_grid samples
+  // (one per host pixel, or with bilinear filtering one per 2 when wide).
+  uint32_t soft_fetch_grid = 1;
+  uint32_t soft_fetch_size = 0;
+  if (instr.opcode == FetchOpcode::kTextureFetch && is_pixel_shader() &&
+      GetDxbcShaderModification().pixel.soft_texture_fetch_size &&
+      instr.dimension == xenos::FetchOpDimension::k2D) {
+    const PixelShaderDrawOverride* draw_override =
+        FindPixelShaderDrawOverride(current_shader().ucode_data_hash());
+    if (draw_override && ((draw_override->soft_texture_fetch_mask >> tfetch_index) & 1)) {
+      soft_fetch_size = GetDxbcShaderModification().pixel.soft_texture_fetch_size;
+      uint32_t host_pixels =
+          soft_fetch_size * std::max(draw_resolution_scale_x_, draw_resolution_scale_y_);
+      soft_fetch_grid = host_pixels <= 4 ? host_pixels : std::min((host_pixels + 1) / 2, 8u);
+    }
+  }
+
   // Load the texture size if needed.
   // 1D: X - width.
   // 2D, cube: X - width, Y - height (cube maps probably can be only square, but
@@ -828,6 +848,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         size_needed_components &= 0b0011;
         break;
     }
+  }
+  if (soft_fetch_grid > 1) {
+    // For the size of a host pixel.
+    size_needed_components |= 0b0011;
   }
   if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
     // Stacked and 3D textures have different size packing - need to get whether
@@ -1799,8 +1823,32 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
               texture_binding_signed.bindful_srv_index,
               uint32_t(SRVMainRegister::kBindfulTexturesStart) + texture_binding_index_signed);
         }
+        // Soft fetch: soft_coord_temp.xy - the fetch coordinates, .zw - the
+        // size of a guest pixel in them.
+        uint32_t soft_samples = soft_fetch_grid * soft_fetch_grid;
+        uint32_t soft_coord_temp = UINT32_MAX;
+        uint32_t soft_value_temp = UINT32_MAX;
+        if (soft_samples > 1) {
+          soft_coord_temp = PushSystemTemp();
+          soft_value_temp = PushSystemTemp();
+          a_.OpDiv(dxbc::Dest::R(soft_coord_temp, 0b1100), dxbc::Src::LF(1.0f),
+                   dxbc::Src::R(size_and_is_3d_temp, 0b01000100));
+          a_.OpMov(dxbc::Dest::R(soft_coord_temp, 0b0011), dxbc::Src::R(coord_and_sampler_temp));
+        }
+        for (uint32_t soft_sample = 0; soft_sample < soft_samples; ++soft_sample) {
+        if (soft_samples > 1) {
+          // Evenly over soft_fetch_size guest pixels, centered.
+          float soft_offset_x = ((float(soft_sample % soft_fetch_grid) + 0.5f) /
+                                     float(soft_fetch_grid) - 0.5f) * float(soft_fetch_size);
+          float soft_offset_y = ((float(soft_sample / soft_fetch_grid) + 0.5f) /
+                                     float(soft_fetch_grid) - 0.5f) * float(soft_fetch_size);
+          a_.OpMAd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                   dxbc::Src::R(soft_coord_temp, 0b11101110),
+                   dxbc::Src::LF(soft_offset_x, soft_offset_y, 0.0f, 0.0f),
+                   dxbc::Src::R(soft_coord_temp));
+        }
         for (uint32_t layer = 0; layer < (layer_lerp_needed ? 2u : 1u); ++layer) {
-          uint32_t layer_value_temp = system_temp_result_;
+          uint32_t layer_value_temp = soft_sample ? soft_value_temp : system_temp_result_;
           if (layer) {
             layer_value_temp = PushSystemTemp();
             // Check if the lerp factor is not zero (or NaN).
@@ -1891,6 +1939,17 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
             // Release the allocated layer_value_temp.
             PopSystemTemp();
           }
+        }
+        if (soft_sample) {
+          a_.OpAdd(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+                   dxbc::Src::R(system_temp_result_), dxbc::Src::R(soft_value_temp));
+        }
+        }
+        if (soft_samples > 1) {
+          a_.OpMul(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+                   dxbc::Src::R(system_temp_result_), dxbc::Src::LF(1.0f / float(soft_samples)));
+          // Release soft_value_temp and soft_coord_temp.
+          PopSystemTemp(2);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {

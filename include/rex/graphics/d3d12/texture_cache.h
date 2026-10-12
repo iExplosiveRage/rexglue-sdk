@@ -165,6 +165,7 @@ class D3D12TextureCache final : public TextureCache {
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+  bool IsDownscaledResolveSupportedForFormat(TextureKey key) const override;
   uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 
   uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension dimension) const override;

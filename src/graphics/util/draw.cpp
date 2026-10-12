@@ -765,7 +765,8 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
-                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    uint32_t draw_resolution_percent) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
@@ -840,6 +841,16 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   y1 = std::clamp(y1, int32_t(scissor.offset[1]), scissor_bottom);
 
   assert_true(x0 <= x1 && y0 <= y1);
+
+  // Below 1x, the game is drawn in the top-left part of the render targets,
+  // and the destination gets it in the same part (the rest of the resolve
+  // follows from the rectangle). Outwards, the alignment below also rounds up.
+  if (draw_resolution_percent < 100 && x0 >= 0 && y0 >= 0) {
+    x0 = int32_t(uint64_t(x0) * draw_resolution_percent / 100);
+    y0 = int32_t(uint64_t(y0) * draw_resolution_percent / 100);
+    x1 = int32_t((uint64_t(x1) * draw_resolution_percent + 99) / 100);
+    y1 = int32_t((uint64_t(y1) * draw_resolution_percent + 99) / 100);
+  }
 
   // Direct3D 9's D3DDevice_Resolve internally rounds the right/bottom of the
   // rectangle internally to 8. While all the alignment should have already been

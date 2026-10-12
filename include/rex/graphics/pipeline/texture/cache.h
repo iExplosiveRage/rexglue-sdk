@@ -81,6 +81,29 @@ class TextureCache {
     return draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   }
 
+  // Rendering below 1x (draw_resolution_percent, for slow GPUs): at a draw
+  // resolution scale of 1x, every draw, clear and resolve covers only the
+  // top-left `percent` of the 1x render targets and resolve destinations, and
+  // textures made from resolved data (not written by the CPU since) are made
+  // from that top-left part, at that size - so normalized texture coordinates,
+  // the half-pixel offset and guest texel distances all still line up. Returns
+  // 100 (off) unless the render scale is 1x1, and while NVIDIA DLSS or AMD FSR
+  // scene modes are on (they upscale whole scales).
+  static uint32_t GetConfigDrawResolutionPercent(uint32_t render_scale_x, uint32_t render_scale_y);
+  // Scaling of a guest size or coordinate with the percent.
+  static uint32_t DownscaleFloor(uint32_t value, uint32_t percent) {
+    return uint32_t(uint64_t(value) * percent / 100);
+  }
+  static uint32_t DownscaleCeil(uint32_t value, uint32_t percent) {
+    return uint32_t((uint64_t(value) * percent + 99) / 100);
+  }
+  uint32_t draw_resolution_percent() const { return draw_resolution_percent_; }
+  bool IsDrawResolutionDownscaled() const { return draw_resolution_percent_ < 100; }
+  // Before any texture is made (right after creation).
+  void SetDrawResolutionPercent(uint32_t percent) {
+    draw_resolution_percent_ = percent < 1 ? 1 : (percent > 100 ? 100 : percent);
+  }
+
   // Initializes DDS texture dumping beside the executable.
   void InitTextureReplacement(const std::filesystem::path& textures_dir);
 
@@ -518,6 +541,9 @@ class TextureCache {
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
   virtual bool IsScaledResolveSupportedForFormat(TextureKey /*key*/) const { return false; }
+  // The same for rendering below 1x (the texture is loaded from the top-left
+  // part of its guest data, at that size, with the regular load shaders).
+  virtual bool IsDownscaledResolveSupportedForFormat(TextureKey /*key*/) const { return false; }
   // For formats with less than 4 components, implementations normally should
   // replicate the last component into the non-existent ones, similar to what is
   // done for unused components of operands in shaders by Microsoft's Xbox 360
@@ -625,6 +651,7 @@ class TextureCache {
   SharedMemory& shared_memory_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t draw_resolution_percent_ = 100;
 
   static const LoadShaderInfo load_shader_info_[kLoadShaderCount];
 

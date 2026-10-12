@@ -100,6 +100,7 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       !render_target_cache_.gamma_render_target_as_unorm16(),
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+  shader_translator_->SetDrawResolutionPercent(render_target_cache_.draw_resolution_percent());
 
   if (edram_rov_used) {
     depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader());
@@ -375,6 +376,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
           render_target_cache_.draw_resolution_scale_y(),
           provider.GetGraphicsAnalysis() != nullptr);
+      translator.SetDrawResolutionPercent(render_target_cache_.draw_resolution_percent());
       // If needed and possible, create objects needed for DXIL conversion and
       // disassembly on this thread.
       IDxbcConverter* dxbc_converter = nullptr;

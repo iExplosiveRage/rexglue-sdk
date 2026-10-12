@@ -26,6 +26,7 @@ std::atomic<uint32_t> g_scale_x{0};
 std::atomic<uint32_t> g_scale_y{0};
 std::atomic<uint32_t> g_requested_scale_x{0};
 std::atomic<uint32_t> g_requested_scale_y{0};
+std::atomic<uint32_t> g_percent{100};
 }  // namespace
 
 void RecordGuestSwap() {
@@ -71,8 +72,13 @@ void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32
   g_requested_scale_y.store(requested_y, std::memory_order_relaxed);
 }
 
+void SetDrawResolutionPercent(uint32_t percent) {
+  g_percent.store(percent ? percent : 100, std::memory_order_relaxed);
+}
+
 RenderInfo GetRenderInfo() {
   RenderInfo info;
+  info.percent = g_percent.load(std::memory_order_relaxed);
   info.frontbuffer_width = g_frontbuffer_width.load(std::memory_order_relaxed);
   info.frontbuffer_height = g_frontbuffer_height.load(std::memory_order_relaxed);
   info.scale_x = g_scale_x.load(std::memory_order_relaxed);

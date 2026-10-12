@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -162,6 +163,16 @@ class RenderTargetCache {
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
+  }
+  // Rendering below 1x (draw_resolution_percent, D3D12): the render targets
+  // (or the EDRAM buffer) keep their 1x size, but every draw, clear and
+  // resolve covers only the top-left percent of them - see
+  // TextureCache::GetConfigDrawResolutionPercent. 100 = off. Set by the command
+  // processor right after creating the cache, constant for its lifetime.
+  uint32_t draw_resolution_percent() const { return draw_resolution_percent_; }
+  bool IsDrawResolutionDownscaled() const { return draw_resolution_percent_ < 100; }
+  void SetDrawResolutionPercent(uint32_t percent) {
+    draw_resolution_percent_ = std::clamp(percent, uint32_t(1), uint32_t(100));
   }
 
   // Virtual (both the common code and the implementation may do something
@@ -575,6 +586,7 @@ class RenderTargetCache {
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t draw_resolution_percent_ = 100;
 
   DrawExtentEstimator draw_extent_estimator_;
 

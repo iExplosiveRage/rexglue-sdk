@@ -100,6 +100,14 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
     .range(1, 8);
 
+// Applies live on D3D12 like the scale (Vulkan ignores it).
+REXCVAR_DEFINE_INT32(draw_resolution_percent, 100, "GPU",
+                     "Render below 1x, for slow GPUs: with a draw resolution scale of 1, the game "
+                     "renders at this percent of its resolution (100 = 1280x720, 75 = 960x540, "
+                     "50 = 640x360) and the picture is stretched to the window. Off while NVIDIA "
+                     "DLSS or AMD FSR (dlss_mode / fsr_mode) is on")
+    .range(25, 100);
+
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
@@ -527,6 +535,26 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   return clamped_x == config_x && clamped_y == config_y;
 }
 
+uint32_t TextureCache::GetConfigDrawResolutionPercent(uint32_t render_scale_x,
+                                                      uint32_t render_scale_y) {
+  const int32_t config = REXCVAR_GET(draw_resolution_percent);
+  if (config >= 100 || render_scale_x != 1 || render_scale_y != 1) {
+    return 100;
+  }
+  // The scene upscalers work with whole scales and the full render targets.
+  const std::string dlss = LowercaseFlag("dlss_mode");
+  if (!dlss.empty() && dlss != "off" &&
+      rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kUnavailable) {
+    return 100;
+  }
+  const std::string fsr = LowercaseFlag("fsr_mode");
+  if (!fsr.empty() && fsr != "off" &&
+      rex::graphics::GetFsrAvailability() != rex::graphics::FsrAvailability::kUnavailable) {
+    return 100;
+  }
+  return uint32_t(std::clamp(config, INT32_C(25), INT32_C(100)));
+}
+
 void TextureCache::ClearCache() {
   DestroyAllTextures();
 }
@@ -759,7 +787,8 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
-  if (texture_key.scaled_resolve) {
+  // (Below 1x, resolved data is in the shared memory like any other.)
+  if (texture_key.scaled_resolve && !IsDrawResolutionDownscaled()) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
     // by an actual resolve, but is still included in the texture size, so the
@@ -1180,14 +1209,45 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       key.scaled_resolve = 1;
     }
   }
+  // Below 1x: render-to-texture data is in the top-left part of the guest data
+  // (single-level 2D textures not in a packed mip tail - anything else is made
+  // from all of its guest data).
+  if (IsDrawResolutionDownscaled()) {
+    texture_util::TextureGuestLayout downscaled_guest_layout = key.GetGuestLayout();
+    if (downscaled_guest_layout.base.level_data_extent_bytes &&
+        IsRangeResolved(key.base_page << 12, downscaled_guest_layout.base.level_data_extent_bytes)) {
+      if (key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
+          key.depth_or_array_size_minus_1 == 0 && key.mip_max_level == 0 &&
+          downscaled_guest_layout.packed_level != 0 && IsDownscaledResolveSupportedForFormat(key)) {
+        key.scaled_resolve = 1;
+      } else {
+        // Shown cropped (all of its guest data at 1x) - for finding why.
+        static uint32_t unsupported_logged = 0;
+        if (unsupported_logged < 16) {
+          ++unsupported_logged;
+          REXGPU_WARN(
+              "Below 1x: resolved texture at 0x{:08X} {}x{}x{} format {} tiled {} mips {} packed "
+              "level {} isn't made at the lower resolution",
+              key.base_page << 12, key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+              uint32_t(key.format), uint32_t(key.tiled), uint32_t(key.mip_max_level),
+              downscaled_guest_layout.packed_level);
+        }
+      }
+    }
+  }
 
   auto get_host_extent = [this, &key](uint32_t& host_width_out, uint32_t& host_height_out,
                                       uint32_t& host_depth_or_array_size_out) {
     host_width_out = key.GetWidth();
     host_height_out = key.GetHeight();
     if (key.scaled_resolve) {
-      host_width_out *= draw_resolution_scale_x();
-      host_height_out *= draw_resolution_scale_y();
+      if (IsDrawResolutionDownscaled()) {
+        host_width_out = DownscaleCeil(host_width_out, draw_resolution_percent());
+        host_height_out = DownscaleCeil(host_height_out, draw_resolution_percent());
+      } else {
+        host_width_out *= draw_resolution_scale_x();
+        host_height_out *= draw_resolution_scale_y();
+      }
     }
     host_depth_or_array_size_out = key.GetDepthOrArraySize();
   };
