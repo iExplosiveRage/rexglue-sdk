@@ -34,6 +34,7 @@
 #include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/wide_aspect.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -2400,6 +2401,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  // A game rendering a wider view into its frontbuffer (wide_aspect.h).
+  if (const float display_aspect = rex::graphics::GetGuestDisplayAspect(); display_aspect > 0.0f) {
+    display_height = 10000;
+    display_width = std::max(uint32_t(1), uint32_t(display_aspect * 10000.0f + 0.5f));
+  }
 
   // NVIDIA DLSS upscaling: every frame is presented at the output resolution
   // (the presenter would recreate its textures on size changes) - DLSS's
@@ -3177,6 +3183,80 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+
+  // Wide output (rex/graphics/wide_aspect.h): the app places the 2D overlay
+  // drawn over the main render target - the depth test off or always passing,
+  // with the viewport covering the frontbuffer around its center.
+  overlay_scale_x_ = 1.0f;
+  overlay_offset_x_ = 0.0f;
+  if (rex::graphics::OverlayPlacementCallback overlay_callback =
+          rex::graphics::GetOverlayPlacementCallback()) {
+    const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+    const uint32_t fb_width = render_info.frontbuffer_width;
+    const float vport_xscale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+    const float vport_xoffset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+    const uint32_t vte = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+    if (fb_width && render_info.frontbuffer_height &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= fb_width && (vte & 0b11) == 0b11 &&
+        (!normalized_depth_control.z_enable ||
+         normalized_depth_control.zfunc == xenos::CompareFunction::kAlways ||
+         (pixel_shader &&
+          rex::graphics::IsOverlayDepthTestedPixelShader(pixel_shader->ucode_data_hash()))) &&
+        std::abs(vport_xoffset - 0.5f * float(fb_width)) < 1.0f &&
+        std::abs(std::abs(vport_xscale) - 0.5f * float(fb_width)) < 1.0f) {
+      rex::graphics::OverlayDrawInfo overlay_info;
+      overlay_info.vertex_shader_hash = vertex_shader->ucode_data_hash();
+      overlay_info.pixel_shader_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+      for (uint32_t i = 0; i < 32; ++i) {
+        overlay_info.vertex_constants[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+      }
+      const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
+      if (fetch.type == xenos::FetchConstantType::kTexture &&
+          fetch.dimension == xenos::DataDimension::k2DOrStacked) {
+        overlay_info.texture0_width = fetch.size_2d.width + 1;
+        overlay_info.texture0_height = fetch.size_2d.height + 1;
+      }
+      const Shader::ConstantRegisterMap& overlay_vfetch_map = vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(overlay_vfetch_map.vertex_fetch_bitmap); ++i) {
+        uint32_t j;
+        if (rex::bit_scan_forward(overlay_vfetch_map.vertex_fetch_bitmap[i], &j)) {
+          const xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(i * 32 + j);
+          if (vfetch.type == xenos::FetchConstantType::kVertex && vfetch.address && vfetch.size) {
+            overlay_info.vertex_data =
+                memory_->TranslatePhysical<const uint8_t*>(vfetch.address << 2);
+            overlay_info.vertex_data_size = vfetch.size << 2;
+          }
+          break;
+        }
+      }
+      overlay_info.depth_test = normalized_depth_control.z_enable != 0;
+      overlay_info.primitive_type = uint32_t(primitive_type);
+      overlay_info.vertex_count = index_count;
+      overlay_info.frontbuffer_width = fb_width;
+      overlay_info.frontbuffer_height = render_info.frontbuffer_height;
+      const rex::graphics::OverlayPlacement placement = overlay_callback(overlay_info);
+      if (placement.scale_x != 1.0f || placement.offset_x != 0.0f) {
+        overlay_scale_x_ = placement.scale_x;
+        overlay_offset_x_ = placement.offset_x;
+        // The scissor follows, in guest pixels around the center.
+        const float half = 0.5f * float(fb_width);
+        float left = half + (float(scissor.offset[0]) - half) * placement.scale_x +
+                     placement.offset_x * half;
+        float right = half +
+                      (float(scissor.offset[0] + scissor.extent[0]) - half) * placement.scale_x +
+                      placement.offset_x * half;
+        if (left > right) {
+          std::swap(left, right);
+        }
+        const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+        const uint32_t new_left = uint32_t(std::clamp(std::floor(left), 0.0f, float(pitch)));
+        const uint32_t new_right = uint32_t(std::clamp(std::ceil(right), 0.0f, float(pitch)));
+        scissor.offset[0] = new_left;
+        scissor.extent[0] = new_right > new_left ? new_right - new_left : 0;
+      }
+    }
+  }
+
   const draw_util::Scissor guest_scissor = scissor;
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
@@ -4623,10 +4703,17 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     }
   }
   for (uint32_t i = 0; i < 3; ++i) {
+    float ndc_scale = viewport_info.ndc_scale[i];
     float ndc_offset = viewport_info.ndc_offset[i] + ndc_jitter[i];
-    dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
+    if (i == 0) {
+      // 2D overlay placement (wide output): applied to the guest clip X
+      // before the conversion, x * s + o * w -> (x * k + a * w) * s + o * w.
+      ndc_offset += overlay_offset_x_ * ndc_scale;
+      ndc_scale *= overlay_scale_x_;
+    }
+    dirty |= system_constants_.ndc_scale[i] != ndc_scale;
     dirty |= system_constants_.ndc_offset[i] != ndc_offset;
-    system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
+    system_constants_.ndc_scale[i] = ndc_scale;
     system_constants_.ndc_offset[i] = ndc_offset;
   }
 
@@ -4641,6 +4728,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   float scene_projection_matrix[4] = {1.0f, 0.0f, 0.0f, 1.0f};
   const float requested_scene_projection_scale = rex::graphics::GetSceneProjectionScale();
   const float requested_scene_roll = rex::graphics::GetSceneProjectionRoll();
+  // Wide output when the game's projection can't be changed: X only.
+  const float requested_scene_aspect_scale = rex::graphics::GetSceneProjectionAspectScale();
   const bool scene_depth_tested = normalized_depth_control.z_enable &&
                                   normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
   // Effects drawn after the scene with the depth test off, as triangles - not
@@ -4650,7 +4739,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       (guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
        guest_primitive_type == xenos::PrimitiveType::kTriangleFan ||
        guest_primitive_type == xenos::PrimitiveType::kTriangleStrip);
-  if ((requested_scene_projection_scale != 1.0f || requested_scene_roll != 0.0f) &&
+  if ((requested_scene_projection_scale != 1.0f || requested_scene_roll != 0.0f ||
+       requested_scene_aspect_scale != 1.0f) &&
       (scene_depth_tested || scene_effect)) {
     const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
     if (render_info.frontbuffer_width && render_info.frontbuffer_height &&
@@ -4673,6 +4763,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       scene_projection_matrix[1] = -roll_sin / aspect;
       scene_projection_matrix[2] = roll_sin * aspect;
       scene_projection_matrix[3] = roll_cos;
+      scene_projection_matrix[0] *= requested_scene_aspect_scale;
+      scene_projection_matrix[1] *= requested_scene_aspect_scale;
     }
   }
   dirty |= system_constants_.scene_projection_scale != scene_projection_scale;

@@ -788,20 +788,42 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   quality = uint32_t(NVSDK_NGX_PerfQuality_Value_DLAA);
 #endif
   if (upscale) {
-    if (uint64_t(output_width) * height != uint64_t(output_height) * width) {
+    // Each axis on its own (a game rendering wider than 16:9 has a higher X
+    // scale, so the ratios along X and Y may differ); DLSS's mode is the one
+    // of the larger ratio.
+    auto dlss_ratio = [](uint32_t render, uint32_t output) -> uint32_t {
+      // 2 = 1x, 3 = 1.5x, 4 = 2x, 6 = 3x (in halves), 0 = none of them.
+      for (uint32_t halves : {2u, 3u, 4u, 6u}) {
+        if (2 * output == halves * render) {
+          return halves;
+        }
+      }
+      return 0;
+    };
+    if (output_width < width || output_height < height) {
       upscale = false;
     } else if (backend == Backend::kFsr) {
-      upscale = output_width <= 3 * width;
+      upscale = output_width <= 3 * width && output_height <= 3 * height;
 #if defined(REX_HAS_DLSS)
-    } else if (3 * width == 2 * output_width) {
-      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxQuality);
-    } else if (2 * width == output_width) {
-      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxPerf);
-    } else if (3 * width == output_width) {
-      quality = uint32_t(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
-#endif
+    } else {
+      const uint32_t ratio_x = dlss_ratio(width, output_width);
+      const uint32_t ratio_y = dlss_ratio(height, output_height);
+      const uint32_t ratio = std::max(ratio_x, ratio_y);
+      if (!ratio_x || !ratio_y) {
+        upscale = false;
+      } else if (ratio == 3) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+      } else if (ratio == 4) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxPerf);
+      } else if (ratio == 6) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+      } else {
+        upscale = false;
+      }
+#else
     } else {
       upscale = false;
+#endif
     }
     if (!upscale) {
       // Switching between the upscalers, the render scale of the other one may

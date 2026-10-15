@@ -481,10 +481,11 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   // NVIDIA DLSS (dlss_mode, read by name like the presenter cvars) goes first:
   // with an upscaling mode, DLSS upscales the 3D scene to the configured scale,
   // and present_fsr_quality_mode doesn't lower it further. Only where DLSS
-  // works, and for square scales (DLSS needs the output's aspect ratio).
+  // works. Each axis on its own: a wider-than-16:9 game renders at a higher X
+  // scale, and the upscalers take a different ratio along X and Y.
   const std::string dlss = LowercaseFlag("dlss_mode");
   const bool dlss_upscaling =
-      !dlss.empty() && dlss != "off" && dlss != "dlaa" && clamped_x == clamped_y &&
+      !dlss.empty() && dlss != "off" && dlss != "dlaa" &&
       rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable;
   // AMD FSR (fsr_mode) the same way while DLSS isn't on, at the closest whole
   // scale to its ratio, at most 3x below the target.
@@ -495,11 +496,10 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   const bool fsr_upscaling =
       !dlss_active && (fsr == "quality" || fsr == "balanced" || fsr == "performance" ||
                        fsr == "ultra_performance") &&
-      clamped_x == clamped_y &&
       rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable;
   if (dlss_upscaling) {
     x_out = GetDlssRenderScale(clamped_x, dlss);
-    y_out = x_out;
+    y_out = GetDlssRenderScale(clamped_y, dlss);
     if (x_out != clamped_x) {
       REXLOG_INFO("NVIDIA DLSS {}: rendering at {}x{} scale, upscaled to {}x{}", dlss, x_out,
                   y_out, clamped_x, clamped_y);
@@ -509,7 +509,10 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
     while (3 * x_out < clamped_x) {
       ++x_out;
     }
-    y_out = x_out;
+    y_out = GetUpscalerRenderScale(clamped_y, "fsr", fsr);
+    while (3 * y_out < clamped_y) {
+      ++y_out;
+    }
     if (x_out != clamped_x) {
       REXLOG_INFO("AMD FSR {}: rendering at {}x{} scale, upscaled to {}x{}", fsr, x_out, y_out,
                   clamped_x, clamped_y);

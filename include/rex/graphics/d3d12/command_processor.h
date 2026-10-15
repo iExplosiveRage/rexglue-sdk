@@ -484,6 +484,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t draw_resolution_target_scale_x_ = 1;
   uint32_t draw_resolution_target_scale_y_ = 1;
   uint64_t pending_draw_resolution_scale_time_ms_ = 0;
+  // 2D overlay placement of the current draw (rex::graphics::wide_aspect.h):
+  // guest clip X -> x * overlay_scale_x_ + overlay_offset_x_ * w.
+  float overlay_scale_x_ = 1.0f;
+  float overlay_offset_x_ = 0.0f;
   // For reloading the pipeline storage into a recreated pipeline cache.
   std::filesystem::path shader_storage_cache_root_;
   uint32_t shader_storage_title_id_ = 0;

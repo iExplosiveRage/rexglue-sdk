@@ -19,6 +19,7 @@
 #include <rex/graphics/draw_overrides.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/graphics/wide_aspect.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -806,6 +807,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   }
 
   flow.properties = properties;
+  rex::graphics::SetOutputSurfaceSize(surface_width_in_paint_connection_,
+                                      surface_height_in_paint_connection_);
 
   // Multiplication-division rounding to the nearest.
   auto rescale_unsigned = [](uint32_t value, uint32_t new_scale, uint32_t old_scale) -> uint32_t {
