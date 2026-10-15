@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -395,15 +396,35 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
-      WaitForUITickFromUIThread();
+      const bool ui_tick = WaitForUITickFromUIThread();
 
-      paint_result = PaintAndPresent(draw_ui);
-      if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
-        // Request another PaintFromUIThread which will try to recover from the
-        // outdated connection in the next frame (not immediately, so the
-        // windowing system has some time to prepare what may be required to
-        // recover from it, such as to send a resize event).
-        request_repaint_immediately = true;
+      // A repaint only for the UI drawers (they ask for one every frame while
+      // shown, such as the debug overlay) at the monitor's refresh rate would
+      // present the same guest frame again and again - 160+ presents per
+      // second on a 165 Hz monitor with the game capped at 60 or 30. While the
+      // guest is refreshing its output itself, the UI is drawn with each of its
+      // frames, so skip those (but keep ticking, so the UI goes on if the guest
+      // stops presenting, like during loading).
+      const uint64_t guest_refreshes =
+          guest_output_refresh_count_.load(std::memory_order_acquire);
+      const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+      constexpr int64_t kGuestOutputLiveNs = 100'000'000;
+      if (ui_tick && !force_paint && guest_refreshes == ui_painted_guest_output_refresh_count_ &&
+          now_ns - guest_output_refresh_time_ns_.load(std::memory_order_relaxed) <
+              kGuestOutputLiveNs) {
+        request_ui_paint_after_current_ui_thread_paint_ = true;
+      } else {
+        ui_painted_guest_output_refresh_count_ = guest_refreshes;
+        paint_result = PaintAndPresent(draw_ui);
+        if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+          // Request another PaintFromUIThread which will try to recover from
+          // the outdated connection in the next frame (not immediately, so the
+          // windowing system has some time to prepare what may be required to
+          // recover from it, such as to send a resize event).
+          request_repaint_immediately = true;
+        }
       }
     }
     // If can't paint anymore, notify the paint mode refresh below (which is not
@@ -526,6 +547,13 @@ bool Presenter::RefreshGuestOutput(
     // currently not accessible to the host presentation.
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
+
+  guest_output_refresh_time_ns_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+  guest_output_refresh_count_.fetch_add(1, std::memory_order_release);
 
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
@@ -1500,10 +1528,10 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
 #endif
 }
 
-void Presenter::WaitForUITickFromUIThread() {
+bool Presenter::WaitForUITickFromUIThread() {
 #if REX_PLATFORM_WIN32
   if (!AreUITicksNeededFromUIThread()) {
-    return;
+    return false;
   }
   std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   uint64_t last_vblank_before_wait = dxgi_ui_tick_last_vblank_;
@@ -1512,21 +1540,22 @@ void Presenter::WaitForUITickFromUIThread() {
     // possible as they should be fulfilled as early as possible.
     if (dxgi_ui_tick_force_requested_) {
       dxgi_ui_tick_force_requested_ = false;
-      return;
+      return false;
     }
     if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
-      return;
+      return false;
     }
     if (dxgi_ui_tick_last_vblank_ > dxgi_ui_tick_last_draw_) {
       // If there have been multiple vblanks during the wait for some reason,
       // next time draw the UI immediately.
       dxgi_ui_tick_last_draw_ =
           std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
-      return;
+      return true;
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
 #endif  // XE_PLATFORM
+  return false;
 }
 
 void Presenter::ForceUIThreadPaintTick() {

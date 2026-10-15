@@ -34,6 +34,13 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif  // REX_PLATFORM_WIN32
+
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
                       "Anti-aliasing of the final image: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
@@ -176,6 +183,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+#if REX_PLATFORM_WIN32
+        // For the frame rate cap: a high resolution waitable timer sleeps
+        // closer to the next vblank than Sleep's milliseconds (Windows 10
+        // 1803+; without it, the 1 ms sleeps below as before).
+        HANDLE precise_timer = CreateWaitableTimerExW(
+            nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif  // REX_PLATFORM_WIN32
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           const double game_rate_hz = rex::graphics::GetGuestVblankRate();
@@ -196,8 +210,21 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             // spaced (144 Hz is under 7 ms).
             current_time = chrono::Clock::QueryGuestTickCount();
             const uint64_t next_vblank = last_frame_time + interval_ticks;
-            if (next_vblank > current_time &&
-                next_vblank - current_time > guest_tick_frequency / 500) {
+            const uint64_t remaining = next_vblank > current_time ? next_vblank - current_time : 0;
+#if REX_PLATFORM_WIN32
+            // With the precise timer only the last 0.2 ms is yielded (it was
+            // the last 2 ms, ~12% of a core at 60 Hz).
+            if (precise_timer && remaining > guest_tick_frequency / 2500) {
+              LARGE_INTEGER due;
+              due.QuadPart = -int64_t((remaining - guest_tick_frequency / 5000) * 10000000 /
+                                      guest_tick_frequency);
+              if (SetWaitableTimerEx(precise_timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                WaitForSingleObject(precise_timer, INFINITE);
+                continue;
+              }
+            }
+#endif  // REX_PLATFORM_WIN32
+            if (remaining > guest_tick_frequency / 500) {
               rex::thread::Sleep(std::chrono::milliseconds(1));
             } else {
               rex::thread::MaybeYield();
@@ -206,6 +233,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(1));
           }
         }
+#if REX_PLATFORM_WIN32
+        if (precise_timer) {
+          CloseHandle(precise_timer);
+        }
+#endif  // REX_PLATFORM_WIN32
         return 0;
       }));
   // TODO: set_can_debugger_suspend not yet ported

@@ -870,7 +870,9 @@ class Presenter {
            !surface_paint_connection_has_implicit_vsync_;
   }
   void UpdateUITicksNeededFromUIThread();
-  void WaitForUITickFromUIThread();
+  // Returns true if it waited for a UI tick (a vblank of the monitor) - false
+  // if ticks aren't waitable, or for a forced tick (a guest output refresh).
+  bool WaitForUITickFromUIThread();
   // May be called from any thread.
   void ForceUIThreadPaintTick();
 
@@ -944,6 +946,14 @@ class Presenter {
   // connection as the next successful reconnection should be followed by a
   // repaint request anyway.
   std::atomic<bool> ui_thread_paint_requested_{false};
+
+  // Guest output refreshes so far, and when the latest was (steady clock, ns),
+  // so the UI thread can tell a paint that would only repeat the last guest
+  // frame for the UI drawers while the guest is presenting frames itself.
+  std::atomic<uint64_t> guest_output_refresh_count_{0};
+  std::atomic<int64_t> guest_output_refresh_time_ns_{0};
+  // UI thread: guest_output_refresh_count_ when it painted last.
+  uint64_t ui_painted_guest_output_refresh_count_ = 0;
 
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.
