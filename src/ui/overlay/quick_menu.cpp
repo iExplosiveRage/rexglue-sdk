@@ -103,6 +103,50 @@ void DrawText(ImDrawList* draw_list, float size, ImVec2 position, ImU32 color,
   overlay_text::Draw(draw_list, size, position, color, text, wrap_width);
 }
 
+// The height DrawText's words take wrapped to `wrap_width` (greedy, like
+// DrawText; a little over for ImGui's own wrapping).
+float WrappedHeight(float size, std::string_view text, float wrap_width) {
+  const bool art = g_art_text != nullptr;
+  const float line_height = art ? size * kArtTextScale * 0.95f : TextSize(size, "Ag").y;
+  int lines = 1;
+  std::string line;
+  size_t pos = 0;
+  while (pos <= text.size()) {
+    size_t end = text.find(' ', pos);
+    if (end == std::string_view::npos) end = text.size();
+    const std::string_view word = text.substr(pos, end - pos);
+    const std::string candidate = line.empty() ? std::string(word) : line + " " + std::string(word);
+    if (wrap_width > 0.0f && !line.empty() && TextSize(size, candidate).x > wrap_width) {
+      ++lines;
+      line = std::string(word);
+    } else {
+      line = candidate;
+    }
+    pos = end + 1;
+  }
+  return float(lines) * line_height + (art ? size * kArtTextScale * 0.1f : 0.0f);
+}
+
+// DrawText inside [position.y, bottom): a smaller size when the words need it
+// (down to min_size), and clipped below that. Returns the height used.
+float DrawTextFitted(ImDrawList* draw_list, float size, float min_size, ImVec2 position,
+                     ImU32 color, std::string_view text, float wrap_width, float bottom) {
+  const float room = bottom - position.y;
+  if (room <= 0.0f) {
+    return 0.0f;
+  }
+  float height = WrappedHeight(size, text, wrap_width);
+  while (height > room && size > min_size) {
+    size = std::max(min_size, size - 1.0f);
+    height = WrappedHeight(size, text, wrap_width);
+  }
+  draw_list->PushClipRect(ImVec2(position.x - 4.0f, position.y - size),
+                          ImVec2(position.x + wrap_width + 4.0f, bottom), true);
+  DrawText(draw_list, size, position, color, text, wrap_width);
+  draw_list->PopClipRect();
+  return std::min(height, room);
+}
+
 std::atomic<int> g_button_glyphs{int(ButtonGlyphs::kXbox)};
 
 // Face buttons by position (Xbox A, B, X, Y).
@@ -862,7 +906,7 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     }
     max_rows = std::max(max_rows, labels.size());
   }
-  const float kTitleHeight = 60.0f, kTabsHeight = 54.0f, kRowHeight = 58.0f, kHelpHeight = 96.0f,
+  const float kTitleHeight = 60.0f, kTabsHeight = 54.0f, kRowHeight = 58.0f, kHelpHeight = 132.0f,
               kHintsHeight = 58.0f, kPadding = 30.0f;
   const float base_height = kPadding + kTitleHeight + kTabsHeight + 14.0f +
                             float(max_rows) * kRowHeight + 16.0f + kHelpHeight + kHintsHeight;
@@ -1246,9 +1290,11 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   }
   y += float(max_rows) * row_height + 16.0f * u;
 
-  // Help for the selected setting.
+  // Help for the selected setting: never below the hints' bar (smaller words
+  // when a long text needs it).
   draw_list->AddLine(ImVec2(content_left, y - 8.0f * u), ImVec2(content_right, y - 8.0f * u),
                      color(theme.divider), 1.5f * u);
+  const float help_bottom = panel_max.y - kHintsHeight * u - 16.0f * u;
   if (capturing_) {
     const std::string text =
         capture_message_.empty()
@@ -1256,27 +1302,23 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
                   FaceName(Face::kRight) + " cancels."
             : capture_message_ + " Press another key, or Esc or " + FaceName(Face::kRight) +
                   " to cancel.";
-    DrawText(draw_list, 23.0f * u, ImVec2(content_left, y + 6.0f * u),
-             capture_message_.empty() ? color(theme.highlight) : color(theme.warning), text,
-             content_right - content_left);
+    DrawTextFitted(draw_list, 23.0f * u, 15.0f * u, ImVec2(content_left, y + 6.0f * u),
+                   capture_message_.empty() ? color(theme.highlight) : color(theme.warning),
+                   text, content_right - content_left, help_bottom);
   } else {
     // A section's status line (like what an action did) goes first.
     float help_y = y + 6.0f * u;
     const QuickMenuStatus status = section.status ? section.status() : QuickMenuStatus{};
     if (!status.text.empty()) {
-      const float status_size = 23.0f * u;
-      DrawText(draw_list, status_size, ImVec2(content_left, help_y),
-               status.error ? color(theme.warning) : color(theme.highlight), status.text,
-               content_right - content_left);
-      // Wrapped: about one line per width of text.
-      const ImVec2 extent = TextSize(status_size, status.text);
-      const float lines =
-          std::max(1.0f, std::ceil(extent.x * 1.08f / std::max(1.0f, content_right - content_left)));
-      help_y += extent.y * lines + 6.0f * u;
+      help_y += DrawTextFitted(draw_list, 23.0f * u, 16.0f * u, ImVec2(content_left, help_y),
+                               status.error ? color(theme.warning) : color(theme.highlight),
+                               status.text, content_right - content_left, help_bottom) +
+                6.0f * u;
     }
-    if (!rows.empty() && help_y < y + (kHelpHeight - 20.0f) * u) {
-      DrawText(draw_list, 23.0f * u, ImVec2(content_left, help_y), color(theme.help),
-               section.items[selected_item_].help, content_right - content_left);
+    if (!rows.empty() && help_y < help_bottom - 16.0f * u) {
+      DrawTextFitted(draw_list, 23.0f * u, 14.0f * u, ImVec2(content_left, help_y),
+                     color(theme.help), section.items[selected_item_].help,
+                     content_right - content_left, help_bottom);
     }
   }
 
