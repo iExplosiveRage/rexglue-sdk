@@ -12,6 +12,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -162,9 +163,22 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
     fps_window_swaps_ = swaps;
   }
 
-  // Frame times of the latest guest frames, for the graph.
+  // Frame times for the graph and the frame time: the times between the real
+  // presents to the screen (what RTSS / PresentMon show), so uneven
+  // presentation shows even when the game's own frames are even. The guest
+  // frame times until there are presents to measure.
+  std::array<float, 255> present_intervals{};
+  const size_t present_count =
+      rex::perf::GetHostPresentIntervals(present_intervals.data(), present_intervals.size());
   std::array<float, kGraphFrames> frame_times{};
-  const size_t frame_count = rex::perf::GetGuestFrameTimes(frame_times.data(), kGraphFrames);
+  size_t frame_count = 0;
+  if (present_count >= 2) {
+    frame_count = std::min(present_count, kGraphFrames);
+    std::copy(present_intervals.begin() + (present_count - frame_count),
+              present_intervals.begin() + present_count, frame_times.begin());
+  } else {
+    frame_count = rex::perf::GetGuestFrameTimes(frame_times.data(), kGraphFrames);
+  }
   float frame_time_ms = 0.0f;
   if (frame_count) {
     const size_t average_frames = std::min<size_t>(frame_count, 30);
@@ -198,7 +212,22 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   if (std::string upscaler = UpscalerText(); !upscaler.empty()) {
     rows.emplace_back("Upscaler", std::move(upscaler));
   }
-  std::snprintf(text, sizeof(text), "%.0f FPS", io.Framerate);
+  // Presents per second and their 1% low (the 99th percentile time between
+  // presents) over the latest ones (up to 255).
+  if (present_count >= 10) {
+    double total_ms = 0.0;
+    for (size_t i = 0; i < present_count; ++i) {
+      total_ms += present_intervals[i];
+    }
+    std::array<float, 255> sorted = present_intervals;
+    std::sort(sorted.begin(), sorted.begin() + present_count);
+    const float p99_ms = sorted[std::min(present_count - 1, (present_count * 99) / 100)];
+    std::snprintf(text, sizeof(text), "%.0f FPS \xC2\xB7 1%% low %.0f",
+                  total_ms > 0.0 ? 1000.0 * double(present_count) / total_ms : 0.0,
+                  p99_ms > 0.0f ? 1000.0 / double(p99_ms) : 0.0);
+  } else {
+    std::snprintf(text, sizeof(text), "%.0f FPS", io.Framerate);
+  }
   rows.emplace_back("Display", text);
   if (stats_provider_) {
     const FrameStats stats = stats_provider_();

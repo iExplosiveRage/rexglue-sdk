@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <functional>
@@ -27,6 +29,7 @@
 #include <rex/graphics/frame_pacing.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/net/session.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -190,9 +193,89 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         HANDLE precise_timer = CreateWaitableTimerExW(
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif  // REX_PLATFORM_WIN32
+        // Locking to the display: the host vblank last seen, and the one the
+        // guest vblank was last fired at.
+        uint64_t host_vblank_seen = 0;
+        uint64_t host_vblank_fired = 0;
+        bool was_locked = false;
+        uint32_t logged_divisor = 0;
+        int64_t logged_time_ns = 0;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          const double game_rate_hz = rex::graphics::GetGuestVblankRate();
+          double game_rate_hz = rex::graphics::GetGuestVblankRate();
+          const bool display_rate = game_rate_hz == rex::graphics::kGuestVblankRateDisplay;
+          if (display_rate) {
+            // The display's refresh rate (60 until it's measured).
+            game_rate_hz = rex::graphics::GetHostRefreshRate();
+            if (game_rate_hz <= 0.0) {
+              game_rate_hz = 60.0;
+            }
+          }
+
+          // With host vsync, a rate that is the display's refresh rate or a
+          // whole fraction of it fires on every k-th display vblank instead
+          // of a timer of its own: a timer drifts against the display (60.00
+          // vs a 59.95 Hz display, 144.0 vs 143.9), and every so often two
+          // frames land in one refresh and none in the next - a skipped and a
+          // doubled frame. Not online (the timing there stays as it was), and
+          // only while the display's vblanks come steadily.
+          uint32_t lock_divisor = 0;
+          rex::graphics::HostVblankInfo host = rex::graphics::GetHostVblank();
+          const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+          if (game_rate_hz > 0.0 && game_rate_hz < 500.0 && rex::graphics::IsHostVsync() &&
+              host.stable && host.period_ns > 0.0 &&
+              now_ns - host.time_ns < int64_t(host.period_ns * 3.0) &&
+              !rex::net::IsGameSessionOpen()) {
+            const double host_hz = 1.0e9 / host.period_ns;
+            const double divisor = std::round(host_hz / game_rate_hz);
+            if (display_rate) {
+              lock_divisor = 1;
+            } else if (divisor >= 1.0 && divisor <= 8.0 &&
+                       std::abs(host_hz / divisor - game_rate_hz) <= game_rate_hz * 0.015) {
+              lock_divisor = uint32_t(divisor);
+            }
+          }
+          if (lock_divisor != logged_divisor && now_ns - logged_time_ns > 2'000'000'000) {
+            // Once per change (at most every 2 s), for logs from players.
+            if (lock_divisor) {
+              REXLOG_INFO("GPU VSync: guest vblank locked to the display ({:.2f} Hz / {})",
+                          1.0e9 / host.period_ns, lock_divisor);
+            } else if (logged_divisor) {
+              REXLOG_INFO("GPU VSync: guest vblank on its own timer ({:.2f} Hz)", game_rate_hz);
+            }
+            logged_divisor = lock_divisor;
+            logged_time_ns = now_ns;
+          }
+          if (lock_divisor) {
+            if (!was_locked) {
+              // Fire on the next display vblank.
+              host_vblank_seen = host.count;
+              host_vblank_fired = host.count >= lock_divisor ? host.count - lock_divisor : 0;
+              was_locked = true;
+            }
+            const auto timeout = std::chrono::nanoseconds(int64_t(host.period_ns * 3.0));
+            if (rex::graphics::WaitForHostVblank(host_vblank_seen, timeout, host)) {
+              host_vblank_seen = host.count;
+              if (host.count - host_vblank_fired >= lock_divisor) {
+                MarkVblank();
+                host_vblank_fired = host.count;
+                last_frame_time = chrono::Clock::QueryGuestTickCount();
+              }
+              continue;
+            }
+            // The display's vblanks stopped (minimized, moved, lost): the
+            // timer below until they're back.
+          }
+          if (was_locked) {
+            // Back to the timer: go on from now (one vblank, not a burst for
+            // the time spent waiting).
+            was_locked = false;
+            current_time = chrono::Clock::QueryGuestTickCount();
+            last_frame_time = current_time;
+          }
+
           uint64_t interval_ticks;
           if (game_rate_hz > 0.0) {
             interval_ticks =

@@ -23,6 +23,18 @@ uint64_t GetGuestSwapCount();
 // the last 255). Returns how many were written.
 size_t GetGuestFrameTimes(float* out_ms, size_t max_count);
 
+// Called after each successful host present (the real cadence on the screen,
+// what RTSS / PresentMon see). new_guest_frame: it shows a guest frame that
+// wasn't presented before (its swap -> present latency is recorded).
+void RecordHostPresent(bool new_guest_frame);
+uint64_t GetHostPresentCount();
+// Times between the latest host presents in milliseconds, oldest first (up to
+// the last 255). Returns how many were written.
+size_t GetHostPresentIntervals(float* out_ms, size_t max_count);
+// Guest swap -> host present latencies of the latest new guest frames in
+// milliseconds, oldest first (up to the last 255).
+size_t GetGuestToPresentLatencies(float* out_ms, size_t max_count);
+
 // Guest frontbuffer size (before resolution scaling) of the latest swap.
 void RecordGuestFrontbuffer(uint32_t width, uint32_t height);
 

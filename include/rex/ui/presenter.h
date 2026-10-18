@@ -875,6 +875,9 @@ class Presenter {
   bool WaitForUITickFromUIThread();
   // May be called from any thread.
   void ForceUIThreadPaintTick();
+  // present_vsync: if there has been a present since the latest vblank, waits
+  // for the next one (at most 50 ms).
+  void WaitForVsyncPresentSlotFromUIThread();
 
   // Must be called only in the end of entry points - reinitialization of the
   // presenter may be done by the handler if it was called from the UI thread
@@ -954,6 +957,9 @@ class Presenter {
   std::atomic<int64_t> guest_output_refresh_time_ns_{0};
   // UI thread: guest_output_refresh_count_ when it painted last.
   uint64_t ui_painted_guest_output_refresh_count_ = 0;
+  // guest_output_refresh_count_ at the latest present (by whichever thread
+  // painted), to tell presents of new guest frames from repeats.
+  std::atomic<uint64_t> presented_guest_output_refresh_count_{0};
 
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.
@@ -1052,6 +1058,13 @@ class Presenter {
 
   std::mutex dxgi_ui_tick_mutex_;
   uint64_t dxgi_ui_tick_last_vblank_ = 1;
+  // dxgi_ui_tick_last_vblank_ at the latest UI thread present (present_vsync).
+  uint64_t dxgi_ui_tick_last_present_vblank_ = 0;
+  // Vblank thread only: the output its vblanks were last measured on, its
+  // display mode refresh rate, and the number of waits.
+  IDXGIOutput* host_vblank_output_ = nullptr;
+  double host_vblank_nominal_hz_ = 0.0;
+  uint64_t host_vblank_waits_ = 0;
   // If output is null or shutdown is true, the signal may not be sent, either
   // don't limit the frame rate in this case (an exceptional situation, such as
   // a failure to find the output in DXGI), or don't draw at all if the window

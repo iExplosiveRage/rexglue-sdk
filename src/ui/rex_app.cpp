@@ -266,6 +266,10 @@ void PerfReportCommand(std::string_view args) {
     std::vector<float> frame_ms;
     uint64_t seen_swaps = start_swaps;
     float recent[255];
+    // Host presents: the real cadence on the screen.
+    std::vector<float> present_ms;
+    const uint64_t start_presents = perf::GetHostPresentCount();
+    uint64_t seen_presents = start_presents;
     uint64_t peak_memory = 0;
     while (std::chrono::duration<double>(clock::now() - start).count() < seconds) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -274,6 +278,13 @@ void PerfReportCommand(std::string_view args) {
       const size_t take = size_t(std::min<uint64_t>(swaps - seen_swaps, count));
       frame_ms.insert(frame_ms.end(), recent + (count - take), recent + count);
       seen_swaps = swaps;
+      const uint64_t presents = perf::GetHostPresentCount();
+      const size_t present_count = perf::GetHostPresentIntervals(recent, 255);
+      const size_t present_take =
+          size_t(std::min<uint64_t>(presents - seen_presents, present_count));
+      present_ms.insert(present_ms.end(), recent + (present_count - present_take),
+                        recent + present_count);
+      seen_presents = presents;
       peak_memory = std::max(peak_memory, tc.memory_bytes.load());
     }
     const double elapsed = std::chrono::duration<double>(clock::now() - start).count();
@@ -286,6 +297,15 @@ void PerfReportCommand(std::string_view args) {
       }
       return frame_ms[std::min(frame_ms.size() - 1, size_t(p * double(frame_ms.size())))];
     };
+    const uint64_t presents = perf::GetHostPresentCount() - start_presents;
+    std::sort(present_ms.begin(), present_ms.end());
+    // Guest swap -> present latencies of the latest new frames (up to 254).
+    std::vector<float> latency_ms(recent, recent + perf::GetGuestToPresentLatencies(recent, 255));
+    std::sort(latency_ms.begin(), latency_ms.end());
+    auto percentile_of = [](const std::vector<float>& v, double p) -> double {
+      return v.empty() ? 0.0 : double(v[std::min(v.size() - 1, size_t(p * double(v.size())))]);
+    };
+    const double present_p99 = percentile_of(present_ms, 0.99);
     auto per_second = [&](size_t i) { return double(after[i] - before[i]) / elapsed; };
     const perf::RenderInfo render = perf::GetRenderInfo();
     const std::string summary = fmt::format(
@@ -302,8 +322,17 @@ void PerfReportCommand(std::string_view args) {
         double(after[8] - before[8]) * 1.0e-6 / elapsed, tc.memory_bytes.load() >> 20,
         peak_memory >> 20, tc.limit_soft_mb.load(), tc.limit_hard_mb.load(),
         tc.vram_usage_bytes.load() >> 20, tc.vram_budget_bytes.load() >> 20);
-    REXLOG_INFO("perf_report: {}", summary);
-    done(true, summary);
+    const std::string present_summary = fmt::format(
+        "present fps {:.1f} presents {} | present ms p1 {:.2f} p50 {:.2f} p99 {:.2f} max {:.2f} "
+        "1%low {:.1f} | swap->present ms p50 {:.2f} p99 {:.2f} (last {})",
+        double(presents) / elapsed, presents, percentile_of(present_ms, 0.01),
+        percentile_of(present_ms, 0.5), present_p99,
+        present_ms.empty() ? 0.0 : double(present_ms.back()),
+        present_p99 > 0.0 ? 1000.0 / present_p99 : 0.0, percentile_of(latency_ms, 0.5),
+        percentile_of(latency_ms, 0.99), latency_ms.size());
+    const std::string full_summary = summary + " | " + present_summary;
+    REXLOG_INFO("perf_report: {}", full_summary);
+    done(true, full_summary);
   }).detach();
 }
 

@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/graphics/frame_pacing.h>
 #include <rex/perf/frame_rate.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -1334,20 +1335,26 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       capture(image);
     }
   }
-  // Present as soon as possible, without waiting for vsync (the host refresh
-  // rate may be something like 144 Hz, which is not a multiple of the common
-  // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
-  // frames for lower latency. Also, if possible, allowing tearing to use
-  // variable refresh rate in borderless fullscreen (note that if DXGI
-  // fullscreen is ever used in, the allow tearing flag must not be passed in
-  // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-  // presentation model used in Direct3D 12).
+  // present_vsync (the default): sync interval 1 - the frame is shown from
+  // the next vblank, whole, and every present is shown (the presenter makes at
+  // most one per refresh). Variable refresh rate displays still show each
+  // frame when it comes, below their maximum refresh rate.
+  // Off: present as soon as possible, without waiting for vsync, allowing
+  // dropping outdated queued frames for lower latency, and tearing if possible
+  // (variable refresh rate in borderless fullscreen; if DXGI fullscreen is
+  // ever used, the allow tearing flag must not be passed in fullscreen).
+  // Without a variable refresh rate that shows frames torn, and in a window
+  // the compositor shows whichever present is the latest at its vblank.
+  const bool vsync = rex::graphics::IsHostVsync();
   const bool profile_present = rex::perf::IsGpuProfiling();
   const auto present_start = profile_present ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point();
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  HRESULT present_result =
+      vsync ? paint_context_.swap_chain->Present(1, 0)
+            : paint_context_.swap_chain->Present(
+                  0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                                 ? DXGI_PRESENT_ALLOW_TEARING
+                                                 : 0));
   if (profile_present) {
     rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
     stats.present_calls.fetch_add(1, std::memory_order_relaxed);

@@ -18,7 +18,9 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/draw_overrides.h>
+#include <rex/graphics/frame_pacing.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/platform.h>
 #include <rex/graphics/wide_aspect.h>
 #include <rex/ui/presenter.h>
@@ -26,6 +28,14 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_BOOL(present_vsync, true, "UI/Presenter",
+                    "Present with vertical sync: each frame is shown from the display's next "
+                    "refresh, at most one new frame per refresh, without tearing (variable "
+                    "refresh rate displays still follow the frame rate), and a frame rate that "
+                    "the refresh rate is a multiple of is locked to the display. Off = present "
+                    "at once, tearing allowed.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
@@ -411,13 +421,33 @@ void Presenter::PaintFromUIThread(bool force_paint) {
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
       constexpr int64_t kGuestOutputLiveNs = 100'000'000;
-      if (ui_tick && !force_paint && guest_refreshes == ui_painted_guest_output_refresh_count_ &&
+      // With present_vsync also a forced tick without a new guest frame (a
+      // guest frame that the previous paint already took): presenting it again
+      // would take the next refresh, and the next new frame would be shown a
+      // refresh late.
+      const bool vsync = REXCVAR_GET(present_vsync);
+      if ((ui_tick || vsync) && !force_paint &&
+          guest_refreshes == ui_painted_guest_output_refresh_count_ &&
           now_ns - guest_output_refresh_time_ns_.load(std::memory_order_relaxed) <
               kGuestOutputLiveNs) {
         request_ui_paint_after_current_ui_thread_paint_ = true;
       } else {
-        ui_painted_guest_output_refresh_count_ = guest_refreshes;
+        // With vertical sync, at most one present per display refresh: a
+        // second one would queue behind the first and show a refresh late (or
+        // block in Present). Wait for the next vblank and present the newest
+        // guest frame then.
+        if (vsync) {
+          WaitForVsyncPresentSlotFromUIThread();
+        }
+        ui_painted_guest_output_refresh_count_ =
+            guest_output_refresh_count_.load(std::memory_order_acquire);
         paint_result = PaintAndPresent(draw_ui);
+#if REX_PLATFORM_WIN32
+        {
+          std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+          dxgi_ui_tick_last_present_vblank_ = dxgi_ui_tick_last_vblank_;
+        }
+#endif  // REX_PLATFORM_WIN32
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
           // Request another PaintFromUIThread which will try to recover from
           // the outdated connection in the next frame (not immediately, so the
@@ -1366,12 +1396,14 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   // theoretically. For safety, check whether the window exists unconditionally.
   assert_not_null(window_);
   assert_not_null(surface_);
+  // Force the tick even if a paint is pending already: that paint may be a UI
+  // tick repaint that would otherwise wait for the next vblank first.
+  if (force_ui_thread_paint_tick) {
+    ForceUIThreadPaintTick();
+  }
   if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
     // Invalidation pending already, no need to do it twice.
     return false;
-  }
-  if (force_ui_thread_paint_tick) {
-    ForceUIThreadPaintTick();
   }
   window_->RequestPaint();
   return true;
@@ -1449,7 +1481,16 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  rex::graphics::SetHostVsync(REXCVAR_GET(present_vsync));
+  // Taken before painting: a guest frame refreshed meanwhile may or may not be
+  // in this paint - counted as new next time rather than never.
+  const uint64_t guest_refreshes = guest_output_refresh_count_.load(std::memory_order_acquire);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    const uint64_t last_presented =
+        presented_guest_output_refresh_count_.exchange(guest_refreshes, std::memory_order_relaxed);
+    rex::perf::RecordHostPresent(guest_refreshes != last_presented);
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
@@ -1512,7 +1553,12 @@ void Presenter::HandleUIDrawersChangeFromUIThread(bool drawers_were_empty) {
 
 void Presenter::UpdateUITicksNeededFromUIThread() {
 #if REX_PLATFORM_WIN32
-  bool new_needed = AreUITicksNeededFromUIThread();
+  // The vblank thread also runs without UI drawers: its vblanks pace the
+  // presents with present_vsync and lock the guest vblank to the display
+  // (rex::graphics::NotifyHostVblank). The UI frame rate limit itself still
+  // applies only with drawers (WaitForUITickFromUIThread).
+  bool new_needed =
+      paint_mode_ != PaintMode::kNone && !surface_paint_connection_has_implicit_vsync_;
   if (dxgi_ui_ticks_needed_ == new_needed) {
     return;
   }
@@ -1560,9 +1606,37 @@ bool Presenter::WaitForUITickFromUIThread() {
 
 void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
-  std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
-  dxgi_ui_tick_force_requested_ = true;
+  {
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    dxgi_ui_tick_force_requested_ = true;
+  }
+  // Wake a UI thread waiting for the next vblank in WaitForUITickFromUIThread
+  // at once. Without this a new guest frame waited for the monitor's next
+  // vblank to be presented (GitHub #14): presents snapped to the refresh grid a
+  // refresh late, and a frame that came in while the UI thread was busy was
+  // presented right away instead - two presents in one refresh, the first one
+  // never shown, then a refresh with nothing new (a skipped frame).
+  dxgi_ui_tick_signal_condition_.notify_all();
 #endif  // XE_PLATFORM
+}
+
+void Presenter::WaitForVsyncPresentSlotFromUIThread() {
+#if REX_PLATFORM_WIN32
+  std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+  if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock) ||
+      dxgi_ui_tick_last_vblank_ != dxgi_ui_tick_last_present_vblank_) {
+    return;
+  }
+  // Bounded, in case the vblanks stop (the monitor is turned off).
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  const uint64_t presented_at = dxgi_ui_tick_last_present_vblank_;
+  while (dxgi_ui_tick_last_vblank_ == presented_at && AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
+    if (dxgi_ui_tick_signal_condition_.wait_until(dxgi_ui_tick_lock, deadline) ==
+        std::cv_status::timeout) {
+      break;
+    }
+  }
+#endif  // REX_PLATFORM_WIN32
 }
 
 #if REX_PLATFORM_WIN32
@@ -1601,7 +1675,31 @@ void Presenter::DXGIUITickThread() {
     {
       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+      // The display mode's refresh rate of this output, re-read now and then
+      // (for rex::graphics::NotifyHostVblank).
+      if (dxgi_output.Get() != host_vblank_output_ || !(host_vblank_waits_ & 1023)) {
+        if (dxgi_output.Get() != host_vblank_output_) {
+          host_vblank_output_ = dxgi_output.Get();
+          rex::graphics::ResetHostVblank();
+        }
+        host_vblank_nominal_hz_ = 0.0;
+        DXGI_OUTPUT_DESC output_desc;
+        MONITORINFOEXW monitor_info = {};
+        monitor_info.cbSize = sizeof(monitor_info);
+        DEVMODEW mode = {};
+        mode.dmSize = sizeof(mode);
+        if (SUCCEEDED(dxgi_output->GetDesc(&output_desc)) &&
+            GetMonitorInfoW(output_desc.Monitor, &monitor_info) &&
+            EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+            mode.dmDisplayFrequency > 1) {
+          host_vblank_nominal_hz_ = double(mode.dmDisplayFrequency);
+        }
+      }
+      ++host_vblank_waits_;
+      wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
+      if (wait_succeeded) {
+        rex::graphics::NotifyHostVblank(host_vblank_nominal_hz_);
+      }
     }
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {

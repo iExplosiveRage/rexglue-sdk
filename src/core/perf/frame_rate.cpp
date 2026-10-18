@@ -27,7 +27,74 @@ std::atomic<uint32_t> g_scale_y{0};
 std::atomic<uint32_t> g_requested_scale_x{0};
 std::atomic<uint32_t> g_requested_scale_y{0};
 std::atomic<uint32_t> g_percent{100};
+// Host presents (UI or guest output thread, one at a time): times by present
+// number, and swap -> present latencies of new guest frames.
+std::array<std::atomic<int64_t>, kSwapTimeHistory> g_present_times_ns{};
+std::atomic<uint64_t> g_present_count{0};
+std::array<std::atomic<int64_t>, kSwapTimeHistory> g_present_latency_ns{};
+std::atomic<uint64_t> g_present_latency_count{0};
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+size_t ReadIntervals(const std::array<std::atomic<int64_t>, kSwapTimeHistory>& times,
+                     uint64_t count, float* out_ms, size_t max_count) {
+  if (!out_ms || count < 2) {
+    return 0;
+  }
+  const size_t frames =
+      size_t(std::min<uint64_t>({uint64_t(max_count), count - 1, kSwapTimeHistory - 1}));
+  for (size_t i = 0; i < frames; ++i) {
+    const uint64_t newer = count - frames + i;
+    const int64_t interval_ns = times[newer % kSwapTimeHistory].load(std::memory_order_relaxed) -
+                                times[(newer - 1) % kSwapTimeHistory].load(std::memory_order_relaxed);
+    out_ms[i] = float(std::max<int64_t>(interval_ns, 0)) * 1.0e-6f;
+  }
+  return frames;
+}
 }  // namespace
+
+void RecordHostPresent(bool new_guest_frame) {
+  const int64_t now = SteadyNowNs();
+  const uint64_t index = g_present_count.load(std::memory_order_relaxed);
+  g_present_times_ns[index % kSwapTimeHistory].store(now, std::memory_order_relaxed);
+  g_present_count.store(index + 1, std::memory_order_release);
+  const uint64_t swaps = g_guest_swap_count.load(std::memory_order_acquire);
+  if (new_guest_frame && swaps) {
+    const int64_t swap_time =
+        g_swap_times_ns[(swaps - 1) % kSwapTimeHistory].load(std::memory_order_relaxed);
+    const uint64_t latency_index = g_present_latency_count.load(std::memory_order_relaxed);
+    g_present_latency_ns[latency_index % kSwapTimeHistory].store(
+        std::max<int64_t>(now - swap_time, 0), std::memory_order_relaxed);
+    g_present_latency_count.store(latency_index + 1, std::memory_order_release);
+  }
+}
+
+uint64_t GetHostPresentCount() {
+  return g_present_count.load(std::memory_order_relaxed);
+}
+
+size_t GetHostPresentIntervals(float* out_ms, size_t max_count) {
+  return ReadIntervals(g_present_times_ns, g_present_count.load(std::memory_order_acquire), out_ms,
+                       max_count);
+}
+
+size_t GetGuestToPresentLatencies(float* out_ms, size_t max_count) {
+  const uint64_t count = g_present_latency_count.load(std::memory_order_acquire);
+  if (!out_ms) {
+    return 0;
+  }
+  const size_t n = size_t(std::min<uint64_t>({uint64_t(max_count), count, kSwapTimeHistory - 1}));
+  for (size_t i = 0; i < n; ++i) {
+    out_ms[i] = float(g_present_latency_ns[(count - n + i) % kSwapTimeHistory].load(
+                    std::memory_order_relaxed)) *
+                1.0e-6f;
+  }
+  return n;
+}
 
 void RecordGuestSwap() {
   const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
