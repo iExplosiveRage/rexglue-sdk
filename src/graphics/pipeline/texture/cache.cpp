@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -135,6 +136,16 @@ REXCVAR_DEFINE_INT32(texture_replace_ram_mb, 3072, "GPU/Texture Replacement",
                      "dropped past it (and decoded again if needed), and a pack bigger than this "
                      "isn't preloaded")
     .range(256, 65536)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(texture_replace_alpha, "auto", "GPU/Texture Replacement",
+                      "How the pack's images store transparency: auto (each image compared with "
+                      "the game's own texture it replaces - or, without one, a sample of the "
+                      "pack decides), straight (colour not multiplied by alpha, like the game's own "
+                      "textures) or premultiplied (colour multiplied by alpha, as some upscaling "
+                      "tools export it - converted to straight alpha when loaded; drawn as it is, "
+                      "soft edges, glows, clouds and decals come out dark)")
+    .allowed({"auto", "straight", "premultiplied"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
@@ -736,6 +747,25 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
   return host_swizzle;
 }
 
+uint32_t TextureCache::ReplacementHostSwizzle(uint32_t guest_swizzle,
+                                              uint32_t host_format_swizzle) {
+  // Only formats whose host texture keeps the guest components in place
+  // (RGBA-like: 8_8_8_8, DXT1-5, ...); single- and two-channel formats
+  // replicate components and keep the plain mapping.
+  uint32_t channel_of[4];
+  if (host_format_swizzle != xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA ||
+      !TextureReplacement::GetSwizzleColorOrder(guest_swizzle, channel_of)) {
+    return GuestToHostSwizzle(guest_swizzle, host_format_swizzle);
+  }
+  uint32_t host_swizzle = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t c = (guest_swizzle >> (3 * i)) & 0b111;
+    const uint32_t host_c = c >= xenos::XE_GPU_TEXTURE_SWIZZLE_0 ? (c & 0b101) : channel_of[c];
+    host_swizzle |= host_c << (3 * i);
+  }
+  return host_swizzle;
+}
+
 bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
                                       PendingSharedMemoryRange* pending_ranges_out,
                                       size_t& pending_range_count_out) {
@@ -853,7 +883,8 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
                               texture_key.tiled != 0, guest_bytes, guest_size);
       replacement_->DumpTexture(content_hash, texture_key.GetWidth(), texture_key.GetHeight(),
                                 texture_key.pitch, texture_key.tiled != 0, texture_key.format,
-                                texture_key.endianness, guest_bytes, guest_size);
+                                texture_key.endianness, guest_bytes, guest_size,
+                                texture.last_guest_swizzle_);
     }
   }
 
@@ -932,6 +963,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
+    // For FindOrCreateTexture below (a replacement's original is compared in
+    // the colours this binding shows).
+    replacement_lookup_swizzle_ = fetch.swizzle;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
@@ -941,6 +975,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    if (binding.key == old_key && binding.texture && binding.texture->replacement_content_hash_) {
+      binding.host_swizzle =
+          ReplacementHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    }
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -990,6 +1028,31 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       binding.texture_signed = nullptr;
     }
+    // A replacement image holds the colours the game shows: guest data
+    // stored in another component order (ARGB read with ZYXW) must not be
+    // reordered once more.
+    if (binding.texture && binding.texture->replacement_content_hash_) {
+      const uint32_t replacement_swizzle =
+          ReplacementHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+      if (replacement_swizzle != binding.host_swizzle) {
+        // Once per replacement (bindings are looked up again every frame).
+        static std::unordered_set<uint64_t> logged;
+        if (logged.size() < 256 && logged.insert(binding.texture->replacement_content_hash_).second) {
+          REXLOG_INFO(
+              "TextureReplacement: {:016x} (guest format {}, fetch swizzle {:03o}) shown in "
+              "the replacement's own colour order",
+              binding.texture->replacement_content_hash_, uint32_t(binding.key.format),
+              uint32_t(fetch.swizzle));
+        }
+        binding.host_swizzle = replacement_swizzle;
+        if (replacement_swizzle != old_host_swizzle) {
+          bindings_changed |= index_bit;
+        }
+      }
+    }
+    if (binding.texture) {
+      binding.texture->last_guest_swizzle_ = fetch.swizzle;
+    }
     if (load_unsigned_data) {
       queue_pending_texture_load(binding.texture);
     }
@@ -997,6 +1060,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
   }
+
+  replacement_lookup_swizzle_ = 0x688;  // XYZW
 
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
                     uint32_t(pending_texture_loads.size()));
@@ -1377,11 +1442,21 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       uint32_t replacement_width = 0, replacement_height = 0;
       if (replacement_->FindReplacementSize(replacement_content_hash, replacement_width,
                                             replacement_height)) {
-        // The key holds up to 8192 per side.
+        // The key holds up to 8192 per side (bigger images are given at that
+        // size already - TextureReplacement::FitReplacementSize).
         const uint32_t max_size = std::min(GetMaxHostTextureWidthHeight(key.dimension),
                                            xenos::kTexture2DCubeMaxWidthHeight);
 
-        if (replacement_width <= max_size && replacement_height <= max_size) {
+        if (replacement_width > max_size || replacement_height > max_size) {
+          static std::unordered_set<uint64_t> logged_too_big;
+          if (logged_too_big.size() < 256 &&
+              logged_too_big.insert(replacement_content_hash).second) {
+            REXLOG_WARN(
+                "TextureReplacement: {:016x} is {}x{}, more than this GPU's textures can be "
+                "({} per side) - the original texture is shown",
+                replacement_content_hash, replacement_width, replacement_height, max_size);
+          }
+        } else {
           const uint32_t original_width = key.GetWidth();
           const uint32_t original_height = key.GetHeight();
 
@@ -1389,13 +1464,41 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           replacement_key.width_minus_1 = replacement_width - 1;
           replacement_key.height_minus_1 = replacement_height - 1;
           replacement_key.format = xenos::TextureFormat::k_8_8_8_8;
-          // A full mip chain (made when the replacement is loaded), so it
-          // doesn't shimmer when it's far away - the guest's sampler state
-          // still picks which levels are used.
+          // Mips (made when the replacement is loaded) down to the game's own
+          // last level at the replacement's scale - level log2(scale) is the
+          // original's base: a texture the game made without mips keeps the
+          // original's detail at a distance (not blurred below it) and isn't
+          // sampled finer than the original either (no extra shimmer); one
+          // with a full chain gets a full chain.
+          const float scale = std::max(float(replacement_width) / float(original_width),
+                                       float(replacement_height) / float(original_height));
+          const uint32_t scale_log2 =
+              scale > 1.0f ? uint32_t(std::floor(std::log2(scale) + 0.01f)) : 0;
           replacement_key.mip_max_level =
-              std::min(rex::log2_floor(std::max(replacement_width, replacement_height)),
-                       uint32_t(xenos::kTextureMaxMips - 1));
+              std::min({rex::log2_floor(std::max(replacement_width, replacement_height)),
+                        uint32_t(xenos::kTextureMaxMips - 1),
+                        uint32_t(key.mip_max_level) + scale_log2});
           replacement_key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
+
+          // Premultiplied alpha (texture_replace_alpha): the original's data
+          // for the loading thread to compare the replacement with, while the
+          // guest memory holds it.
+          if (textures_.find(replacement_key) == textures_.end() &&
+              key.dimension == xenos::DataDimension::k2DOrStacked &&
+              original_guest_layout.array_size == 1 && original_guest_layout.packed_level != 0 &&
+              TextureReplacement::CanDecodeGuestFormat(key.format) &&
+              replacement_->WantsGuestReference(replacement_content_hash)) {
+            auto guest = std::make_shared<TextureReplacementGuest>();
+            guest->bytes.assign(guest_bytes, guest_bytes + guest_size);
+            guest->width = original_width;
+            guest->height = original_height;
+            guest->row_pitch_bytes = original_guest_layout.base.row_pitch_bytes;
+            guest->tiled = key.tiled != 0;
+            guest->format = key.format;
+            guest->endianness = key.endianness;
+            guest->swizzle = replacement_lookup_swizzle_;
+            replacement_->SetGuestReference(replacement_content_hash, std::move(guest));
+          }
 
           // Not decoded yet: the original texture this time, the replacement
           // decoded in the background (its ready callback has the bindings

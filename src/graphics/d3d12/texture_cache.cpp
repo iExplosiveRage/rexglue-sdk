@@ -1005,6 +1005,29 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mip_filter
                                         : binding.mip_filter;
+  // A texture pack's replacement of a texture the game made without mips has
+  // its own (down to the original's size - its key's mip_max_level, see
+  // TextureCache::FindOrCreateTexture). Its smaller levels stand for the
+  // original's base level, so they're sampled as such: the anisotropic
+  // filtering setting applies (floors at grazing angles), and a base map
+  // fetch picks the nearest of them instead of the 4x-8x top level only
+  // (which would alias far more than the original did).
+  bool replacement_levels_as_base = false;
+  if (!has_mips) {
+    const TextureBinding* texture_binding = GetValidTextureBinding(binding.fetch_constant);
+    const Texture* texture = texture_binding ? texture_binding->texture : nullptr;
+    replacement_levels_as_base =
+        texture && texture->replacement_content_hash_ && texture->key().mip_max_level > 0;
+  }
+  bool mip_from_base_map = false;
+  if (replacement_levels_as_base) {
+    has_mips = true;
+    if (mip_filter == xenos::TextureFilter::kBaseMap) {
+      mip_filter = xenos::TextureFilter::kPoint;
+      mip_from_base_map = true;
+    }
+  }
+
   bool min_mag_linear = (mag_filter == xenos::TextureFilter::kLinear) &&
                         (min_filter == xenos::TextureFilter::kLinear);
   bool mip_filter_bilinear_or_trilinear =
@@ -1016,9 +1039,15 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  // (Not for a base map made nearest-mip above: anisotropic filtering always
+  // blends levels, which would soften UI the game draws with base maps.)
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips && !mip_base_map &&
-      min_mag_linear && mip_filter_bilinear_or_trilinear) {
+      !mip_from_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
+  }
+  if (mip_from_base_map) {
+    // The game's own anisotropy (if any) would blend levels too.
+    aniso_filter = xenos::AnisoFilter::kDisabled;
   }
   aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
   parameters.aniso_filter = aniso_filter;
@@ -2363,8 +2392,12 @@ bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
   if (data.prepared_upload) {
     const auto* prepared = static_cast<const PreparedReplacementUpload*>(data.prepared_upload.get());
     const D3D12_RESOURCE_DESC prepared_desc = resource->GetDesc();
+    // The buffer has the full mip chain; the texture may take fewer (the
+    // game's own last level at the replacement's scale - see
+    // FindOrCreateTexture) - the first ones are the same.
+    const uint32_t copy_level_count = std::max(uint32_t(prepared_desc.MipLevels), uint32_t(1));
     if (prepared_desc.Width != data.width || prepared_desc.Height != data.height ||
-        prepared_desc.MipLevels != prepared->footprints.size()) {
+        copy_level_count > prepared->footprints.size()) {
       return false;
     }
     const D3D12_RESOURCE_STATES old_state =
@@ -2372,7 +2405,7 @@ bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
     command_processor_.PushTransitionBarrier(resource, old_state, D3D12_RESOURCE_STATE_COPY_DEST);
     command_processor_.SubmitBarriers();
     DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
-    for (uint32_t level = 0; level < prepared->footprints.size(); ++level) {
+    for (uint32_t level = 0; level < copy_level_count; ++level) {
       D3D12_TEXTURE_COPY_LOCATION destination_location{};
       destination_location.pResource = resource;
       destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;

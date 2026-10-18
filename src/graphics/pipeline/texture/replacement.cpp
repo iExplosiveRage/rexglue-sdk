@@ -16,9 +16,13 @@
 #include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
+#include <rex/math.h>
 #include <rex/perf/frame_rate.h>
 #include <rex/thread.h>
+
+#include "replacement_alpha.h"
 
 #ifndef XXH_INLINE_ALL
 #define XXH_INLINE_ALL
@@ -317,27 +321,8 @@ static void DecodeBC3AlphaBlock(const uint8_t* block, uint8_t alpha[16]) {
   }
 }
 
-// Runs body(begin, end) over the rows [0, count), split across a few threads
-// when the image is big (a 4096x4096 replacement decodes and mips about 8x
-// faster on 8 threads, which is what the frame waits for).
-template <typename Body>
-static void ParallelRows(uint32_t count, uint64_t pixels, Body&& body) {
-  const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
-  if (threads <= 1 || pixels < uint64_t(512) * 512 || count < threads * 4) {
-    body(0u, count);
-    return;
-  }
-  const uint32_t step = (count + threads - 1) / threads;
-  std::vector<std::thread> workers;
-  for (uint32_t begin = step; begin < count; begin += step) {
-    const uint32_t end = std::min(count, begin + step);
-    workers.emplace_back([&body, begin, end] { body(begin, end); });
-  }
-  body(0u, std::min(count, step));
-  for (std::thread& worker : workers) {
-    worker.join();
-  }
-}
+// (replacement_alpha.h)
+using replacement_image::ParallelRows;
 
 enum class DdsDecodeFormat {
   kRGBA8,
@@ -943,13 +928,19 @@ TextureReplacement::TextureReplacement(std::filesystem::path textures_dir)
 }
 
 TextureReplacement::~TextureReplacement() {
+  // The survey first: loads waiting for its answer get it (and once more at
+  // the end, for one a stopping load may have started).
+  StopAlphaSurvey();
   StopAsync();
   StopPreload();
+  StopAlphaSurvey();
 }
 
 void TextureReplacement::Rescan() {
+  StopAlphaSurvey();
   StopAsync();
   StopPreload();
+  StopAlphaSurvey();
   std::lock_guard<std::mutex> lock(cache_mutex_);
   replacements_.clear();
   pixel_cache_.clear();
@@ -957,6 +948,19 @@ void TextureReplacement::Rescan() {
   pixel_cache_bytes_ = 0;
   failed_cache_.clear();
   size_cache_.clear();
+  guest_refs_.clear();
+  premultiplied_votes_ = 0;
+  straight_votes_ = 0;
+  pack_verdict_logged_ = false;
+  // Files for the premultiplied-alpha survey: up to 8 MB (quick to decode),
+  // in the order of their keys (as good as random).
+  std::vector<std::pair<uint64_t, std::filesystem::path>> survey_files;
+  {
+    std::lock_guard<std::mutex> alpha_lock(alpha_mutex_);
+    pack_alpha_ = PackAlpha::kUnknown;
+    alpha_survey_started_ = false;
+    alpha_survey_files_.clear();
+  }
 
   std::error_code ec;
   if (!std::filesystem::exists(replace_dir(), ec))
@@ -997,6 +1001,23 @@ void TextureReplacement::Rescan() {
       continue;
 
     replacements_[hash] = p;
+    std::error_code size_ec;
+    const uintmax_t file_size = entry.file_size(size_ec);
+    if (!size_ec && file_size <= (uintmax_t(8) << 20)) {
+      survey_files.emplace_back(hash, p);
+    }
+  }
+
+  std::sort(survey_files.begin(), survey_files.end());
+  {
+    std::lock_guard<std::mutex> alpha_lock(alpha_mutex_);
+    for (auto& [hash, path] : survey_files) {
+      // (A later file with the same key replaced this one in the index.)
+      auto it = replacements_.find(hash);
+      if (it != replacements_.end() && it->second == path) {
+        alpha_survey_files_.push_back(std::move(path));
+      }
+    }
   }
 
   REXLOG_INFO("TextureReplacement: {} replacement(s) indexed from {}", replacements_.size(),
@@ -1034,10 +1055,24 @@ uint64_t TextureReplacement::FingerprintGuestData(const uint8_t* data, size_t si
 // ---------------------------------------------------------------------------
 // DumpTexture — untile + endian-swap + write DDS
 // ---------------------------------------------------------------------------
+bool TextureReplacement::GetSwizzleColorOrder(uint32_t guest_swizzle, uint32_t channel_of[4]) {
+  uint32_t seen = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t c = (guest_swizzle >> (3 * i)) & 0b111;
+    if (c > 2 || (seen & (1u << c))) {
+      return false;
+    }
+    seen |= 1u << c;
+    channel_of[c] = i;
+  }
+  channel_of[3] = 3;
+  return true;
+}
+
 void TextureReplacement::DumpTexture(uint64_t content_hash, uint32_t width, uint32_t height,
                                      uint32_t pitch_blocks, bool tiled, xenos::TextureFormat format,
                                      xenos::Endian endianness, const uint8_t* guest_bytes,
-                                     uint32_t guest_size) const {
+                                     uint32_t guest_size, uint32_t guest_swizzle) const {
   using F = xenos::TextureFormat;
 
   const FormatInfo* fi = FormatInfo::Get(format);
@@ -1144,6 +1179,24 @@ void TextureReplacement::DumpTexture(uint64_t content_hash, uint32_t width, uint
       }
     }
 
+    // Write the colours the game shows (replacement files are read that
+    // way): e.g. ARGB textures read with a ZYXW swizzle come out blue in the
+    // guest component order. Only for formats with red, green and blue.
+    uint32_t channel_of[4];
+    const bool rgb_format = format == F::k_8_8_8_8 || format == F::k_8_8_8_8_A ||
+                            format == F::k_8_8_8_8_GAMMA_EDRAM || format == F::k_2_10_10_10 ||
+                            format == F::k_1_5_5_5 || format == F::k_5_6_5 ||
+                            format == F::k_4_4_4_4;
+    if (rgb_format && GetSwizzleColorOrder(guest_swizzle, channel_of) &&
+        (channel_of[0] != 0 || channel_of[1] != 1 || channel_of[2] != 2)) {
+      for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+        uint8_t texel[4] = {rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]};
+        for (uint32_t c = 0; c < 4; ++c) {
+          rgba[i + channel_of[c]] = texel[c];
+        }
+      }
+    }
+
     if (!WriteDDS_RGBA8(dest, width, height, rgba.data(), out_row_bytes)) {
       REXLOG_WARN("TextureReplacement: failed to write RGBA8 dump {}", dest.string());
     } else {
@@ -1189,21 +1242,15 @@ bool TextureReplacement::ReadPNG(const std::filesystem::path& path, TextureRepla
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
-std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* pixels,
-                                                                uint32_t width, uint32_t height) {
-  std::vector<std::vector<uint8_t>> mips;
-  const uint8_t* source = pixels;
-  uint32_t source_width = width, source_height = height;
-  while (source_width > 1 || source_height > 1) {
-    const uint32_t mip_width = std::max(source_width >> 1, uint32_t(1));
-    const uint32_t mip_height = std::max(source_height >> 1, uint32_t(1));
-    std::vector<uint8_t>& mip = mips.emplace_back(size_t(mip_width) * mip_height * 4);
-    ParallelRows(mip_height, uint64_t(source_width) * source_height,
-                 [&](uint32_t y_begin, uint32_t y_end) {
+void TextureReplacement::Downsample2x(const uint8_t* source, uint32_t source_width,
+                                      uint32_t source_height, uint8_t* dest, uint32_t dest_width,
+                                      uint32_t dest_height) {
+  ParallelRows(dest_height, uint64_t(source_width) * source_height,
+               [&](uint32_t y_begin, uint32_t y_end) {
     for (uint32_t y = y_begin; y < y_end; ++y) {
       const uint32_t y0 = std::min(y * 2, source_height - 1);
       const uint32_t y1 = std::min(y * 2 + 1, source_height - 1);
-      for (uint32_t x = 0; x < mip_width; ++x) {
+      for (uint32_t x = 0; x < dest_width; ++x) {
         const uint32_t x0 = std::min(x * 2, source_width - 1);
         const uint32_t x1 = std::min(x * 2 + 1, source_width - 1);
         const uint8_t* texels[4] = {
@@ -1220,7 +1267,7 @@ std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* p
             weighted_sum[c] += uint32_t(texel[c]) * texel[3];
           }
         }
-        uint8_t* out = mip.data() + (size_t(y) * mip_width + x) * 4;
+        uint8_t* out = dest + (size_t(y) * dest_width + x) * 4;
         for (uint32_t c = 0; c < 3; ++c) {
           out[c] = uint8_t(alpha_sum ? (weighted_sum[c] + alpha_sum / 2) / alpha_sum
                                      : (color_sum[c] + 2) / 4);
@@ -1228,7 +1275,19 @@ std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* p
         out[3] = uint8_t((alpha_sum + 2) / 4);
       }
     }
-    });
+  });
+}
+
+std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* pixels,
+                                                                uint32_t width, uint32_t height) {
+  std::vector<std::vector<uint8_t>> mips;
+  const uint8_t* source = pixels;
+  uint32_t source_width = width, source_height = height;
+  while (source_width > 1 || source_height > 1) {
+    const uint32_t mip_width = std::max(source_width >> 1, uint32_t(1));
+    const uint32_t mip_height = std::max(source_height >> 1, uint32_t(1));
+    std::vector<uint8_t>& mip = mips.emplace_back(size_t(mip_width) * mip_height * 4);
+    Downsample2x(source, source_width, source_height, mip.data(), mip_width, mip_height);
     source = mip.data();
     source_width = mip_width;
     source_height = mip_height;
@@ -1236,15 +1295,341 @@ std::vector<std::vector<uint8_t>> TextureReplacement::BuildMips(const uint8_t* p
   return mips;
 }
 
-bool TextureReplacement::LoadFile(const std::filesystem::path& path, TextureReplacementData& out) {
+void TextureReplacement::FitReplacementSize(uint32_t& width, uint32_t& height) {
+  replacement_image::FitExtent(width, height, kMaxReplacementSize);
+}
+
+// ---------------------------------------------------------------------------
+// Premultiplied alpha
+// ---------------------------------------------------------------------------
+namespace {
+// Half-transparent texels the alpha checks look at.
+constexpr uint32_t kSoftAlphaMin = 8;
+constexpr uint32_t kSoftAlphaMax = 247;
+// How much brighter than alpha a premultiplied texel may come out (rounding,
+// and upscalers that work on the colour and alpha separately).
+constexpr uint32_t kPremultipliedTolerance = 8;
+// An image tells something only with this many half-transparent texels
+// sampled (and at least 1 in 500 of them).
+constexpr uint64_t kAlphaMinSoft = 256;
+
+bool AlphaStatsInformative(const TextureReplacement::AlphaStats& stats) {
+  return stats.soft >= kAlphaMinSoft && stats.soft * 500 >= stats.sampled;
+}
+
+// Logs a line once per file name (re-decoding after the RAM budget dropped a
+// texture doesn't log it again).
+bool FirstTimeFor(const std::filesystem::path& path) {
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  return seen.size() < 65536 && seen.insert(path.filename().string()).second;
+}
+}  // namespace
+
+TextureReplacement::AlphaStats TextureReplacement::GetAlphaStats(const uint8_t* pixels,
+                                                                 uint32_t width,
+                                                                 uint32_t height) {
+  // Big images every second row and column for the counts (all texels for
+  // whether there's any transparency).
+  const uint32_t step = uint64_t(width) * height > 1024 * 1024 ? 2 : 1;
+  std::atomic<uint64_t> soft{0}, brighter{0}, sampled{0};
+  std::atomic<bool> transparent{false};
+  ParallelRows(height, uint64_t(width) * height, [&](uint32_t y_begin, uint32_t y_end) {
+    uint64_t local_soft = 0, local_brighter = 0, local_sampled = 0;
+    bool local_transparent = false;
+    for (uint32_t y = y_begin; y < y_end; ++y) {
+      const uint8_t* row = pixels + size_t(y) * width * 4;
+      const bool sampled_row = y % step == 0;
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint8_t* texel = row + size_t(x) * 4;
+        const uint32_t alpha = texel[3];
+        if (alpha != 255) {
+          local_transparent = true;
+        }
+        if (!sampled_row || x % step) {
+          continue;
+        }
+        ++local_sampled;
+        if (alpha < kSoftAlphaMin || alpha > kSoftAlphaMax) {
+          continue;
+        }
+        ++local_soft;
+        if (std::max({texel[0], texel[1], texel[2]}) > alpha + kPremultipliedTolerance) {
+          ++local_brighter;
+        }
+      }
+    }
+    soft.fetch_add(local_soft, std::memory_order_relaxed);
+    brighter.fetch_add(local_brighter, std::memory_order_relaxed);
+    sampled.fetch_add(local_sampled, std::memory_order_relaxed);
+    if (local_transparent) {
+      transparent.store(true, std::memory_order_relaxed);
+    }
+  });
+  AlphaStats stats;
+  stats.soft = soft.load();
+  stats.brighter = brighter.load();
+  stats.sampled = sampled.load();
+  stats.transparent = transparent.load();
+  return stats;
+}
+
+bool TextureReplacement::DecodeFile(const std::filesystem::path& path,
+                                    TextureReplacementData& out) {
   const auto ext = LowerASCII(path.extension().string());
-  const bool ok = ext == ".png" ? ReadPNG(path, out) : ReadDDS(path, out);
-  if (!ok) {
-    REXLOG_WARN("TextureReplacement: failed to load {}", path.filename().string());
+  return ext == ".png" ? ReadPNG(path, out) : ReadDDS(path, out);
+}
+
+// ---------------------------------------------------------------------------
+// The original texture (for the alpha check)
+// ---------------------------------------------------------------------------
+bool TextureReplacement::CanDecodeGuestFormat(xenos::TextureFormat format) {
+  using F = xenos::TextureFormat;
+  switch (format) {
+    // Formats with alpha worth comparing (DXT1's is 1-bit and black under
+    // it, telling nothing).
+    case F::k_DXT2_3:
+    case F::k_DXT2_3_AS_16_16_16_16:
+    case F::k_DXT4_5:
+    case F::k_DXT4_5_AS_16_16_16_16:
+    case F::k_8_8_8_8:
+    case F::k_8_8_8_8_A:
+    case F::k_4_4_4_4:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool TextureReplacement::DecodeGuest(const TextureReplacementGuest& guest,
+                                     std::vector<uint8_t>& rgba) {
+  using F = xenos::TextureFormat;
+  const FormatInfo* format_info = FormatInfo::Get(guest.format);
+  if (!format_info || !guest.width || !guest.height || !CanDecodeGuestFormat(guest.format)) {
     return false;
   }
-  out.mips = BuildMips(out.pixels.data(), out.width, out.height);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (!bytes_per_block || (bytes_per_block & (bytes_per_block - 1)) || !guest.row_pitch_bytes) {
+    return false;
+  }
+  const uint32_t x_blocks = (guest.width + format_info->block_width - 1) / format_info->block_width;
+  const uint32_t y_blocks =
+      (guest.height + format_info->block_height - 1) / format_info->block_height;
+  // The blocks in rows, as the guest addresses them (like HashReplacementBase).
+  std::vector<uint8_t> linear(size_t(x_blocks) * y_blocks * bytes_per_block);
+  const uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
+  const uint32_t pitch_blocks = guest.row_pitch_bytes / bytes_per_block;
+  for (uint32_t y = 0; y < y_blocks; ++y) {
+    for (uint32_t x = 0; x < x_blocks; ++x) {
+      const uint64_t offset =
+          guest.tiled ? uint64_t(uint32_t(texture_util::GetTiledOffset2D(
+                            int32_t(x), int32_t(y), pitch_blocks, bytes_per_block_log2)))
+                      : uint64_t(y) * guest.row_pitch_bytes + uint64_t(x) * bytes_per_block;
+      if (offset + bytes_per_block > guest.bytes.size()) {
+        return false;
+      }
+      std::memcpy(linear.data() + (size_t(y) * x_blocks + x) * bytes_per_block,
+                  guest.bytes.data() + offset, bytes_per_block);
+    }
+  }
+  if (guest.endianness != xenos::Endian::kNone) {
+    texture_conversion::CopySwapBlock(guest.endianness, linear.data(), linear.data(),
+                                      linear.size());
+  }
+  if (format_info->type == FormatType::kCompressed) {
+    const bool dxt3 = guest.format == F::k_DXT2_3 || guest.format == F::k_DXT2_3_AS_16_16_16_16;
+    if (!DecodeBCToRGBA8(linear.data(), linear.size(), guest.width, guest.height,
+                         dxt3 ? DdsDecodeFormat::kBC2 : DdsDecodeFormat::kBC3, rgba)) {
+      return false;
+    }
+  } else {
+    rgba.resize(size_t(guest.width) * guest.height * 4);
+    for (size_t i = 0; i < size_t(guest.width) * guest.height; ++i) {
+      if (!TexelToRGBA8(linear.data() + i * bytes_per_block, guest.format, &rgba[i * 4])) {
+        return false;
+      }
+    }
+  }
+  // In the colours the game shows (replacement images hold those).
+  uint32_t channel_of[4];
+  if (GetSwizzleColorOrder(guest.swizzle, channel_of) &&
+      (channel_of[0] != 0 || channel_of[1] != 1 || channel_of[2] != 2)) {
+    for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+      const uint8_t texel[4] = {rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]};
+      for (uint32_t c = 0; c < 4; ++c) {
+        rgba[i + channel_of[c]] = texel[c];
+      }
+    }
+  }
   return true;
+}
+
+bool TextureReplacement::WantsGuestReference(uint64_t content_hash) const {
+  if (REXCVAR_GET(texture_replace_alpha) == "straight") {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return replacements_.count(content_hash) && !pixel_cache_.count(content_hash) &&
+         !failed_cache_.count(content_hash) && !guest_refs_.count(content_hash);
+}
+
+void TextureReplacement::SetGuestReference(
+    uint64_t content_hash, std::shared_ptr<const TextureReplacementGuest> guest) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  // Only those waiting to be decoded - a few at a time, normally.
+  if (guest_refs_.size() >= 1024) {
+    guest_refs_.clear();
+  }
+  guest_refs_[content_hash] = std::move(guest);
+}
+
+// ---------------------------------------------------------------------------
+// Loading a replacement
+// ---------------------------------------------------------------------------
+bool TextureReplacement::FixAlpha(uint64_t hash, const std::filesystem::path& path,
+                                  TextureReplacementData& data, bool allow_defer) const {
+  namespace image = replacement_image;
+  const std::string mode = REXCVAR_GET(texture_replace_alpha);
+  if (mode == "straight" ||
+      !image::HasTransparency(data.pixels.data(), uint64_t(data.width) * data.height)) {
+    return true;
+  }
+  const bool forced = mode == "premultiplied";
+
+  // The game's own texture, when it was handed over with the lookup.
+  std::shared_ptr<const TextureReplacementGuest> guest;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    auto it = guest_refs_.find(hash);
+    if (it != guest_refs_.end()) {
+      guest = it->second;
+    }
+  }
+  std::vector<uint8_t> original;
+  if (guest && DecodeGuest(*guest, original)) {
+    // Compared with the original: decided for this texture alone.
+    const image::AlphaCheck check = image::ClassifyAgainstOriginal(
+        data.pixels.data(), data.width, data.height, original.data(), guest->width,
+        guest->height);
+    if (!check.cutout) {
+      if (check.kind == image::AlphaKind::kPremultiplied) {
+        ++premultiplied_votes_;
+      } else if (check.kind == image::AlphaKind::kStraight) {
+        ++straight_votes_;
+      }
+    }
+    image::AlphaKind kind = check.kind;
+    if (forced && kind != image::AlphaKind::kLostColour) {
+      kind = image::AlphaKind::kPremultiplied;
+    }
+    if (kind != image::AlphaKind::kPremultiplied && kind != image::AlphaKind::kLostColour) {
+      return true;
+    }
+    image::RestoreStraightAlpha(data.pixels.data(), data.width, data.height, kind,
+                                original.data(), guest->width, guest->height);
+    const uint32_t fixed = ++alpha_fixed_count_;
+    if (FirstTimeFor(path) && (fixed <= 48 || fixed % 100 == 0)) {
+      if (kind == image::AlphaKind::kLostColour) {
+        REXLOG_INFO(
+            "TextureReplacement: {} is black under its transparent texels where the original "
+            "has colour (original {:.0f}, image {:.0f}) - the original's colour put back ({} "
+            "fixed so far)",
+            path.filename().string(), check.error_a, check.error_b, fixed);
+      } else if (check.cutout || forced) {
+        REXLOG_INFO(
+            "TextureReplacement: {} has premultiplied alpha{} - converted to straight alpha, the "
+            "original's colour under its transparent texels ({} fixed so far)",
+            path.filename().string(),
+            forced ? " (texture_replace_alpha = premultiplied)" : " (black under transparency)",
+            fixed);
+      } else {
+        REXLOG_INFO(
+            "TextureReplacement: {} has premultiplied alpha (colour difference from the "
+            "original: {:.1f} as straight, {:.1f} as premultiplied) - converted to straight "
+            "alpha, the original's colour under its transparent texels ({} fixed so far)",
+            path.filename().string(), check.error_a, check.error_b, fixed);
+      }
+    }
+    if (!pack_verdict_logged_ && premultiplied_votes_ >= 3 &&
+        premultiplied_votes_ >= 3 * straight_votes_ && !pack_verdict_logged_.exchange(true)) {
+      REXLOG_INFO(
+          "TextureReplacement: this pack has premultiplied alpha ({} of {} textures compared "
+          "with the game's originals so far) - such images are converted as they load",
+          uint32_t(premultiplied_votes_), uint32_t(premultiplied_votes_ + straight_votes_));
+    }
+    return true;
+  }
+
+  // No original to compare with (decoded ahead by the preload, or a guest
+  // format the check can't read): the image's own texels and the pack as a
+  // whole decide.
+  const AlphaStats alpha = GetAlphaStats(data.pixels.data(), data.width, data.height);
+  // Most of its colour brighter than its alpha: straight (whatever the pack).
+  const bool straight = AlphaStatsInformative(alpha) && alpha.brighter * 2 > alpha.soft;
+  if (straight) {
+    return true;
+  }
+  if (allow_defer) {
+    // Loaded again when the game asks for it, with its original.
+    return false;
+  }
+  if (!forced && !IsPackPremultiplied()) {
+    return true;
+  }
+  image::RestoreStraightAlpha(data.pixels.data(), data.width, data.height,
+                              image::AlphaKind::kPremultiplied, nullptr, 0, 0);
+  const uint32_t fixed = ++alpha_fixed_count_;
+  if (FirstTimeFor(path) && (fixed <= 48 || fixed % 100 == 0)) {
+    REXLOG_INFO(
+        "TextureReplacement: {} has premultiplied alpha (the pack's; no original to compare "
+        "with) - converted to straight alpha ({} fixed so far)",
+        path.filename().string(), fixed);
+  }
+  return true;
+}
+
+TextureReplacement::LoadResult TextureReplacement::LoadReplacement(
+    uint64_t hash, const std::filesystem::path& path, TextureReplacementData& out,
+    bool allow_defer) const {
+  if (!DecodeFile(path, out)) {
+    REXLOG_WARN("TextureReplacement: failed to load {}", path.filename().string());
+    return LoadResult::kFailed;
+  }
+
+  // Premultiplied alpha to straight, before anything averages texels.
+  if (!FixAlpha(hash, path, out, allow_defer)) {
+    return LoadResult::kDeferred;
+  }
+
+  // Bigger than a texture can be: downscaled to fit, area-averaged (the size
+  // lookups say the same, see ReadImageSize).
+  uint32_t fit_width = out.width, fit_height = out.height;
+  FitReplacementSize(fit_width, fit_height);
+  if (fit_width != out.width || fit_height != out.height) {
+    std::vector<uint8_t> fitted = replacement_image::DownscaleArea(
+        out.pixels.data(), out.width, out.height, fit_width, fit_height);
+    if (FirstTimeFor(path.filename().string() + "#size")) {
+      REXLOG_INFO(
+          "TextureReplacement: {} is {}x{}, more than a texture can be ({} per side) - used at "
+          "{}x{}",
+          path.filename().string(), out.width, out.height, kMaxReplacementSize, fit_width,
+          fit_height);
+    }
+    out.pixels.swap(fitted);
+    out.width = fit_width;
+    out.height = fit_height;
+  }
+
+  out.mip_levels = 1;
+  out.mips = BuildMips(out.pixels.data(), out.width, out.height);
+  // Its original isn't needed any more (given again if it has to be decoded
+  // again).
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    guest_refs_.erase(hash);
+  }
+  return LoadResult::kLoaded;
 }
 
 bool TextureReplacement::ReadImageSize(const std::filesystem::path& path, uint32_t& width,
@@ -1271,7 +1656,12 @@ bool TextureReplacement::ReadImageSize(const std::filesystem::path& path, uint32
     height = little_endian(12);
     width = little_endian(16);
   }
-  return width && height && width <= 16384 && height <= 16384;
+  if (!width || !height || width > 16384 || height > 16384) {
+    return false;
+  }
+  // The size it's used at (LoadFile halves bigger images).
+  FitReplacementSize(width, height);
+  return true;
 }
 
 uint64_t TextureReplacement::DecodedSize(const std::filesystem::path& path) {
@@ -1329,6 +1719,12 @@ bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& wi
     path = it->second;
   }
   const bool ok = ReadImageSize(path, width, height);
+  if (!ok) {
+    REXLOG_WARN(
+        "TextureReplacement: {} can't be used (not a PNG or DDS image, or more than 16384 per "
+        "side) - the original texture is shown",
+        path.filename().string());
+  }
   std::lock_guard<std::mutex> lock(cache_mutex_);
   if (ok) {
     size_cache_[content_hash] = {width, height};
@@ -1364,17 +1760,19 @@ void TextureReplacement::TrimPixelCache(uint64_t keep) const {
   }
   const uint64_t before = pixel_cache_bytes_;
   size_t dropped = 0;
-  // Oldest first; a few thousand entries at most, and only when a new texture
-  // pushed the cache over.
-  std::vector<std::pair<uint64_t, uint64_t>> by_age;  // last use, hash
+  // The ones already handed out (their textures are made) first, oldest
+  // first; those decoded in the background and not used yet last - the game
+  // is about to ask for them. A few thousand entries at most, and only when
+  // the cache is over its budget.
+  std::vector<std::tuple<bool, uint64_t, uint64_t>> by_age;  // not used yet, last use, hash
   by_age.reserve(pixel_cache_use_.size());
   for (const auto& [hash, use] : pixel_cache_use_) {
     if (hash != keep) {
-      by_age.emplace_back(use.last_use, hash);
+      by_age.emplace_back(!use.used, use.last_use, hash);
     }
   }
   std::sort(by_age.begin(), by_age.end());
-  for (const auto& [last_use, hash] : by_age) {
+  for (const auto& [not_used, last_use, hash] : by_age) {
     if (pixel_cache_bytes_ <= pixel_cache_budget_) {
       break;
     }
@@ -1384,13 +1782,31 @@ void TextureReplacement::TrimPixelCache(uint64_t keep) const {
     pixel_cache_.erase(hash);
     ++dropped;
   }
-  REXLOG_INFO("TextureReplacement: dropped {} decoded texture(s) from RAM ({} -> {} MB)", dropped,
-              before >> 20, pixel_cache_bytes_ >> 20);
+  // Logged at most every 10 s (with the background loading this runs often
+  // once the budget is full).
+  trim_log_dropped_ += dropped;
+  const auto now = std::chrono::steady_clock::now();
+  if (trim_log_dropped_ && now - trim_log_time_ >= std::chrono::seconds(10)) {
+    REXLOG_INFO(
+        "TextureReplacement: dropped {} decoded texture(s) from RAM (now {} MB, "
+        "texture_replace_ram_mb {} MB; was {} MB)",
+        trim_log_dropped_, pixel_cache_bytes_ >> 20, pixel_cache_budget_ >> 20, before >> 20);
+    trim_log_dropped_ = 0;
+    trim_log_time_ = now;
+  }
 }
 
 void TextureReplacement::StartPreload() const {
   preload_started_ = true;
   pixel_cache_budget_ = uint64_t(std::max(REXCVAR_GET(texture_replace_ram_mb), 1)) << 20;
+  // Whether the pack has premultiplied alpha is needed by every load: the
+  // survey starts with the first lookup, so it's usually done before the first
+  // replacement is decoded.
+  if (!replacements_.empty() && REXCVAR_GET(texture_replace_alpha) != "straight" &&
+      REXCVAR_GET(texture_replace_alpha) != "premultiplied") {
+    std::lock_guard<std::mutex> alpha_lock(alpha_mutex_);
+    StartAlphaSurvey();
+  }
   if (!REXCVAR_GET(texture_replace_preload) || replacements_.empty()) {
     return;
   }
@@ -1454,7 +1870,10 @@ void TextureReplacement::PreloadWorker() const {
     }
     if (needed) {
       TextureReplacementData loaded;
-      const bool ok = LoadFile(path, loaded);
+      // Deferred: its alpha needs its original, given when the game asks for
+      // it - left for that load.
+      const LoadResult result = LoadReplacement(hash, path, loaded, true);
+      const bool ok = result == LoadResult::kLoaded;
       if (ok) {
         Prepare(loaded);
       }
@@ -1462,7 +1881,7 @@ void TextureReplacement::PreloadWorker() const {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (ok) {
           AddToPixelCache(hash, std::move(loaded));
-        } else {
+        } else if (result == LoadResult::kFailed) {
           failed_cache_.insert(hash);
         }
         preload_in_progress_.erase(hash);
@@ -1479,6 +1898,150 @@ void TextureReplacement::PreloadWorker() const {
 }
 
 // ---------------------------------------------------------------------------
+// Premultiplied-alpha survey (texture_replace_alpha = auto)
+// ---------------------------------------------------------------------------
+// A pack is either: whoever made it exported all of it the same way. One image
+// can't always tell - dark straight images (shadows, shading masks) also keep
+// their colour below their alpha - so a sample of the pack's images votes:
+// premultiplied ones have almost no texel brighter than its alpha, straight
+// ones mostly have.
+namespace {
+// Whether an image file can have half-transparent texels, from its header.
+bool MayHaveSoftAlpha(const std::filesystem::path& path) {
+  uint8_t header[88] = {};
+  std::ifstream file(path, std::ios::binary);
+  file.read(reinterpret_cast<char*>(header), sizeof(header));
+  if (!std::memcmp(header, "\x89PNG", 4)) {
+    const uint8_t color_type = header[25];  // IHDR: palette, gray + alpha, RGBA
+    return color_type == 3 || color_type == 4 || color_type == 6;
+  }
+  if (!std::memcmp(header, "DDS ", 4)) {
+    uint32_t four_cc;
+    std::memcpy(&four_cc, header + 84, sizeof(four_cc));
+    return four_cc != kFourCC_DXT1;  // 1-bit alpha
+  }
+  return false;
+}
+// Images decoded at most, and how many that tell something are enough.
+constexpr uint32_t kAlphaSurveyMaxImages = 160;
+constexpr uint32_t kAlphaSurveyVotes = 24;
+}  // namespace
+
+bool TextureReplacement::IsPackPremultiplied() const {
+  std::unique_lock<std::mutex> lock(alpha_mutex_);
+  if (pack_alpha_ == PackAlpha::kUnknown) {
+    const std::string mode = REXCVAR_GET(texture_replace_alpha);
+    if (mode == "straight") {
+      pack_alpha_ = PackAlpha::kStraight;
+    } else if (mode == "premultiplied") {
+      pack_alpha_ = PackAlpha::kPremultiplied;
+      REXLOG_INFO(
+          "TextureReplacement: texture_replace_alpha = premultiplied - the pack's images are "
+          "converted to straight alpha as they load");
+    } else {
+      StartAlphaSurvey();
+      alpha_decided_.wait(lock, [this]() { return pack_alpha_ != PackAlpha::kUnknown; });
+    }
+  }
+  return pack_alpha_ == PackAlpha::kPremultiplied;
+}
+
+void TextureReplacement::StartAlphaSurvey() const {
+  if (alpha_survey_started_ || pack_alpha_ != PackAlpha::kUnknown) {
+    return;
+  }
+  alpha_survey_started_ = true;
+  alpha_survey_next_ = 0;
+  alpha_votes_premultiplied_ = 0;
+  alpha_votes_straight_ = 0;
+  alpha_votes_looked_ = 0;
+  alpha_survey_start_time_ = std::chrono::steady_clock::now();
+  const uint32_t thread_count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+  alpha_survey_active_ = thread_count;
+  for (uint32_t i = 0; i < thread_count; ++i) {
+    rex::thread::Thread::CreationParameters params;
+    params.stack_size = 1024 * 1024;
+    auto thread = rex::thread::Thread::Create(params, [this]() { AlphaSurveyWorker(); });
+    if (!thread) {
+      if (alpha_survey_active_.fetch_sub(1) == 1) {
+        FinishAlphaSurvey();
+      }
+      continue;
+    }
+    thread->set_name("Texture Alpha Survey");
+    alpha_survey_threads_.push_back(std::move(thread));
+  }
+}
+
+void TextureReplacement::StopAlphaSurvey() {
+  std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+  {
+    std::lock_guard<std::mutex> lock(alpha_mutex_);
+    threads.swap(alpha_survey_threads_);
+    alpha_survey_stop_ = true;
+  }
+  for (auto& thread : threads) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  std::lock_guard<std::mutex> lock(alpha_mutex_);
+  alpha_survey_stop_ = false;
+}
+
+void TextureReplacement::AlphaSurveyWorker() const {
+  while (!alpha_survey_stop_ &&
+         alpha_votes_premultiplied_ + alpha_votes_straight_ < kAlphaSurveyVotes &&
+         alpha_votes_looked_ < kAlphaSurveyMaxImages) {
+    const size_t index = alpha_survey_next_.fetch_add(1);
+    if (index >= alpha_survey_files_.size()) {
+      break;
+    }
+    const std::filesystem::path& path = alpha_survey_files_[index];
+    if (!MayHaveSoftAlpha(path)) {
+      continue;
+    }
+    TextureReplacementData image;
+    if (!DecodeFile(path, image)) {
+      continue;
+    }
+    alpha_votes_looked_.fetch_add(1);
+    const AlphaStats stats = GetAlphaStats(image.pixels.data(), image.width, image.height);
+    if (!AlphaStatsInformative(stats)) {
+      continue;
+    }
+    if (stats.brighter * 20 <= stats.soft) {
+      // At most 5% brighter than alpha.
+      alpha_votes_premultiplied_.fetch_add(1);
+    } else if (stats.brighter * 4 >= stats.soft) {
+      // A quarter or more.
+      alpha_votes_straight_.fetch_add(1);
+    }
+  }
+  if (alpha_survey_active_.fetch_sub(1) == 1) {
+    // The last one decides.
+    std::lock_guard<std::mutex> lock(alpha_mutex_);
+    FinishAlphaSurvey();
+  }
+}
+
+void TextureReplacement::FinishAlphaSurvey() const {
+  const uint32_t premultiplied = alpha_votes_premultiplied_;
+  const uint32_t straight = alpha_votes_straight_;
+  const bool is_premultiplied = premultiplied >= 3 && premultiplied >= straight * 4;
+  pack_alpha_ = is_premultiplied ? PackAlpha::kPremultiplied : PackAlpha::kStraight;
+  REXLOG_INFO(
+      "TextureReplacement: {} ({} of {} images looked at premultiplied, {} straight, {} ms; "
+      "texture_replace_alpha = auto)",
+      is_premultiplied ? "the pack's images have premultiplied alpha - they're converted to "
+                         "straight alpha (the game's) as they load"
+                       : "the pack's images have straight alpha",
+      premultiplied, uint32_t(alpha_votes_looked_), straight,
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                            alpha_survey_start_time_)
+          .count());
+  alpha_decided_.notify_all();
+}
+
+// ---------------------------------------------------------------------------
 // Asynchronous loading
 // ---------------------------------------------------------------------------
 bool TextureReplacement::IsResident(uint64_t content_hash) const {
@@ -1486,6 +2049,13 @@ bool TextureReplacement::IsResident(uint64_t content_hash) const {
     return true;
   }
   std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto use = pixel_cache_use_.find(content_hash);
+  if (use != pixel_cache_use_.end()) {
+    // About to be made into a texture: the newest, so trimming the RAM
+    // budget before FindReplacement gets to it doesn't drop it.
+    use->second.last_use = ++pixel_cache_clock_;
+    return true;
+  }
   return pixel_cache_.count(content_hash) || failed_cache_.count(content_hash) ||
          !replacements_.count(content_hash);
 }
@@ -1493,6 +2063,10 @@ bool TextureReplacement::IsResident(uint64_t content_hash) const {
 void TextureReplacement::RequestAsync(uint64_t content_hash) const {
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
+    // The loading threads add without trimming (FindReplacement's pointers
+    // must stay valid until its next call): texture_replace_ram_mb is kept
+    // here and in FindReplacement, on the thread asking for textures.
+    TrimPixelCache(0);
     if (pixel_cache_.count(content_hash) || failed_cache_.count(content_hash) ||
         preload_in_progress_.count(content_hash) || !replacements_.count(content_hash) ||
         std::find(async_queue_.begin(), async_queue_.end(), content_hash) !=
@@ -1539,7 +2113,7 @@ void TextureReplacement::AsyncWorker() const {
     }
     const auto load_start = std::chrono::steady_clock::now();
     TextureReplacementData loaded;
-    const bool ok = LoadFile(path, loaded);
+    const bool ok = LoadReplacement(hash, path, loaded, false) == LoadResult::kLoaded;
     if (ok) {
       Prepare(loaded);
     }
@@ -1556,7 +2130,7 @@ void TextureReplacement::AsyncWorker() const {
       std::lock_guard<std::mutex> lock(cache_mutex_);
       if (ok) {
         // Not trimmed here: FindReplacement's pointers must stay valid until
-        // its next call, which trims.
+        // its next call - it and RequestAsync trim.
         AddToPixelCache(hash, std::move(loaded));
       } else {
         failed_cache_.insert(hash);
@@ -1644,7 +2218,11 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
       auto use = pixel_cache_use_.find(content_hash);
       if (use != pixel_cache_use_.end()) {
         use->second.last_use = ++pixel_cache_clock_;
+        use->second.used = true;
       }
+      // texture_replace_ram_mb also with the background loading (which only
+      // adds): the pointers handed out before are used by now.
+      TrimPixelCache(content_hash);
       return &cached->second;
     }
     // Known failure — don't retry.
@@ -1663,7 +2241,7 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
   // Not decoded yet (needed before the preload got to it, or it's off).
   const auto load_start = std::chrono::steady_clock::now();
   TextureReplacementData loaded;
-  const bool ok = LoadFile(path, loaded);
+  const bool ok = LoadReplacement(content_hash, path, loaded, false) == LoadResult::kLoaded;
   {
     rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
     stats.replacement_decodes.fetch_add(1, std::memory_order_relaxed);
@@ -1685,6 +2263,7 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
     std::lock_guard<std::mutex> lock(cache_mutex_);
     if (ok) {
       result = AddToPixelCache(content_hash, std::move(loaded));
+      pixel_cache_use_[content_hash].used = true;
       TrimPixelCache(content_hash);
     } else {
       failed_cache_.insert(content_hash);

@@ -123,6 +123,11 @@ class TextureCache {
   }
 
   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
+  // The host swizzle for a texture made from a replacement image (RGBA8 in
+  // the colours the game shows): a fetch swizzle that only reorders the
+  // colour components of an RGBA-like format reads the image in its own
+  // order; anything else is applied like GuestToHostSwizzle.
+  static uint32_t ReplacementHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
 
   void TextureFetchConstantWritten(uint32_t index) { TextureFetchConstantsWritten(index, index); }
   void TextureFetchConstantsWritten(uint32_t first_index, uint32_t last_index) {
@@ -280,6 +285,9 @@ class TextureCache {
     void LogAction(const char* action) const;
 
     uint64_t replacement_content_hash_ = 0;
+    // The fetch swizzle of the binding that last asked for this texture's
+    // data (dumps are written in the colours that binding shows).
+    uint32_t last_guest_swizzle_ = 0x688;  // XYZW
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -687,6 +695,9 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  // The fetch swizzle of the binding FindOrCreateTexture is looking a texture
+  // up for (a replacement's original is decoded in the colours it shows).
+  uint32_t replacement_lookup_swizzle_ = 0x688;  // XYZW
 
   void InvalidateHashCache(uint32_t base_page) {
     base_page_hash_cache_.erase(base_page);
