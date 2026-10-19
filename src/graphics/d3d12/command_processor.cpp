@@ -33,6 +33,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/draw_overrides.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/wide_aspect.h>
 #include <rex/graphics/util/draw.h>
@@ -85,6 +86,17 @@ REXCVAR_DEFINE_STRING(gpu_debug_skip_pixel_shaders, "", "GPU/Debug",
                       "Comma-separated pixel shader ucode hashes (as in the dump_shaders file "
                       "names) whose draws are skipped, for finding which effect draws something");
 
+REXCVAR_DECLARE(bool, gpu_skip_overwritten_transfers);
+
+REXCVAR_DEFINE_BOOL(gpu_lod_free_texture_fetches, true, "GPU",
+                    "Pixel shaders sample textures that have a single mip level, the same "
+                    "minification and magnification filter and no anisotropic filtering at LOD 0 "
+                    "instead of computing gradients (the same result, less shader work)");
+
+REXCVAR_DEFINE_STRING(gpu_profile_focus_ps, "", "GPU/Debug",
+                      "Comma-separated pixel shader ucode hashes whose draws gpu_profile times "
+                      "separately (as draws_focus)");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -105,6 +117,30 @@ namespace {
 // NVIDIA DLSS upscales), set on any thread and taken by the command processor
 // at the end of a frame. 0 = no change requested.
 std::atomic<uint32_t> g_requested_draw_resolution_scale{0};
+
+// gpu_profile_focus_ps, parsed again only when the text changes (command
+// processor thread, only while a gpu_profile measurement runs).
+bool IsGpuProfileFocusPixelShader(uint64_t ucode_hash) {
+  thread_local std::string parsed_text;
+  thread_local std::vector<uint64_t> hashes;
+  const std::string& text = REXCVAR_GET(gpu_profile_focus_ps);
+  if (text != parsed_text) {
+    parsed_text = text;
+    hashes.clear();
+    size_t pos = 0;
+    while (pos < text.size()) {
+      size_t end = text.find_first_of(", ", pos);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      if (end > pos) {
+        hashes.push_back(std::strtoull(text.substr(pos, end - pos).c_str(), nullptr, 16));
+      }
+      pos = end + 1;
+    }
+  }
+  return std::find(hashes.begin(), hashes.end(), ucode_hash) != hashes.end();
+}
 
 void SetDebugSkippedPixelShaders(std::string_view text) {
   std::vector<rex::graphics::PixelShaderDrawOverride> overrides;
@@ -373,6 +409,11 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
       }
     }
     return;
+  }
+  // Direct resolve data only in textures goes to the guest memory copy, which
+  // stays (the scaled resolve memory is recreated anyway).
+  if (texture_cache_->HasPendingDirectResolves() && BeginSubmission(false)) {
+    texture_cache_->WriteOutUnscaledDirectResolves();
   }
   // Nothing may still be using the caches that are about to be destroyed.
   if (!AwaitAllQueueOperationsCompletion()) {
@@ -2739,6 +2780,75 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+uint32_t D3D12CommandProcessor::GetLodFreeFetchMask(const D3D12Shader& pixel_shader) {
+  // Texture fetches whose result can't depend on the level of detail: 1D / 2D,
+  // a single mip level in the fetch constant and in the texture actually bound
+  // (a texture pack replacement may have more), the same minification and
+  // magnification filter (only one level - the level of detail would only
+  // choose between them), no anisotropic filtering (it uses the gradients
+  // even with one level). As in D3D12TextureCache::GetSamplerParameters.
+  const RegisterFile& regs = *register_file_;
+  uint32_t candidates = 0, lod_dependent = 0;
+  for (const Shader::TextureBinding& binding : pixel_shader.texture_bindings()) {
+    const uint32_t fetch_constant = binding.fetch_constant;
+    if (fetch_constant >= 12) {
+      continue;
+    }
+    const ParsedTextureFetchInstruction& fetch_instr = binding.fetch_instr;
+    if (fetch_instr.opcode != ucode::FetchOpcode::kTextureFetch) {
+      continue;
+    }
+    const uint32_t fetch_constant_bit = uint32_t(1) << fetch_constant;
+    bool lod_free = fetch_instr.dimension == xenos::FetchOpDimension::k1D ||
+                    fetch_instr.dimension == xenos::FetchOpDimension::k2D;
+    if (lod_free) {
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
+      xenos::TextureFilter mag_filter =
+          fetch_instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst
+              ? fetch.mag_filter
+              : fetch_instr.attributes.mag_filter;
+      xenos::TextureFilter min_filter =
+          fetch_instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst
+              ? fetch.min_filter
+              : fetch_instr.attributes.min_filter;
+      xenos::AnisoFilter aniso_filter =
+          fetch_instr.attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+              ? fetch.aniso_filter
+              : fetch_instr.attributes.aniso_filter;
+      uint32_t mip_min_level, mip_max_level;
+      texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
+                                                     nullptr, &mip_min_level, &mip_max_level);
+      lod_free = mip_max_level == 0 && mip_min_level == 0 &&
+                 aniso_filter == xenos::AnisoFilter::kDisabled &&
+                 (mag_filter == xenos::TextureFilter::kLinear) ==
+                     (min_filter == xenos::TextureFilter::kLinear);
+    }
+    if (lod_free) {
+      candidates |= fetch_constant_bit;
+    } else {
+      lod_dependent |= fetch_constant_bit;
+    }
+  }
+  candidates &= ~lod_dependent;
+  if (!candidates) {
+    return 0;
+  }
+  // The textures that will be bound (requesting them is incremental - the
+  // draw's own request later only adds the rest).
+  SetGpuProfilePass(rex::perf::GpuPass::kTextureLoad);
+  texture_cache_->RequestTextures(candidates);
+  SetGpuProfilePass(rex::perf::GpuPass::kOther);
+  uint32_t lod_free_mask = 0;
+  uint32_t fetch_constant;
+  while (rex::bit_scan_forward(candidates, &fetch_constant)) {
+    candidates &= ~(uint32_t(1) << fetch_constant);
+    if (texture_cache_->IsActiveTextureSingleLevel(fetch_constant)) {
+      lod_free_mask |= uint32_t(1) << fetch_constant;
+    }
+  }
+  return lod_free_mask;
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2892,6 +3002,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     pixel_shader_modification.pixel.soft_texture_fetch_size =
         std::clamp(pixel_shader_draw_override->soft_texture_fetch_size, uint32_t(1), uint32_t(15));
   }
+  if (pixel_shader && REXCVAR_GET(gpu_lod_free_texture_fetches)) {
+    pixel_shader_modification.pixel.lod_free_fetch_mask = GetLodFreeFetchMask(*pixel_shader);
+  }
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
@@ -2921,6 +3034,41 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           }
           return color_state;
         });
+  }
+  // Color render targets this draw overwrites with no dependency on their old
+  // contents - the render target cache doesn't transfer old data into the
+  // part it certainly covers (gpu_skip_overwritten_transfers).
+  {
+    uint32_t draw_overwritten_color_rts = 0;
+    if (REXCVAR_GET(gpu_skip_overwritten_transfers) && pixel_shader && is_rasterization_done &&
+        !hud_draw_hidden && !dlss_take_scene && !(dlss_ && dlss_->IsHudMirrorActive()) &&
+        !memexport_used && !pixel_shader->kills_pixels() &&
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+        (!normalized_depth_control.z_enable ||
+         normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) &&
+        !normalized_depth_control.stencil_enable) {
+      auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      if ((!rb_colorcontrol.alpha_test_enable ||
+           rb_colorcontrol.alpha_func == xenos::CompareFunction::kAlways) &&
+          !rb_colorcontrol.alpha_to_mask_enable) {
+        for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+          if (((normalized_color_mask >> (4 * i)) & 0b1111) != 0b1111) {
+            continue;
+          }
+          auto blend_control =
+              regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+          if (blend_control.color_srcblend == xenos::BlendFactor::kOne &&
+              blend_control.color_destblend == xenos::BlendFactor::kZero &&
+              blend_control.color_comb_fcn == xenos::BlendOp::kAdd &&
+              blend_control.alpha_srcblend == xenos::BlendFactor::kOne &&
+              blend_control.alpha_destblend == xenos::BlendFactor::kZero &&
+              blend_control.alpha_comb_fcn == xenos::BlendOp::kAdd) {
+            draw_overwritten_color_rts |= uint32_t(1) << i;
+          }
+        }
+      }
+    }
+    render_target_cache_->SetDrawOverwrittenColorRenderTargets(draw_overwritten_color_rts);
   }
   SetGpuProfilePass(rex::perf::GpuPass::kRenderTargets);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
@@ -3016,6 +3164,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     } else {
       hud_mirror = true;
+    }
+  }
+
+  // Direct resolve data (D3D12TextureCache) that the vertex fetches and the
+  // memory exports of this draw may read goes to the guest memory copy now:
+  // from binding the pipeline on, the shared memory requests below must not
+  // record dispatches or change the descriptor heap.
+  if (texture_cache_->HasPendingDirectResolves()) {
+    if (memexport_used) {
+      std::pair<uint32_t, uint32_t> everything(0, SharedMemory::kBufferSize);
+      texture_cache_->WriteOutDirectResolves(&everything, 1);
+    } else {
+      std::pair<uint32_t, uint32_t> vertex_ranges[96];
+      size_t vertex_range_count = 0;
+      const Shader::ConstantRegisterMap& vertex_constant_map =
+          vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(vertex_constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t vfetch_bits_remaining = vertex_constant_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+          vfetch_bits_remaining &= ~(uint32_t(1) << j);
+          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(i * 32 + j);
+          if (vertex_range_count < rex::countof(vertex_ranges)) {
+            vertex_ranges[vertex_range_count++] =
+                std::make_pair(vfetch_constant.address << 2, vfetch_constant.size << 2);
+          }
+        }
+      }
+      texture_cache_->WriteOutDirectResolves(vertex_ranges, vertex_range_count);
     }
   }
 
@@ -3279,6 +3456,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!
+  struct DirectResolveWriteOutBlock {
+    D3D12TextureCache& texture_cache;
+    explicit DirectResolveWriteOutBlock(D3D12TextureCache& cache) : texture_cache(cache) {
+      texture_cache.SetDirectResolveWriteOutBlocked(true);
+    }
+    ~DirectResolveWriteOutBlock() { texture_cache.SetDirectResolveWriteOutBlocked(false); }
+  } direct_resolve_write_out_block(*texture_cache_);
 
   // Ensure vertex buffers are resident.
   SetGpuProfilePass(rex::perf::GpuPass::kSharedMemory);
@@ -3358,6 +3542,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return false;
     }
   }
+  texture_cache_->SetDirectResolveWriteOutBlocked(false);
 
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -3420,7 +3605,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         return false;
     }
   }
-  SetGpuProfilePass(memexport_used ? rex::perf::GpuPass::kDrawMemexport : rex::perf::GpuPass::kDraw);
+  rex::perf::GpuPass draw_profile_pass =
+      memexport_used ? rex::perf::GpuPass::kDrawMemexport : rex::perf::GpuPass::kDraw;
+  if (rex::perf::IsGpuProfiling() && pixel_shader &&
+      IsGpuProfileFocusPixelShader(pixel_shader->ucode_data_hash())) {
+    draw_profile_pass = rex::perf::GpuPass::kDrawFocus;
+  }
+  SetGpuProfilePass(draw_profile_pass);
   if (rex::perf::IsGpuProfiling()) {
     rex::perf::GetGpuProfileStats().draws.fetch_add(1, std::memory_order_relaxed);
   }
@@ -3989,7 +4180,12 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
+        rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
+        const uint32_t where_before = thread_state.where.load(std::memory_order_relaxed);
+        thread_state.fence_await.store(fence_value, std::memory_order_relaxed);
+        rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kQueueOpsWait);
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere(where_before));
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -4011,7 +4207,13 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       const bool profiling = rex::perf::IsGpuProfiling();
       const auto wait_start =
           profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+      rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
+      const uint32_t where_before = thread_state.where.load(std::memory_order_relaxed);
+      thread_state.fence_await.store(await_submission, std::memory_order_relaxed);
+      thread_state.fence_completed.store(submission_completed_, std::memory_order_relaxed);
+      rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kFenceWait);
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere(where_before));
       if (profiling) {
         rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
         stats.fence_waits.fetch_add(1, std::memory_order_relaxed);
