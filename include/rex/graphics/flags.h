@@ -43,6 +43,8 @@ REXCVAR_DECLARE(bool, native_2x_msaa);
 REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
 REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
 REXCVAR_DECLARE(bool, direct_host_resolve);
+REXCVAR_DECLARE(bool, gpu_native_renderer);
+REXCVAR_DECLARE(bool, gpu_native_edram_transfers);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);

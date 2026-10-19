@@ -339,7 +339,12 @@ RenderTargetCache::~RenderTargetCache() {
   ShutdownCommon();
 }
 
+bool RenderTargetCache::NativeRenderTargetsNoTransfers() const {
+  return native_render_targets_ && !REXCVAR_GET(gpu_native_edram_transfers);
+}
+
 void RenderTargetCache::InitializeCommon() {
+  native_render_targets_ = REXCVAR_GET(gpu_native_renderer);
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -695,8 +700,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
+    // Native renderer: render targets keep their own contents, nothing is
+    // copied between render targets sharing EDRAM ranges.
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                    (interlock_barrier_only || NativeRenderTargetsNoTransfers())
+                        ? nullptr
+                        : &last_update_transfers_[rt_bit_index]);
   }
 
   if (interlock_barrier_only) {
@@ -1070,10 +1079,12 @@ bool RenderTargetCache::PrepareHostRenderTargetsDrawnClear(
   const uint32_t tile_y1 = (y1 - 1) / xenos::kEdramTileHeightSamples + 1;
   auto change_ownership = [&](uint32_t start, uint32_t length) {
     if (depth_render_target) {
-      ChangeOwnership(depth_key, start, length, &depth_transfers_out, &clear_rectangle);
+      ChangeOwnership(depth_key, start, length,
+                      NativeRenderTargetsNoTransfers() ? nullptr : &depth_transfers_out, &clear_rectangle);
     }
     if (color_render_target) {
-      ChangeOwnership(color_key, start, length, &color_transfers_out, &clear_rectangle);
+      ChangeOwnership(color_key, start, length,
+                      NativeRenderTargetsNoTransfers() ? nullptr : &color_transfers_out, &clear_rectangle);
     }
   };
   if (tile_x0 == 0 && tile_x1 == pitch_tiles_at_32bpp) {
@@ -1265,13 +1276,15 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   depth_transfers_out.clear();
   if (depth_render_target) {
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
-                    depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
+                    depth_clear_length_tiles,
+                    NativeRenderTargetsNoTransfers() ? nullptr : &depth_transfers_out, &clear_rectangle);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
   if (color_render_target) {
     ChangeOwnership(color_render_target_key, color_clear_start_tiles_base_relative,
-                    color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
+                    color_clear_length_tiles,
+                    NativeRenderTargetsNoTransfers() ? nullptr : &color_transfers_out, &clear_rectangle);
   }
   return true;
 }

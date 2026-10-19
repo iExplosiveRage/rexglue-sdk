@@ -215,6 +215,10 @@ D3D12RenderTargetCache::Path D3D12RenderTargetCache::ChoosePath(
   if (path == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
     path = Path::kHostRenderTargets;
   }
+  // The native renderer only exists on top of host render targets.
+  if (REXCVAR_GET(gpu_native_renderer)) {
+    path = Path::kHostRenderTargets;
+  }
   return path;
 }
 
@@ -6008,6 +6012,20 @@ bool D3D12RenderTargetCache::TryDirectResolveToTexture(
       REXCVAR_GET(fsr_mode) != "off" ||
       // Reads the resolved data back from the (scaled resolve) memory copy.
       REXCVAR_GET(d3d12_readback_resolve)) {
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      REXGPU_INFO(
+          "DIRECT RESOLVE refused: copy shader {} rt fmt {} dest fmt {} swap {} endian {} array {} "
+          "dest offset {},{} msaa {} depth {} exp_bias {}",
+          uint32_t(copy_shader), uint32_t(rt_format),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_array),
+          resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8,
+          resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8,
+          uint32_t(edram_info.msaa_samples), depth24,
+          int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias));
+    }
     return false;
   }
   // One render target with the same pitch owning the whole area.
@@ -6016,6 +6034,13 @@ bool D3D12RenderTargetCache::TryDirectResolveToTexture(
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  direct_texture_rectangles_);
   if (direct_texture_rectangles_.size() != 1) {
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      REXGPU_INFO("DIRECT RESOLVE refused: {} owner rectangles", direct_texture_rectangles_.size());
+      for (const ResolveCopyDumpRectangle& r : direct_texture_rectangles_) {
+        REXGPU_INFO("  owner {} row {} rows {}", r.render_target->key().GetDebugName(), r.row_first,
+                    r.rows);
+      }
+    }
     return false;
   }
   auto& rt = *static_cast<D3D12RenderTarget*>(direct_texture_rectangles_[0].render_target);
@@ -6025,6 +6050,10 @@ bool D3D12RenderTargetCache::TryDirectResolveToTexture(
                   !rt.descriptor_srv_stencil().IsValid())
                : rt_key.GetColorFormat() != rt_format) ||
       rt_key.pitch_tiles_at_32bpp != dump_pitch || !dump_pitch) {
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      REXGPU_INFO("DIRECT RESOLVE refused: owner {} vs resolve pitch {} format {}",
+                  rt_key.GetDebugName(), dump_pitch, uint32_t(rt_format));
+    }
     return false;
   }
   // The render target pixel of the resolve area's origin.

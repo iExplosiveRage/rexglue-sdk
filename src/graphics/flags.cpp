@@ -16,6 +16,14 @@
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
+REXCVAR_DEFINE_BOOL(gpu_native_renderer, false, "GPU",
+                    "Native renderer (experimental): host render targets per surface with no "
+                    "EDRAM ownership transfers, resolves as host copies, clears as host clears; "
+                    "the game's D3D calls are hooked at the API level. Off = the emulated path.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_native_edram_transfers, false, "GPU/Debug",
+                    "With gpu_native_renderer: still copy between render targets sharing EDRAM "
+                    "ranges like the emulated path (A/B debugging, live)");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");

@@ -218,6 +218,9 @@ class RenderTargetCache {
   // Call last in implementation-specific initialization (when things like path
   // are initialized by the implementation).
   void InitializeCommon();
+  // gpu_native_renderer: no EDRAM ownership transfers between render targets.
+  bool native_render_targets_ = false;
+  bool NativeRenderTargetsNoTransfers() const;
   // May be called from the destructor, or from the implementation shutdown to
   // destroy all render targets before destroying what they depend on in the
   // implementation.
