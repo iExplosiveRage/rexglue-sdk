@@ -42,7 +42,9 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
 
 REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
-                      "D3D12 render target implementation path")
+                      "D3D12 render target implementation path: empty = host render targets "
+                      "(fast), \"rtv\" = the same, \"rov\" = rasterizer-ordered views "
+                      "(slower; for drivers that draw incorrectly with render targets)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
@@ -198,25 +200,13 @@ D3D12RenderTargetCache::Path D3D12RenderTargetCache::ChoosePath(
   } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
     path = Path::kPixelShaderInterlock;
   } else {
-    // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
-    // UHD Graphics 630), the "always" stencil comparison function isn't working
-    // properly, so clears in the Xbox 360's Direct3D 9 don't work. Forcing ROV
-    // there.
-#if 1
-    // The ROV path is currently much slower generally.
-    // TODO(Triang3l): Make ROV the default when it's optimized better (for
-    // instance, using static shader modifications to pass render target
-    // parameters).
-    path = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
-               ? Path::kPixelShaderInterlock
-               : Path::kHostRenderTargets;
-#else
-    // The AMD shader compiler crashes very often with Xenia's custom
-    // output-merger code as of March 2021.
-    path = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
-               ? Path::kHostRenderTargets
-               : Path::kPixelShaderInterlock;
-#endif
+    // Host render targets on every vendor. Intel was forced to ROV because of
+    // an April 2021 driver bug (27.20.0100.9316, UHD Graphics 630: the "always"
+    // stencil comparison not working, so Direct3D 9 clears failed), but ROV is
+    // much slower (about 2.4x measured on an integrated GPU) and render targets
+    // drew correctly in testing. render_target_path_d3d12 = "rov" still picks
+    // ROV for drivers that need it.
+    path = Path::kHostRenderTargets;
   }
   if (path == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
     path = Path::kHostRenderTargets;
