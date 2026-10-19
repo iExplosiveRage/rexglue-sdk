@@ -45,7 +45,7 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
                       "D3D12 render target implementation path: empty = host render targets "
                       "(fast), \"rtv\" = the same, \"rov\" = rasterizer-ordered views "
                       "(slower; for drivers that draw incorrectly with render targets)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 REXCVAR_DEFINE_INT32(gpu_dump_samples_per_thread, 4, "GPU",
@@ -194,10 +194,14 @@ D3D12RenderTargetCache::~D3D12RenderTargetCache() {
 
 D3D12RenderTargetCache::Path D3D12RenderTargetCache::ChoosePath(
     const ui::d3d12::D3D12Provider& provider) {
+  // The value at the first call (device setup): a change from the settings
+  // menu applies after a restart, not when the caches are recreated (draw
+  // resolution scale changes).
+  static const std::string startup_path = REXCVAR_GET(render_target_path_d3d12);
   Path path;
-  if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
+  if (startup_path == "rtv") {
     path = Path::kHostRenderTargets;
-  } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
+  } else if (startup_path == "rov") {
     path = Path::kPixelShaderInterlock;
   } else {
     // Host render targets on every vendor. Intel was forced to ROV because of
