@@ -459,6 +459,45 @@ void HitchStopCommand() {
 
 REXCVAR_DEFINE_COMMAND(quick_menu_toggle, rex::ReXApp::ToggleQuickMenuCommand, "Debug",
                        "Open or close the settings menu (F1)");
+namespace rex {
+namespace {
+// gpu_state: what the GPU (command processor) thread is doing right now - for
+// telling apart a game waiting for itself, the GPU thread waiting for the GPU,
+// and a GPU thread stuck in between when frames stop.
+void GpuStateCommand() {
+  ui::CommandCompletion done = ui::DeferCommandCompletion();
+  perf::GpuThreadState& state = perf::GetGpuThreadState();
+  const uint32_t where = state.where.load(std::memory_order_relaxed);
+  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  const uint64_t since_ms = state.where_since_ms.load(std::memory_order_relaxed);
+  std::string summary = fmt::format(
+      "{} for {} ms | ring read {} write {} | primary buffers {} | guest swaps {} host presents {}",
+      perf::GetGpuThreadWhereName(where), since_ms ? now_ms - since_ms : 0,
+      state.read_ptr.load(std::memory_order_relaxed),
+      state.write_ptr.load(std::memory_order_relaxed),
+      state.primary_buffers.load(std::memory_order_relaxed), perf::GetGuestSwapCount(),
+      perf::GetHostPresentCount());
+  if (where == uint32_t(perf::GpuThreadWhere::kWaitRegMem)) {
+    summary += fmt::format(" | wait {} {:08X} ref {:08X} last value {:08X} info {:X}",
+                           (state.wait_reg_mem_flags.load() & 0x10) ? "memory" : "register",
+                           state.wait_reg_mem_address.load(), state.wait_reg_mem_ref.load(),
+                           state.wait_reg_mem_value.load(), state.wait_reg_mem_flags.load());
+  }
+  if (where == uint32_t(perf::GpuThreadWhere::kFenceWait) ||
+      where == uint32_t(perf::GpuThreadWhere::kQueueOpsWait)) {
+    summary += fmt::format(" | fence await {} completed before the wait {}",
+                           state.fence_await.load(), state.fence_completed.load());
+  }
+  REXLOG_INFO("gpu_state: {}", summary);
+  done(true, summary);
+}
+}  // namespace
+}  // namespace rex
+
+REXCVAR_DEFINE_COMMAND(gpu_state, rex::GpuStateCommand, "Debug",
+                       "Report what the GPU (command processor) thread is doing right now");
 REXCVAR_DEFINE_COMMAND(hitch_start, rex::HitchStartCommand, "Debug",
                        "Start recording frame times (stutter test); hitch_stop reports");
 REXCVAR_DEFINE_COMMAND(hitch_stop, rex::HitchStopCommand, "Debug",

@@ -202,6 +202,8 @@ const char* GetGpuPassName(GpuPass pass) {
       return "present_effects";
     case GpuPass::kPresenterUi:
       return "present_ui";
+    case GpuPass::kDrawFocus:
+      return "draws_focus";
     default:
       return "?";
   }
@@ -210,6 +212,41 @@ const char* GetGpuPassName(GpuPass pass) {
 GpuProfileStats& GetGpuProfileStats() {
   static GpuProfileStats stats;
   return stats;
+}
+
+GpuThreadState& GetGpuThreadState() {
+  static GpuThreadState state;
+  return state;
+}
+
+void SetGpuThreadWhere(GpuThreadWhere where) {
+  GpuThreadState& state = GetGpuThreadState();
+  if (state.where.exchange(uint32_t(where), std::memory_order_relaxed) != uint32_t(where)) {
+    state.where_since_ms.store(
+        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()),
+        std::memory_order_relaxed);
+  }
+}
+
+const char* GetGpuThreadWhereName(uint32_t where) {
+  switch (GpuThreadWhere(where)) {
+    case GpuThreadWhere::kStarting:
+      return "starting";
+    case GpuThreadWhere::kIdle:
+      return "idle (waiting for the game's commands)";
+    case GpuThreadWhere::kExecuting:
+      return "executing";
+    case GpuThreadWhere::kWaitRegMem:
+      return "WAIT_REG_MEM";
+    case GpuThreadWhere::kFenceWait:
+      return "waiting for a GPU submission";
+    case GpuThreadWhere::kQueueOpsWait:
+      return "waiting for GPU queue operations";
+    default:
+      return "?";
+  }
 }
 
 }  // namespace rex::perf

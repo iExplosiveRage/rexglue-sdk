@@ -216,6 +216,12 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      {
+        rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
+        thread_state.read_ptr.store(read_ptr_index_, std::memory_order_relaxed);
+        thread_state.write_ptr.store(write_ptr_index, std::memory_order_relaxed);
+        rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kIdle);
+      }
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -242,6 +248,13 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    {
+      rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
+      thread_state.read_ptr.store(read_ptr_index_, std::memory_order_relaxed);
+      thread_state.write_ptr.store(write_ptr_index, std::memory_order_relaxed);
+      thread_state.primary_buffers.fetch_add(1, std::memory_order_relaxed);
+      rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kExecuting);
+    }
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
@@ -1035,6 +1048,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      {
+        rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
+        thread_state.wait_reg_mem_address.store(poll_reg_addr, std::memory_order_relaxed);
+        thread_state.wait_reg_mem_ref.store(ref, std::memory_order_relaxed);
+        thread_state.wait_reg_mem_value.store(value, std::memory_order_relaxed);
+        thread_state.wait_reg_mem_flags.store(wait_info, std::memory_order_relaxed);
+        rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kWaitRegMem);
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1056,6 +1077,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kExecuting);
 
   return true;
 }

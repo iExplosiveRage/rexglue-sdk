@@ -103,6 +103,7 @@ enum class GpuPass : uint32_t {
   kSwap,           // gamma ramp / FXAA of the frontbuffer
   kPresenterGuest, // presenter: guest output effects (CAS, FSR, bilinear)
   kPresenterUi,    // presenter: overlays and UI
+  kDrawFocus,      // the game's draws with a pixel shader in gpu_profile_focus_ps
   kCount,
 };
 const char* GetGpuPassName(GpuPass pass);
@@ -138,6 +139,34 @@ struct GpuProfileStats {
   std::atomic<uint64_t> present_cpu_ns{0};
 };
 GpuProfileStats& GetGpuProfileStats();
+// What the command processor (GPU) thread is doing, for the gpu_state debug
+// command (finding where a stall is: waiting for the game, for the GPU, or
+// stuck in between). Written by the GPU thread, read by anyone.
+enum class GpuThreadWhere : uint32_t {
+  kStarting,
+  kIdle,          // waiting for the game to submit commands
+  kExecuting,     // executing commands
+  kWaitRegMem,    // PM4 WAIT_REG_MEM: waiting for a memory / register value
+  kFenceWait,     // waiting for a GPU submission to complete
+  kQueueOpsWait,  // waiting for out-of-submission queue operations
+  kCount,
+};
+struct GpuThreadState {
+  std::atomic<uint32_t> where{0};
+  std::atomic<uint64_t> where_since_ms{0};  // host uptime when `where` last changed
+  std::atomic<uint64_t> primary_buffers{0}; // ExecutePrimaryBuffer calls
+  std::atomic<uint32_t> read_ptr{0};
+  std::atomic<uint32_t> write_ptr{0};
+  std::atomic<uint32_t> wait_reg_mem_address{0};  // dword address (register or memory)
+  std::atomic<uint32_t> wait_reg_mem_ref{0};
+  std::atomic<uint32_t> wait_reg_mem_value{0};
+  std::atomic<uint32_t> wait_reg_mem_flags{0};
+  std::atomic<uint64_t> fence_await{0};
+  std::atomic<uint64_t> fence_completed{0};
+};
+GpuThreadState& GetGpuThreadState();
+void SetGpuThreadWhere(GpuThreadWhere where);
+const char* GetGpuThreadWhereName(uint32_t where);
 inline bool IsGpuProfiling() {
   return GetGpuProfileStats().enabled.load(std::memory_order_relaxed);
 }
