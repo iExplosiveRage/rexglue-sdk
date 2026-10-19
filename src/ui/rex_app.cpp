@@ -66,6 +66,16 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+// Run on the dedicated GPU of laptops with NVIDIA Optimus / AMD switchable
+// graphics. The drivers only read these from the executable - the copies in
+// the GPU plugin DLL (graphics_system.cpp) are not seen, so without these the
+// game ran on the integrated GPU unless set in the driver's control panel.
+// https://developer.download.nvidia.com/devzone/devcenter/gamegraphics/files/OptimusRenderingPolicies.pdf
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 #endif
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",

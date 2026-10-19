@@ -250,10 +250,55 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
+  // List the adapters in the log (which GPU a laptop used is the first
+  // question in performance reports).
+  {
+    IDXGIAdapter1* listed_adapter = nullptr;
+    for (uint32_t i = 0; dxgi_factory->EnumAdapters1(i, &listed_adapter) == S_OK; ++i) {
+      DXGI_ADAPTER_DESC1 listed_desc;
+      if (SUCCEEDED(listed_adapter->GetDesc1(&listed_desc))) {
+        char listed_name[256] = {};
+        WideCharToMultiByte(CP_UTF8, 0, listed_desc.Description, -1, listed_name,
+                            int(sizeof(listed_name) - 1), nullptr, nullptr);
+        REXGPU_INFO("DXGI adapter {}: {} (vendor 0x{:04X}, device 0x{:04X}, {} MB video memory{})",
+                    i, listed_name, listed_desc.VendorId, listed_desc.DeviceId,
+                    listed_desc.DedicatedVideoMemory >> 20,
+                    (listed_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? ", software" : "");
+      }
+      listed_adapter->Release();
+      listed_adapter = nullptr;
+    }
+  }
+
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  // Any physical adapter: the high-performance one, so on a laptop with
+  // integrated and dedicated graphics (NVIDIA Optimus, AMD switchable
+  // graphics) the game runs on the dedicated GPU - DXGI lists the integrated
+  // one first there, as it drives the screen. The Windows graphics settings of
+  // the app still override this.
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    IDXGIFactory6* dxgi_factory_6 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory_6)))) {
+      for (uint32_t i = 0;
+           dxgi_factory_6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                      IID_PPV_ARGS(&adapter)) == S_OK;
+           ++i) {
+        DXGI_ADAPTER_DESC1 adapter_desc;
+        if (SUCCEEDED(adapter->GetDesc1(&adapter_desc)) &&
+            !(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          break;
+        }
+        adapter->Release();
+        adapter = nullptr;
+      }
+      dxgi_factory_6->Release();
+    }
+  }
+  while (!adapter && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
