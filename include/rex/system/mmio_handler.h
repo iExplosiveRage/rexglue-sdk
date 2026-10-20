@@ -47,6 +47,10 @@ class MMIOHandler {
   typedef bool (*AccessViolationCallback)(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
+  // Whether the host page holding host_address is write-watched (kept
+  // read-only by the memory system for invalidation callbacks). Called with
+  // global_critical_region locked.
+  typedef bool (*WriteWatchQuery)(void* context, void* host_address);
 
   // access_violation_callback is called with global_critical_region locked once
   // on the thread, so if multiple threads trigger an access violation in the
@@ -62,6 +66,13 @@ class MMIOHandler {
   bool RegisterRange(uint32_t virtual_address, uint32_t mask, uint32_t size, void* context,
                      MMIOReadCallback read_callback, MMIOWriteCallback write_callback);
   MMIORange* LookupRange(uint32_t virtual_address);
+
+  // Optional: lets a write fault on a watched page skip the host protection
+  // query (VirtualQuery) that otherwise runs under the global lock.
+  void SetWriteWatchQuery(WriteWatchQuery query, void* context) {
+    write_watch_query_ = query;
+    write_watch_query_context_ = context;
+  }
 
   bool CheckLoad(uint32_t virtual_address, uint32_t* out_value);
   bool CheckStore(uint32_t virtual_address, uint32_t value);
@@ -86,6 +97,9 @@ class MMIOHandler {
 
   AccessViolationCallback access_violation_callback_;
   void* access_violation_callback_context_;
+
+  WriteWatchQuery write_watch_query_ = nullptr;
+  void* write_watch_query_context_ = nullptr;
 
   static MMIOHandler* global_handler_;
 

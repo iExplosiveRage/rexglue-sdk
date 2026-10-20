@@ -232,6 +232,7 @@ bool Memory::Initialize() {
     assert_always();
     return false;
   }
+  mmio_handler_->SetWriteWatchQuery(WriteWatchQueryThunk, this);
   REXSYS_DEBUG("Installed MMIO handler for physical address translation");
 
   // ?
@@ -651,6 +652,20 @@ bool Memory::AccessViolationCallbackThunk(
     void* host_address, bool is_write) {
   return reinterpret_cast<memory::Memory*>(context)->AccessViolationCallback(
       std::move(global_lock_locked_once), host_address, is_write);
+}
+
+bool Memory::WriteWatchQueryThunk(void* context, void* host_address) {
+  auto* self = reinterpret_cast<memory::Memory*>(context);
+  if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(self->virtual_membase_) ||
+      reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(self->physical_membase_)) {
+    return false;
+  }
+  const uint32_t virtual_address = self->HostToGuestVirtual(host_address);
+  const BaseHeap* heap = self->LookupHeap(virtual_address);
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    return false;
+  }
+  return static_cast<const PhysicalHeap*>(heap)->IsAddressWriteWatched(virtual_address);
 }
 
 bool Memory::TriggerPhysicalMemoryCallbacks(
@@ -2357,6 +2372,15 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
   }
   return (system_page_flags_[host_page_number >> 6].notify_on_invalidation &
           (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+bool PhysicalHeap::IsAddressWriteWatched(uint32_t virtual_address) const {
+  if (virtual_address < heap_base_ || virtual_address - heap_base_ >= heap_size_) {
+    return false;
+  }
+  // Same host page numbering as TriggerCallbacks / EnableAccessCallbacks.
+  return IsHostPageWriteWatched((virtual_address - heap_base_ + host_address_offset()) /
+                                system_page_size_);
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {

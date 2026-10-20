@@ -14,6 +14,7 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -22,6 +23,11 @@
 #include <rex/types.h>
 
 using namespace rex::arch;
+
+REXCVAR_DEFINE_BOOL(mmio_fast_watch_check, true, "Memory",
+                    "A write fault on a write-watched page skips the host protection query "
+                    "(VirtualQuery) under the global lock")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::runtime {
 
@@ -406,13 +412,22 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
-    memory::PageAccess cur_access;
-    size_t page_length = memory::page_size();
-    memory::QueryProtect(fault_host_address, page_length, cur_access);
-    if (cur_access != memory::PageAccess::kNoAccess &&
-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
-      // Another thread has cleared this watch. Abort.
-      return true;
+    // A write to a page the memory system still watches: the page is still
+    // read-only (the watch and the protection change together under this
+    // lock), so the watch is not cleared and the callback runs. That skips
+    // VirtualQuery, which is slow on the large guest mapping and held the lock
+    // that the GPU thread needs (native renderer profile, round 2).
+    const bool watched = is_write && write_watch_query_ && REXCVAR_GET(mmio_fast_watch_check) &&
+                         write_watch_query_(write_watch_query_context_, fault_host_address);
+    if (!watched) {
+      memory::PageAccess cur_access;
+      size_t page_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, page_length, cur_access);
+      if (cur_access != memory::PageAccess::kNoAccess &&
+          (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+        // Another thread has cleared this watch. Abort.
+        return true;
+      }
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.

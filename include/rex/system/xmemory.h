@@ -322,6 +322,10 @@ class PhysicalHeap : public BaseHeap {
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
+  // Whether the host page holding this guest address is write-watched. The
+  // caller holds the global critical region.
+  bool IsAddressWriteWatched(uint32_t virtual_address) const;
+
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
 
@@ -571,6 +575,7 @@ class Memory {
   static bool AccessViolationCallbackThunk(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
+  static bool WriteWatchQueryThunk(void* context, void* host_address);
 
   std::filesystem::path file_name_;
   uint32_t system_page_size_ = 0;
