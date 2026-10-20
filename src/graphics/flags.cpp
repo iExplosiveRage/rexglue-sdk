@@ -18,14 +18,18 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(gpu_native_renderer, false, "GPU",
                     "Native renderer (experimental): the game's own threads run its GPU commands "
-                    "at the D3D call that wrote them, with host render targets that need no "
-                    "EDRAM copies between them, instead of an emulated command processor "
-                    "thread. Needs a title with native renderer hooks. Applies at the next "
-                    "start. Off = the emulated path.")
+                    "at the D3D call that wrote them, with host render targets, instead of an "
+                    "emulated command processor thread. Needs a title with native renderer "
+                    "hooks. Applies at the next start. Off = the emulated path.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(gpu_native_edram_transfers, false, "GPU/Debug",
-                    "With gpu_native_renderer: still copy between render targets sharing EDRAM "
-                    "ranges like the emulated path (A/B debugging, live)");
+// On by default: Burst Limit's depth of field in fights reads a render target
+// through another one at the same EDRAM range, so skipping the copies (false)
+// smears the picture with depth_of_field on. Off is kept for A/B and perf
+// experiments (0.03-0.15 ms per frame).
+REXCVAR_DEFINE_BOOL(gpu_native_edram_transfers, true, "GPU/Debug",
+                    "With gpu_native_renderer: copy between render targets sharing EDRAM ranges "
+                    "like the emulated path (false skips them: faster, but wrong for effects "
+                    "that read one render target through another; live)");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");
