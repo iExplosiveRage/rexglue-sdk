@@ -52,7 +52,7 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
 
-REXCVAR_DEFINE_BOOL(gpu_native_aot_shaders, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_native_aot_shaders, true, "GPU",
                     "With gpu_native_renderer: draw with the shaders translated ahead of time by "
                     "XenosRecomp (shader_pack folder next to the executable) where both stages are "
                     "in the pack; the runtime DXBC translation is used for the rest (live)")
