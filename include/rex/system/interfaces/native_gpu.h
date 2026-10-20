@@ -121,6 +121,14 @@ class INativeGpu {
   // The guest thread that runs Swap: XE_SWAP (and the present) runs there.
   virtual void SetSwapOwnerThread(uint32_t guest_thread_id) = 0;
 
+  // An XE_SWAP that a scope left for the ring has not run yet (it waits behind
+  // the null flip's vblank wait). Rendering after it must wait for it to keep
+  // the emulated (ring) order of frames and presents.
+  virtual bool SwapPending() = 0;
+  // Gives up on the queued swaps (a bounded wait timed out): no swap counts as
+  // pending until the next one is queued.
+  virtual void ForgetQueuedSwaps() = 0;
+
   virtual void GetStats(NativeGpuStats* out, bool reset) = 0;
 };
 

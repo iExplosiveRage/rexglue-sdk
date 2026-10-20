@@ -141,6 +141,8 @@ class CommandProcessor : public system::INativeGpu {
   void WaitForRingProgress(uint32_t timeout_us) override;
   void SetSwapOwnerThread(uint32_t guest_thread_id) override;
   bool VblankSinceLastDrain() override;
+  bool SwapPending() override;
+  void ForgetQueuedSwaps() override;
   void GetStats(system::NativeGpuStats* out, bool reset) override;
   // Something a stopped drain may be waiting for happened (a vblank).
   void SignalNativeRingProgress();
@@ -333,6 +335,9 @@ class CommandProcessor : public system::INativeGpu {
   std::condition_variable native_progress_cv_;
   std::atomic<uint64_t> native_progress_generation_{0};
   std::atomic<uint64_t> native_vblanks_{0};
+  // XE_SWAPs scopes left for the ring / XE_SWAPs the drains ran (SwapPending).
+  std::atomic<uint64_t> native_swaps_queued_{0};
+  std::atomic<uint64_t> native_swaps_done_{0};
   std::mutex native_stats_mutex_;
   system::NativeGpuStats native_stats_;
 

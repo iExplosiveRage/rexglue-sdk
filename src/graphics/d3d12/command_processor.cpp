@@ -65,6 +65,42 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Native renderer only (the emulated path always queues up to kQueueFrames).
+// Round 3 measured (4K, unlocked, GPU-bound, with native_swap_order): 2 frames
+// is no steadier than 3 and ~3% slower, 1 frame costs ~30% - so the default
+// stays the emulated queue; lower values trade FPS for input latency.
+REXCVAR_DEFINE_INT32(gpu_native_frames_in_flight, 0, "GPU",
+                     "Native renderer: how many frames the CPU may queue ahead of the GPU "
+                     "(1-3; 0 = automatic = 3, like the emulated path). Lower = less input "
+                     "latency when the GPU is the limit, at some FPS (live)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_frame_trace, 0, "GPU/Debug",
+                     "Log a per-frame timeline (swap time, fence wait, draws, DLSS scenes) "
+                     "for the next N frames, then stop (live)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// gpu_frame_trace probe (one command processor per process).
+struct FrameTraceEntry {
+  int64_t swap_ns;
+  int64_t fence_wait_ns;
+  uint32_t draws;
+  uint32_t scenes;
+  uint32_t fence_waits;
+};
+std::vector<FrameTraceEntry> g_frame_trace;
+int64_t g_frame_trace_fence_wait_ns = 0;
+uint32_t g_frame_trace_fence_waits = 0;
+uint32_t g_frame_trace_draws = 0;
+uint32_t g_frame_trace_scenes = 0;
+int64_t FrameTraceNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
 REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
                      "Log the state of every draw for this many frames (counts down)");
 
@@ -2361,6 +2397,32 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  if (const int32_t trace_frames = REXCVAR_GET(gpu_frame_trace); trace_frames > 0) {
+    g_frame_trace.push_back({FrameTraceNowNs(), g_frame_trace_fence_wait_ns, g_frame_trace_draws,
+                             g_frame_trace_scenes, g_frame_trace_fence_waits});
+    if (g_frame_trace.size() >= size_t(trace_frames)) {
+      std::string line;
+      for (size_t i = 1; i < g_frame_trace.size(); ++i) {
+        const FrameTraceEntry& e = g_frame_trace[i];
+        line += fmt::format(" {:.2f}/{:.2f}/{}/{}/{}",
+                            double(e.swap_ns - g_frame_trace[i - 1].swap_ns) * 1.0e-6,
+                            double(e.fence_wait_ns) * 1.0e-6, e.fence_waits, e.draws, e.scenes);
+        if (i % 50 == 0 || i + 1 == g_frame_trace.size()) {
+          REXGPU_INFO("Frame trace (interval ms/fence wait ms/waits/draws/scenes):{}", line);
+          line.clear();
+        }
+      }
+      g_frame_trace.clear();
+      REXCVAR_SET(gpu_frame_trace, 0);
+    }
+  } else if (!g_frame_trace.empty()) {
+    g_frame_trace.clear();
+  }
+  g_frame_trace_fence_wait_ns = 0;
+  g_frame_trace_fence_waits = 0;
+  g_frame_trace_draws = 0;
+  g_frame_trace_scenes = 0;
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
@@ -2864,6 +2926,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Special copy handling.
     return IssueCopy();
   }
+  ++g_frame_trace_draws;
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -3021,6 +3084,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     render_target_cache_->RequestSceneCallback(
         [this, scene_width, scene_height, output_width, output_height](
             ID3D12Resource* color, ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
+          ++g_frame_trace_scenes;
           D3D12_RESOURCE_STATES color_state = dlss_->ProcessScene(
               color, depth, depth_srv, scene_width, scene_height, output_width, output_height);
           SetGpuProfilePass(rex::perf::GpuPass::kRenderTargets);
@@ -4212,7 +4276,12 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       thread_state.fence_await.store(await_submission, std::memory_order_relaxed);
       thread_state.fence_completed.store(submission_completed_, std::memory_order_relaxed);
       rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kFenceWait);
+      const int64_t trace_wait_start = REXCVAR_GET(gpu_frame_trace) > 0 ? FrameTraceNowNs() : 0;
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      if (trace_wait_start) {
+        g_frame_trace_fence_wait_ns += FrameTraceNowNs() - trace_wait_start;
+        ++g_frame_trace_fence_waits;
+      }
       rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere(where_before));
       if (profiling) {
         rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
@@ -4364,8 +4433,21 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
+  uint64_t await_frame_submission = 0;
+  if (is_opening_frame) {
+    await_frame_submission = closed_frame_submissions_[frame_current_ % kQueueFrames];
+    if (IsNativeRendererActive()) {
+      int32_t in_flight = REXCVAR_GET(gpu_native_frames_in_flight);
+      if (in_flight <= 0) {
+        in_flight = int32_t(kQueueFrames);
+      }
+      if (uint64_t(in_flight) < kQueueFrames && frame_current_ >= uint64_t(in_flight)) {
+        await_frame_submission =
+            closed_frame_submissions_[(frame_current_ - uint64_t(in_flight)) % kQueueFrames];
+      }
+    }
+  }
+  CheckSubmissionFence(await_frame_submission);
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.

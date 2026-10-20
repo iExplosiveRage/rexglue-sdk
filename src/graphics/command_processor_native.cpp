@@ -245,6 +245,16 @@ bool CommandProcessor::VblankSinceLastDrain() {
   return native_vblanks_.load(std::memory_order_relaxed) != t_native_seen_vblanks;
 }
 
+bool CommandProcessor::SwapPending() {
+  return native_swaps_queued_.load(std::memory_order_acquire) >
+         native_swaps_done_.load(std::memory_order_acquire);
+}
+
+void CommandProcessor::ForgetQueuedSwaps() {
+  native_swaps_queued_.store(native_swaps_done_.load(std::memory_order_acquire),
+                             std::memory_order_release);
+}
+
 void CommandProcessor::WaitForRingProgress(uint32_t timeout_us) {
   if (!native_mode_) {
     return;
@@ -356,6 +366,9 @@ bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
     switch (packet_class) {
       case NativePacketClass::kRing:
         flush_run(pos);
+        if ((header >> 30) == 3 && ((header >> 8) & 0x7F) == PM4_XE_SWAP) {
+          native_swaps_queued_.fetch_add(1, std::memory_order_release);
+        }
         if (r.left_packets < 4) {
           r.left_headers[r.left_packets * 2] = header;
           r.left_headers[r.left_packets * 2 + 1] = size > 1 ? load(pos + 1) : 0;
@@ -677,6 +690,12 @@ system::NativeDrainState CommandProcessor::NativeDrain(bool on_worker, bool* adv
     }
     if (is_swap) {
       *excluded_ns += NativeNowNs() - t0;
+      // Done (or dropped): never more done than queued.
+      uint64_t done = native_swaps_done_.load(std::memory_order_relaxed);
+      if (done < native_swaps_queued_.load(std::memory_order_acquire)) {
+        native_swaps_done_.store(done + 1, std::memory_order_release);
+      }
+      BumpNativeRingProgress();
     }
     if (packet_class == NativePacketClass::kRendering) {
       // Something rendering waited in the ring (expected only before the
