@@ -49,6 +49,7 @@ namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
+  bool GpuBehindLastFrame() override;
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                  system::KernelState* kernel_state);
   ~D3D12CommandProcessor();
@@ -523,6 +524,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kQueueFrames] = {};
+  // The last closed frame's submission, for GpuBehindLastFrame (other threads).
+  std::atomic<uint64_t> last_closed_frame_submission_{0};
 
   struct CommandAllocator {
     ID3D12CommandAllocator* command_allocator;

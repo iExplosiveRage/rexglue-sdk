@@ -143,6 +143,7 @@ class CommandProcessor : public system::INativeGpu {
   bool VblankSinceLastDrain() override;
   bool SwapPending() override;
   void ForgetQueuedSwaps() override;
+  bool GpuBehindLastFrame() override { return false; }
   void GetStats(system::NativeGpuStats* out, bool reset) override;
   // Something a stopped drain may be waiting for happened (a vblank).
   void SignalNativeRingProgress();

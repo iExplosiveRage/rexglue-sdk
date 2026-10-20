@@ -4228,6 +4228,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   return true;
 }
 
+bool D3D12CommandProcessor::GpuBehindLastFrame() {
+  const uint64_t last = last_closed_frame_submission_.load(std::memory_order_acquire);
+  ID3D12Fence* fence = submission_fence_;
+  return last && fence && fence->GetCompletedValue() < last;
+}
+
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (await_submission >= submission_current_) {
     if (submission_open_) {
@@ -4633,6 +4639,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+    last_closed_frame_submission_.store(submission_current_ - 1, std::memory_order_release);
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

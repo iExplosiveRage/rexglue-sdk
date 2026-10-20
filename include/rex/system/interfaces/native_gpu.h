@@ -128,6 +128,9 @@ class INativeGpu {
   // Gives up on the queued swaps (a bounded wait timed out): no swap counts as
   // pending until the next one is queued.
   virtual void ForgetQueuedSwaps() = 0;
+  // The host GPU has not finished the last frame the CPU closed (the GPU is
+  // the limit right now).
+  virtual bool GpuBehindLastFrame() = 0;
 
   virtual void GetStats(NativeGpuStats* out, bool reset) = 0;
 };
