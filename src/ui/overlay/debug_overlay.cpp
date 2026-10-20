@@ -40,6 +40,15 @@ namespace {
 
 std::string PresentUpscalerText();
 
+// The scene renders below the output (an upscaling mode).
+bool RenderLowered(const rex::perf::RenderInfo& info) {
+  if (info.output_e100_x && info.output_e100_y) {
+    return info.output_e100_x > info.scale_x * info.percent ||
+           info.output_e100_y > info.scale_y * info.percent;
+  }
+  return info.scale_x < info.requested_scale_x || info.scale_y < info.requested_scale_y;
+}
+
 // The upscaler shown in the overlay: NVIDIA DLSS where it works - upscaling
 // if it lowered the render resolution, DLAA otherwise (with the presenter's
 // upscaler if there's one) - then AMD FSR the same way, or the presenter's.
@@ -56,8 +65,7 @@ std::string UpscalerText() {
           {"ultra_performance", "Ultra Perf."},
       };
       const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
-      const bool lowered =
-          info.scale_x < info.requested_scale_x || info.scale_y < info.requested_scale_y;
+      const bool lowered = RenderLowered(info);
       if (dlss_availability == rex::graphics::DlssAvailability::kAvailable && lowered) {
         for (const auto& [value, name] : kDlssModes) {
           if (dlss == value) {
@@ -85,8 +93,7 @@ std::string UpscalerText() {
       const std::string provider = rex::graphics::GetFsrProviderName();
       const std::string name = provider.empty() ? std::string("AMD FSR") : "AMD FSR " + provider;
       const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
-      const bool lowered =
-          info.scale_x < info.requested_scale_x || info.scale_y < info.requested_scale_y;
+      const bool lowered = RenderLowered(info);
       if (fsr_availability == rex::graphics::FsrAvailability::kAvailable && lowered) {
         for (const auto& [value, mode_name] : kFsrModes) {
           if (fsr == value) {
@@ -195,19 +202,26 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   if (render.scale_x && render.frontbuffer_width) {
     // (Below 1x: the part of the 1x frame the game is drawn in.)
     const uint32_t render_width =
-        (render.frontbuffer_width * render.scale_x * render.percent + 99) / 100;
+        (render.frontbuffer_width * render.scale_x * render.percent) / 100;
     const uint32_t render_height =
-        (render.frontbuffer_height * render.scale_y * render.percent + 99) / 100;
+        (render.frontbuffer_height * render.scale_y * render.percent) / 100;
+    // The output the backend presents (any resolution: not a whole scale).
     const uint32_t output_width =
-        render.frontbuffer_width * std::max(render.requested_scale_x, render.scale_x);
+        render.output_e100_x
+            ? uint32_t((uint64_t(render.frontbuffer_width) * render.output_e100_x + 50) / 100)
+            : render.frontbuffer_width * std::max(render.requested_scale_x, render.scale_x);
     const uint32_t output_height =
-        render.frontbuffer_height * std::max(render.requested_scale_y, render.scale_y);
-    std::snprintf(text, sizeof(text), "%ux%u", render_width, render_height);
-    rows.emplace_back("Render", text);
-    if (output_width != render_width || output_height != render_height) {
-      std::snprintf(text, sizeof(text), "%ux%u", output_width, output_height);
-      rows.emplace_back("Output", text);
+        render.output_e100_y
+            ? uint32_t((uint64_t(render.frontbuffer_height) * render.output_e100_y + 50) / 100)
+            : render.frontbuffer_height * std::max(render.requested_scale_y, render.scale_y);
+    // "render -> output" when the scene is upscaled to a larger picture.
+    if (output_width > render_width + 1 || output_height > render_height + 1) {
+      std::snprintf(text, sizeof(text), "%ux%u -> %ux%u", render_width, render_height,
+                    output_width, output_height);
+    } else {
+      std::snprintf(text, sizeof(text), "%ux%u", render_width, render_height);
     }
+    rows.emplace_back("Render", text);
   }
   if (std::string upscaler = UpscalerText(); !upscaler.empty()) {
     rows.emplace_back("Upscaler", std::move(upscaler));

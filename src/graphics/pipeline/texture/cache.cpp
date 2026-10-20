@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/wide_aspect.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -108,6 +110,16 @@ REXCVAR_DEFINE_INT32(draw_resolution_percent, 100, "GPU",
                      "50 = 640x360) and the picture is stretched to the window. Off while NVIDIA "
                      "DLSS or AMD FSR (dlss_mode / fsr_mode) is on")
     .range(25, 100);
+
+// Applies live on D3D12 like the scale.
+REXCVAR_DEFINE_INT32(draw_resolution_height, 0, "GPU",
+                     "Native renderer: the output resolution by its height, any size - 1080 "
+                     "(1.5x of 720p), 1440, 2160 (4K), 2880, 3240 (6K), 4320 (8K) - instead of the "
+                     "whole draw_resolution_scale steps, and NVIDIA DLSS / AMD FSR modes render at "
+                     "their exact ratio of it (DLSS Quality 66.7%, Balanced 58%, Performance 50%, "
+                     "Ultra Performance 33.3%). 0 = the whole draw_resolution_scale. The emulated "
+                     "renderer uses the next whole scale")
+    .range(0, 5040);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
@@ -474,10 +486,195 @@ uint64_t ReplacementLayoutSignature(const texture_util::TextureGuestLayout& layo
                                            sizeof(values));
 }
 
+// NVIDIA's render size ratios of DLSS Quality, Balanced, Performance and Ultra
+// Performance in 1/10000 of the output - the standard ones until NGX gives
+// its optimal sizes (SetDlssOptimalRatios).
+std::atomic<uint32_t> g_dlss_ratios_e4[4] = {6667, 5800, 5000, 3333};
+
+int UpscalerModeIndex(const std::string& mode) {
+  if (mode == "quality") {
+    return 0;
+  }
+  if (mode == "balanced") {
+    return 1;
+  }
+  if (mode == "performance") {
+    return 2;
+  }
+  if (mode == "ultra_performance") {
+    return 3;
+  }
+  return -1;
+}
+
+// Any resolution (draw_resolution_height, native renderer only): the output
+// at hundredths of 1x, the render resolution at the upscaler's exact ratio of
+// it, made of a whole scale (the render targets, the EDRAM layout and the
+// scaled resolve memory stay whole multiples of the guest's) and one percent
+// of it for both axes (draw_resolution_percent's top-left part). False if not
+// used.
+bool ComputeFractionalDrawResolution(TextureCache::FractionalDrawResolution& plan,
+                                     bool& upscaling_out) {
+  upscaling_out = false;
+  const int32_t height = REXCVAR_GET(draw_resolution_height);
+  if (height <= 0 || !IsNativeRendererActive()) {
+    return false;
+  }
+  constexpr uint32_t kMaxE100 = TextureCache::kMaxDrawResolutionScaleAlongAxis * 100;
+  uint32_t target_y = std::clamp(uint32_t((uint64_t(height) * 100 + 360) / 720), UINT32_C(25),
+                                 kMaxE100);
+  uint32_t target_x = target_y;
+  const float aspect = rex::graphics::GetGuestDisplayAspect();
+  constexpr float kGuestAspect = 16.0f / 9.0f;
+  if (aspect > kGuestAspect * 1.001f) {
+    target_x = std::clamp(uint32_t(std::lround(float(target_y) * aspect / kGuestAspect)),
+                          target_y, kMaxE100);
+  }
+
+  const std::string dlss = LowercaseFlag("dlss_mode");
+  const bool dlss_active =
+      !dlss.empty() && dlss != "off" &&
+      rex::graphics::GetDlssAvailability() != rex::graphics::DlssAvailability::kUnavailable;
+  const std::string fsr = LowercaseFlag("fsr_mode");
+  const bool fsr_active =
+      !dlss_active && !fsr.empty() && fsr != "off" &&
+      rex::graphics::GetFsrAvailability() != rex::graphics::FsrAvailability::kUnavailable;
+  uint32_t ratio_e4 = 10000;
+  if (dlss_active &&
+      rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kAvailable) {
+    const int index = UpscalerModeIndex(dlss);
+    if (index >= 0) {
+      ratio_e4 = g_dlss_ratios_e4[index].load(std::memory_order_relaxed);
+    }
+  } else if (fsr_active &&
+             rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable) {
+    // AMD's own ratios: 1.5x, 1.7x, 2x, 3x.
+    static const uint32_t kFsrRatiosE4[4] = {6667, 5882, 5000, 3333};
+    const int index = UpscalerModeIndex(fsr);
+    if (index >= 0) {
+      ratio_e4 = kFsrRatiosE4[index];
+    }
+  }
+  upscaling_out = ratio_e4 < 10000;
+  uint32_t render_y = std::max(UINT32_C(25), (target_y * ratio_e4 + 5000) / 10000);
+  uint32_t render_x = std::max(UINT32_C(25), (target_x * ratio_e4 + 5000) / 10000);
+  // Lower resolution (draw_resolution_percent) at 720p without an upscaler,
+  // like with the whole scales.
+  if (!upscaling_out && !dlss_active && !fsr_active && target_y <= 100) {
+    const uint32_t config_percent =
+        uint32_t(std::clamp(REXCVAR_GET(draw_resolution_percent), INT32_C(25), INT32_C(100)));
+    render_y = std::max(UINT32_C(25), render_y * config_percent / 100);
+    render_x = std::max(UINT32_C(25), render_x * config_percent / 100);
+  }
+  const uint32_t scale_y = std::min((render_y + 99) / 100,
+                                    TextureCache::kMaxDrawResolutionScaleAlongAxis);
+  // A multiple of 5: the game's render targets and their copies (1280x720,
+  // 640x360, 320x180...) are then whole pixels at the lower size - with
+  // partly covered last columns and rows its glow and blur passes come out
+  // visibly weaker (measured: 87% vs 85 / 90 / 75%).
+  const uint32_t percent =
+      std::clamp((render_y * 2 + scale_y * 5) / (scale_y * 10) * 5, UINT32_C(25), UINT32_C(100));
+  // X with the same percent: the nearest whole scale while upscaling (not above
+  // the output), else at least as many pixels as the output shows.
+  uint32_t scale_x = upscaling_out ? (render_x + percent / 2) / percent
+                                   : (render_x + percent - 1) / percent;
+  if (upscaling_out) {
+    while (scale_x > 1 && scale_x * percent > target_x) {
+      --scale_x;
+    }
+  }
+  scale_x = std::clamp(scale_x, UINT32_C(1), TextureCache::kMaxDrawResolutionScaleAlongAxis);
+  plan.scale_x = scale_x;
+  plan.scale_y = scale_y;
+  plan.percent = percent;
+  plan.render_e100_x = scale_x * percent;
+  plan.render_e100_y = scale_y * percent;
+  if (upscaling_out) {
+    plan.target_e100_x = std::max(target_x, plan.render_e100_x);
+    plan.target_e100_y = std::max(target_y, plan.render_e100_y);
+  } else {
+    plan.target_e100_x = plan.render_e100_x;
+    plan.target_e100_y = plan.render_e100_y;
+  }
+  return true;
+}
+
 }  // namespace
+
+TextureCache::FractionalDrawResolution TextureCache::GetConfigFractionalDrawResolution() {
+  FractionalDrawResolution plan;
+  bool upscaling;
+  if (!ComputeFractionalDrawResolution(plan, upscaling)) {
+    plan.target_e100_x = 0;
+    plan.target_e100_y = 0;
+  }
+  return plan;
+}
+
+void TextureCache::SetDlssOptimalRatios(const uint32_t ratios_e4[4]) {
+  bool changed = false;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (ratios_e4[i] >= 2500 && ratios_e4[i] <= 10000 &&
+        g_dlss_ratios_e4[i].exchange(ratios_e4[i], std::memory_order_relaxed) != ratios_e4[i]) {
+      changed = true;
+    }
+  }
+  if (changed) {
+    REXLOG_INFO("NVIDIA DLSS optimal render sizes: Quality {:.2f}%, Balanced {:.2f}%, "
+                "Performance {:.2f}%, Ultra Performance {:.2f}%",
+                g_dlss_ratios_e4[0].load() * 0.01, g_dlss_ratios_e4[1].load() * 0.01,
+                g_dlss_ratios_e4[2].load() * 0.01, g_dlss_ratios_e4[3].load() * 0.01);
+  }
+}
+
+bool TextureCache::IsScaledResolveKeyDownscaled(TextureKey key) const {
+  if (!key.scaled_resolve || !IsDrawResolutionDownscaled()) {
+    return false;
+  }
+  if (!IsDrawResolutionScaled()) {
+    return true;
+  }
+  return key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
+         key.depth_or_array_size_minus_1 == 0 && key.mip_max_level == 0 &&
+         key.GetGuestLayout().packed_level != 0;
+}
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out,
                                                 uint32_t* target_x_out, uint32_t* target_y_out) {
+  {
+    FractionalDrawResolution plan;
+    bool upscaling;
+    if (ComputeFractionalDrawResolution(plan, upscaling)) {
+      x_out = plan.scale_x;
+      y_out = plan.scale_y;
+      const uint32_t target_x = std::max(x_out, (plan.target_e100_x + 99) / 100);
+      const uint32_t target_y = std::max(y_out, (plan.target_e100_y + 99) / 100);
+      if (target_x_out) {
+        *target_x_out = std::min(target_x, kMaxDrawResolutionScaleAlongAxis);
+      }
+      if (target_y_out) {
+        *target_y_out = std::min(target_y, kMaxDrawResolutionScaleAlongAxis);
+      }
+      static uint64_t logged = 0;
+      const uint64_t key = uint64_t(plan.render_e100_x) | (uint64_t(plan.render_e100_y) << 16) |
+                           (uint64_t(plan.target_e100_x) << 32) |
+                           (uint64_t(plan.target_e100_y) << 48);
+      if (logged != key) {
+        logged = key;
+        REXLOG_INFO(
+            "Draw resolution (draw_resolution_height {}): rendering at {}.{:02}x{}.{:02} of 720p "
+            "(scale {}x{} at {}%), output {}.{:02}x{}.{:02}{}",
+            REXCVAR_GET(draw_resolution_height), plan.render_e100_x / 100,
+            plan.render_e100_x % 100, plan.render_e100_y / 100, plan.render_e100_y % 100,
+            plan.scale_x, plan.scale_y, plan.percent, plan.target_e100_x / 100,
+            plan.target_e100_x % 100, plan.target_e100_y / 100, plan.target_e100_y % 100,
+            upscaling ? " (scene upscaled)" : "");
+      }
+      rex::perf::SetDrawResolutionScale(x_out, y_out, std::min(target_x, kMaxDrawResolutionScaleAlongAxis),
+                                        std::min(target_y, kMaxDrawResolutionScaleAlongAxis));
+      return true;
+    }
+  }
   uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
   bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
   uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
@@ -551,6 +748,13 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
 
 uint32_t TextureCache::GetConfigDrawResolutionPercent(uint32_t render_scale_x,
                                                       uint32_t render_scale_y) {
+  {
+    FractionalDrawResolution plan;
+    bool upscaling;
+    if (ComputeFractionalDrawResolution(plan, upscaling)) {
+      return plan.percent;
+    }
+  }
   const int32_t config = REXCVAR_GET(draw_resolution_percent);
   if (config >= 100 || render_scale_x != 1 || render_scale_y != 1) {
     return 100;
@@ -821,7 +1025,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
   // (Below 1x, resolved data is in the shared memory like any other.)
-  if (texture_key.scaled_resolve && !IsDrawResolutionDownscaled()) {
+  if (texture_key.scaled_resolve && IsDrawResolutionScaled()) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
     // by an actual resolve, but is still included in the texture size, so the
@@ -1279,8 +1483,9 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   // Below 1x: render-to-texture data is in the top-left part of the guest data
   // (single-level 2D textures not in a packed mip tail - anything else is made
-  // from all of its guest data).
-  if (IsDrawResolutionDownscaled()) {
+  // from all of its guest data). Above 1x (any resolution) the scaled resolve
+  // memory has it in the top-left part the same way.
+  if (IsDrawResolutionDownscaled() && !IsDrawResolutionScaled()) {
     texture_util::TextureGuestLayout downscaled_guest_layout = key.GetGuestLayout();
     if (downscaled_guest_layout.base.level_data_extent_bytes &&
         IsRangeResolved(key.base_page << 12, downscaled_guest_layout.base.level_data_extent_bytes)) {
@@ -1309,13 +1514,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     host_width_out = key.GetWidth();
     host_height_out = key.GetHeight();
     if (key.scaled_resolve) {
-      if (IsDrawResolutionDownscaled()) {
-        host_width_out = DownscaleCeil(host_width_out, draw_resolution_percent());
-        host_height_out = DownscaleCeil(host_height_out, draw_resolution_percent());
-      } else {
-        host_width_out *= draw_resolution_scale_x();
-        host_height_out *= draw_resolution_scale_y();
+      if (IsScaledResolveKeyDownscaled(key)) {
+        host_width_out = DownscaleTextureSize(host_width_out, draw_resolution_percent());
+        host_height_out = DownscaleTextureSize(host_height_out, draw_resolution_percent());
       }
+      host_width_out *= draw_resolution_scale_x();
+      host_height_out *= draw_resolution_scale_y();
     }
     host_depth_or_array_size_out = key.GetDepthOrArraySize();
   };

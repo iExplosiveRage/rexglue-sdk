@@ -97,8 +97,32 @@ class TextureCache {
   static uint32_t DownscaleCeil(uint32_t value, uint32_t percent) {
     return uint32_t((uint64_t(value) * percent + 99) / 100);
   }
+  // The size of a texture made from the top-left part: the pixels draws cover
+  // whole (rounded down - a partly covered last column or row would be read as
+  // a dark edge by the effects sampling the texture).
+  static uint32_t DownscaleTextureSize(uint32_t value, uint32_t percent) {
+    const uint32_t size = DownscaleFloor(value, percent);
+    return size ? size : 1;
+  }
   uint32_t draw_resolution_percent() const { return draw_resolution_percent_; }
   bool IsDrawResolutionDownscaled() const { return draw_resolution_percent_ < 100; }
+  // Any resolution (native renderer, draw_resolution_height): the render
+  // resolution as the whole scale times the percent (1.5x = 2x at 75%), and
+  // the output the scene upscalers take it to, in hundredths of the 1x
+  // resolution along each axis (0 = the whole scales, no such plan).
+  struct FractionalDrawResolution {
+    uint32_t scale_x = 1, scale_y = 1, percent = 100;
+    uint32_t render_e100_x = 0, render_e100_y = 0;
+    uint32_t target_e100_x = 0, target_e100_y = 0;
+  };
+  // The plan of the latest GetConfigDrawResolutionScale (target_e100 0 if
+  // the whole scales are used).
+  static FractionalDrawResolution GetConfigFractionalDrawResolution();
+  // NVIDIA's optimal render size ratios of its modes (NGX), when known:
+  // index 0 Quality, 1 Balanced, 2 Performance, 3 Ultra Performance; in
+  // 1/10000 of the output.
+  static void SetDlssOptimalRatios(const uint32_t ratios_e4[4]);
+
   // For backends marking textures up to date outside loading.
   std::unique_lock<std::recursive_mutex> AcquireGlobalLock() {
     return global_critical_region_.Acquire();
@@ -567,6 +591,10 @@ class TextureCache {
   // The same for rendering below 1x (the texture is loaded from the top-left
   // part of its guest data, at that size, with the regular load shaders).
   virtual bool IsDownscaledResolveSupportedForFormat(TextureKey /*key*/) const { return false; }
+  // A texture made from resolved data at the lower size (the top-left
+  // `percent` part of its - possibly resolution-scaled - guest data). Above 1x
+  // only single-level 2D textures (the others keep the whole scaled size).
+  bool IsScaledResolveKeyDownscaled(TextureKey key) const;
   // For formats with less than 4 components, implementations normally should
   // replicate the last component into the non-existent ones, similar to what is
   // done for unused components of operands in shaders by Microsoft's Xbox 360

@@ -64,6 +64,12 @@ REXCVAR_DEFINE_BOOL(gpu_direct_resolve_depth, true, "GPU",
                     "Direct resolves (gpu_direct_resolve) also of kD24S8 depth to k_24_8 "
                     "textures (soft particles)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_direct_resolve_upscaler, true, "GPU",
+                    "Direct resolves (gpu_direct_resolve) also while NVIDIA DLSS / AMD FSR is on "
+                    "(not while the upscaler waits for the scene or its first copy). Off: every "
+                    "resolve goes through the guest memory then, and the textures reading them "
+                    "are loaded again every frame (the old behaviour)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, dlss_mode);
 REXCVAR_DECLARE(std::string, fsr_mode);
 
@@ -6008,8 +6014,9 @@ bool D3D12RenderTargetCache::TryDirectResolveToTexture(
       uint32_t(resolve_info.copy_dest_info.copy_dest_endian) > 3 ||
       resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
       resolve_info.copy_dest_coordinate_info.offset_y_div_8 || scene_resolve_callback_ ||
-      scene_color_render_target_ || REXCVAR_GET(dlss_mode) != "off" ||
-      REXCVAR_GET(fsr_mode) != "off" ||
+      scene_color_render_target_ ||
+      (!REXCVAR_GET(gpu_direct_resolve_upscaler) &&
+       (REXCVAR_GET(dlss_mode) != "off" || REXCVAR_GET(fsr_mode) != "off")) ||
       // Reads the resolved data back from the (scaled resolve) memory copy.
       REXCVAR_GET(d3d12_readback_resolve)) {
     if (REXCVAR_GET(gpu_debug_log_draws) > 0) {

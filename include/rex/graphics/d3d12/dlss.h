@@ -93,6 +93,13 @@ class D3D12Dlss {
   // top-left width x height pixels, output_width x output_height is the size
   // DLSS makes (larger when upscaling). Returns the state the color render
   // target is left in.
+  // Any resolution: the part of the scene the game covers whole pixels of (the
+  // render size rounded down - its last, partly covered column and row aren't
+  // upscaled). 0 = all of it. For the next ProcessScene.
+  void SetSceneValidSize(uint32_t width, uint32_t height) {
+    scene_valid_width_ = width;
+    scene_valid_height_ = height;
+  }
   D3D12_RESOURCE_STATES ProcessScene(ID3D12Resource* color, ID3D12Resource* depth,
                                      D3D12_CPU_DESCRIPTOR_HANDLE depth_srv, uint32_t width,
                                      uint32_t height, uint32_t output_width,
@@ -185,6 +192,9 @@ class D3D12Dlss {
   bool RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint32_t width, uint32_t height,
                  uint32_t output_width, uint32_t output_height, bool upscale, bool reset,
                  ID3D12Resource* output);
+
+  uint32_t scene_valid_width_ = 0;
+  uint32_t scene_valid_height_ = 0;
 
   D3D12CommandProcessor& command_processor_;
 

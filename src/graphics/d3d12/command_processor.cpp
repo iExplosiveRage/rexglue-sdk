@@ -254,7 +254,7 @@ void RegisterDrawResolutionScaleCallbacks() {
     for (const char* name :
          {"draw_resolution_scale_x", "draw_resolution_scale_y", "resolution_scale",
           "present_effect", "present_fsr_quality_mode", "dlss_mode", "fsr_mode",
-          "draw_resolution_percent"}) {
+          "draw_resolution_percent", "draw_resolution_height"}) {
       rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
         D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
       });
@@ -269,6 +269,11 @@ void RegisterDrawResolutionScaleCallbacks() {
 uint32_t ChooseDrawResolutionPercent(const D3D12RenderTargetCache& render_target_cache) {
   return TextureCache::GetConfigDrawResolutionPercent(
       render_target_cache.draw_resolution_scale_x(), render_target_cache.draw_resolution_scale_y());
+}
+
+// A guest size at hundredths of 1x (rounded to the nearest pixel).
+uint32_t DrawResolutionE100Size(uint32_t unscaled, uint32_t e100) {
+  return uint32_t((uint64_t(unscaled) * e100 + 50) / 100);
 }
 
 }  // namespace
@@ -395,7 +400,59 @@ bool D3D12CommandProcessor::IsDrawResolutionScaleChangePending() const {
   return scale_x != texture_cache_->draw_resolution_scale_x() ||
          scale_y != texture_cache_->draw_resolution_scale_y() ||
          target_x != draw_resolution_target_scale_x_ ||
-         target_y != draw_resolution_target_scale_y_ || IsDrawResolutionPercentChangePending();
+         target_y != draw_resolution_target_scale_y_ || IsDrawResolutionPercentChangePending() ||
+         (render_target_cache_ &&
+          (ComputeDrawResolutionTargetE100(false) != draw_resolution_target_e100_x_ ||
+           ComputeDrawResolutionTargetE100(true) != draw_resolution_target_e100_y_));
+}
+
+uint32_t D3D12CommandProcessor::GetDrawResolutionRenderE100X() const {
+  return texture_cache_ && render_target_cache_
+             ? texture_cache_->draw_resolution_scale_x() * render_target_cache_->draw_resolution_percent()
+             : 100;
+}
+
+uint32_t D3D12CommandProcessor::GetDrawResolutionRenderE100Y() const {
+  return texture_cache_ && render_target_cache_
+             ? texture_cache_->draw_resolution_scale_y() * render_target_cache_->draw_resolution_percent()
+             : 100;
+}
+
+uint32_t D3D12CommandProcessor::ComputeDrawResolutionTargetE100(bool y) const {
+  const uint32_t render = y ? GetDrawResolutionRenderE100Y() : GetDrawResolutionRenderE100X();
+  if (!texture_cache_ || !render_target_cache_) {
+    return render;
+  }
+  // Any resolution: the plan's output, unless the device lowered the scale.
+  const TextureCache::FractionalDrawResolution plan =
+      TextureCache::GetConfigFractionalDrawResolution();
+  if (plan.target_e100_x && plan.target_e100_y) {
+    if (plan.scale_x != texture_cache_->draw_resolution_scale_x() ||
+        plan.scale_y != texture_cache_->draw_resolution_scale_y() ||
+        plan.percent != render_target_cache_->draw_resolution_percent()) {
+      return render;
+    }
+    return std::max(render, y ? plan.target_e100_y : plan.target_e100_x);
+  }
+  // Whole scales: the target scale while it's above the render scale.
+  const uint32_t target_scale = y ? draw_resolution_target_scale_y_ : draw_resolution_target_scale_x_;
+  const uint32_t render_scale =
+      y ? texture_cache_->draw_resolution_scale_y() : texture_cache_->draw_resolution_scale_x();
+  return target_scale > render_scale ? target_scale * 100 : render;
+}
+
+bool D3D12CommandProcessor::UpdateDrawResolutionTargetE100() {
+  const uint32_t x = ComputeDrawResolutionTargetE100(false);
+  const uint32_t y = ComputeDrawResolutionTargetE100(true);
+  rex::perf::SetDrawResolutionOutputE100(x, y);
+  if (x == draw_resolution_target_e100_x_ && y == draw_resolution_target_e100_y_) {
+    return false;
+  }
+  draw_resolution_target_e100_x_ = x;
+  draw_resolution_target_e100_y_ = y;
+  REXGPU_INFO("Draw resolution: render {}x{}, output {}x{} (of 1280x720 at 1/100)", GetDrawResolutionRenderE100X(),
+              GetDrawResolutionRenderE100Y(), x, y);
+  return true;
 }
 
 bool D3D12CommandProcessor::IsDrawResolutionPercentChangePending() const {
@@ -418,10 +475,10 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
       now_ms - pending_draw_resolution_scale_time_ms_ < kDrawResolutionScaleSettleMs) {
     return;
   }
-  uint32_t scale_x = pending_draw_resolution_scale_ & 0xFF;
-  uint32_t scale_y = (pending_draw_resolution_scale_ >> 8) & 0xFF;
-  uint32_t target_x = (pending_draw_resolution_scale_ >> 16) & 0xFF;
-  uint32_t target_y = pending_draw_resolution_scale_ >> 24;
+  // The settings as they are now (the request only says they changed - the
+  // output aspect of any resolution isn't in it).
+  uint32_t scale_x, scale_y, target_x, target_y;
+  TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y, &target_x, &target_y);
   const uint32_t requested_x = scale_x, requested_y = scale_y;
   D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(scale_x, scale_y, GetD3D12Provider());
   // Not upscaled by DLSS if the device lowered the scale.
@@ -436,13 +493,13 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
     pending_draw_resolution_scale_ = 0;
     // Only the scale DLSS upscales to may have changed (Performance at 2x and
     // off at 1x both render at 1x).
-    if (target_x != draw_resolution_target_scale_x_ ||
-        target_y != draw_resolution_target_scale_y_) {
-      draw_resolution_target_scale_x_ = target_x;
-      draw_resolution_target_scale_y_ = target_y;
-      if (dlss_) {
-        dlss_->OnDrawResolutionScaleChanged();
-      }
+    bool target_changed = target_x != draw_resolution_target_scale_x_ ||
+                          target_y != draw_resolution_target_scale_y_;
+    draw_resolution_target_scale_x_ = target_x;
+    draw_resolution_target_scale_y_ = target_y;
+    target_changed |= UpdateDrawResolutionTargetE100();
+    if (target_changed && dlss_) {
+      dlss_->OnDrawResolutionScaleChanged();
     }
     return;
   }
@@ -463,6 +520,7 @@ void D3D12CommandProcessor::UpdateDrawResolutionScaleFromSettings() {
     draw_resolution_target_scale_x_ = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
     draw_resolution_target_scale_y_ = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
   }
+  UpdateDrawResolutionTargetE100();
   if (dlss_) {
     dlss_->OnDrawResolutionScaleChanged();
   }
@@ -1652,6 +1710,7 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
   texture_cache_->SetDrawResolutionPercent(draw_resolution_percent);
+  UpdateDrawResolutionTargetE100();
   rex::perf::SetDrawResolutionPercent(draw_resolution_percent);
   if (draw_resolution_percent < 100) {
     REXGPU_INFO("Rendering below 1x: {}% ({}x{} of 1280x720)", draw_resolution_percent,
@@ -2521,12 +2580,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   {
     const uint32_t render_scale_x = texture_cache_->draw_resolution_scale_x();
     const uint32_t render_scale_y = texture_cache_->draw_resolution_scale_y();
-    if (dlss_ && (draw_resolution_target_scale_x_ > render_scale_x ||
-                  draw_resolution_target_scale_y_ > render_scale_y)) {
+    if (dlss_ && (draw_resolution_target_e100_x_ > GetDrawResolutionRenderE100X() ||
+                  draw_resolution_target_e100_y_ > GetDrawResolutionRenderE100Y())) {
+      // From the guest size (any resolution: the render size is rounded up).
+      const uint32_t unscaled_width = frontbuffer_width ? frontbuffer_width : frontbuffer_width_unscaled;
+      const uint32_t unscaled_height =
+          frontbuffer_height ? frontbuffer_height : frontbuffer_height_unscaled;
       const uint32_t upscaled_width =
-          guest_output_width * draw_resolution_target_scale_x_ / render_scale_x;
+          unscaled_width ? DrawResolutionE100Size(unscaled_width, draw_resolution_target_e100_x_)
+                         : guest_output_width * draw_resolution_target_scale_x_ / render_scale_x;
       const uint32_t upscaled_height =
-          guest_output_height * draw_resolution_target_scale_y_ / render_scale_y;
+          unscaled_height ? DrawResolutionE100Size(unscaled_height, draw_resolution_target_e100_y_)
+                          : guest_output_height * draw_resolution_target_scale_y_ / render_scale_y;
       GpuProfilePassScope pass_scope(*this, rex::perf::GpuPass::kDlssCompose);
       if (dlss_->ComposeUpscaledOutput(swap_texture_resource, swap_texture_srv_desc,
                                        guest_output_width, guest_output_height, upscaled_width,
@@ -3075,16 +3140,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   if (dlss_take_scene) {
     const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
-    uint32_t scene_width = render_info.frontbuffer_width * texture_cache_->draw_resolution_scale_x();
-    uint32_t scene_height =
-        render_info.frontbuffer_height * texture_cache_->draw_resolution_scale_y();
+    // Like the frontbuffer texture (any resolution: the top-left part, its size
+    // rounded up like the textures made from it).
+    const uint32_t percent = render_target_cache_->draw_resolution_percent();
+    uint32_t scene_width = TextureCache::DownscaleTextureSize(render_info.frontbuffer_width, percent) *
+                           texture_cache_->draw_resolution_scale_x();
+    uint32_t scene_height = TextureCache::DownscaleTextureSize(render_info.frontbuffer_height, percent) *
+                            texture_cache_->draw_resolution_scale_y();
+    // The pixels the game covers whole (any resolution: rounded down).
+    const uint32_t valid_width = std::max(UINT32_C(1),
+        uint32_t(uint64_t(render_info.frontbuffer_width) * texture_cache_->draw_resolution_scale_x() * percent / 100));
+    const uint32_t valid_height = std::max(UINT32_C(1),
+        uint32_t(uint64_t(render_info.frontbuffer_height) * texture_cache_->draw_resolution_scale_y() * percent / 100));
     // Larger with DLSS upscaling.
-    uint32_t output_width = render_info.frontbuffer_width * draw_resolution_target_scale_x_;
-    uint32_t output_height = render_info.frontbuffer_height * draw_resolution_target_scale_y_;
+    uint32_t output_width =
+        draw_resolution_target_e100_x_ > GetDrawResolutionRenderE100X()
+            ? DrawResolutionE100Size(render_info.frontbuffer_width, draw_resolution_target_e100_x_)
+            : scene_width;
+    uint32_t output_height =
+        draw_resolution_target_e100_y_ > GetDrawResolutionRenderE100Y()
+            ? DrawResolutionE100Size(render_info.frontbuffer_height, draw_resolution_target_e100_y_)
+            : scene_height;
     render_target_cache_->RequestSceneCallback(
-        [this, scene_width, scene_height, output_width, output_height](
+        [this, scene_width, scene_height, output_width, output_height, valid_width, valid_height](
             ID3D12Resource* color, ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
           ++g_frame_trace_scenes;
+          dlss_->SetSceneValidSize(valid_width, valid_height);
           D3D12_RESOURCE_STATES color_state = dlss_->ProcessScene(
               color, depth, depth_srv, scene_width, scene_height, output_width, output_height);
           SetGpuProfilePass(rex::perf::GpuPass::kRenderTargets);
@@ -3806,10 +3887,11 @@ void D3D12CommandProcessor::MirrorDrawToHud(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     const draw_util::ViewportInfo& viewport_info, const draw_util::Scissor& guest_scissor,
     bool with_depth) {
-  const uint32_t render_scale_x = texture_cache_->draw_resolution_scale_x();
-  const uint32_t render_scale_y = texture_cache_->draw_resolution_scale_y();
-  const uint32_t target_scale_x = draw_resolution_target_scale_x_;
-  const uint32_t target_scale_y = draw_resolution_target_scale_y_;
+  // In hundredths (any resolution: not whole scales).
+  const uint32_t render_scale_x = texture_cache_->draw_resolution_scale_x() * 100;
+  const uint32_t render_scale_y = texture_cache_->draw_resolution_scale_y() * 100;
+  const uint32_t target_scale_x = draw_resolution_target_e100_x_;
+  const uint32_t target_scale_y = draw_resolution_target_e100_y_;
   // The viewport is a multiple of the render scale (the normalized device
   // coordinates around it are in guest pixels), so it's the same at the
   // output's.
@@ -3828,12 +3910,12 @@ void D3D12CommandProcessor::MirrorDrawToHud(
   const uint32_t width = dlss_->hud_width();
   const uint32_t height = dlss_->hud_height();
   D3D12_RECT scissor;
-  scissor.left = LONG(std::min(guest_scissor.offset[0] * target_scale_x, width));
-  scissor.top = LONG(std::min(guest_scissor.offset[1] * target_scale_y, height));
-  scissor.right = LONG(
-      std::min((guest_scissor.offset[0] + guest_scissor.extent[0]) * target_scale_x, width));
-  scissor.bottom = LONG(
-      std::min((guest_scissor.offset[1] + guest_scissor.extent[1]) * target_scale_y, height));
+  scissor.left = LONG(std::min(guest_scissor.offset[0] * target_scale_x / 100, width));
+  scissor.top = LONG(std::min(guest_scissor.offset[1] * target_scale_y / 100, height));
+  scissor.right = LONG(std::min(
+      ((guest_scissor.offset[0] + guest_scissor.extent[0]) * target_scale_x + 99) / 100, width));
+  scissor.bottom = LONG(std::min(
+      ((guest_scissor.offset[1] + guest_scissor.extent[1]) * target_scale_y + 99) / 100, height));
 
   dlss_->BindHudTargets(with_depth);
   // The next draw binds the game's render targets again.
@@ -6669,7 +6751,9 @@ uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) cons
   // Below 1x, fewer samples are drawn (percent^2 / 10000 of them).
   const uint64_t percent = render_target_cache_ ? render_target_cache_->draw_resolution_percent() : 100;
   if (percent < 100) {
-    return (samples * 10000 + ((percent * percent) >> 1)) / (percent * percent);
+    // (Any resolution: at the whole scale too.)
+    const uint64_t divisor = percent * percent * scale;
+    return (samples * 10000 + (divisor >> 1)) / divisor;
   }
   if (scale <= 1) {
     return samples;

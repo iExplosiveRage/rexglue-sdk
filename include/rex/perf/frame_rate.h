@@ -57,6 +57,9 @@ void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32
 // Rendering below 1x: the percent of the 1x resolution the game is drawn at
 // (100 = off).
 void SetDrawResolutionPercent(uint32_t percent);
+// The output the GPU backend presents (DLSS / FSR upscale the scene to it), in
+// hundredths of the guest frontbuffer size (any resolution isn't a whole scale).
+void SetDrawResolutionOutputE100(uint32_t x, uint32_t y);
 // The native renderer was latched on at startup (gpu_native_renderer).
 void SetNativeRendererActive(bool active);
 
@@ -68,6 +71,9 @@ struct RenderInfo {
   uint32_t requested_scale_x = 0;
   uint32_t requested_scale_y = 0;
   uint32_t percent = 100;
+  // 0 = not known (requested_scale then).
+  uint32_t output_e100_x = 0;
+  uint32_t output_e100_y = 0;
   bool native_renderer = false;
 };
 RenderInfo GetRenderInfo();

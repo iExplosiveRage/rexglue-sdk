@@ -488,6 +488,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t pending_draw_resolution_scale_ = 0;
   uint32_t draw_resolution_target_scale_x_ = 1;
   uint32_t draw_resolution_target_scale_y_ = 1;
+  // The output of the scene upscalers (and the presented picture) in hundredths of
+  // the 1x resolution - any resolution (draw_resolution_height) isn't a whole scale.
+  uint32_t draw_resolution_target_e100_x_ = 100;
+  uint32_t draw_resolution_target_e100_y_ = 100;
+  uint32_t GetDrawResolutionRenderE100X() const;
+  uint32_t GetDrawResolutionRenderE100Y() const;
+  // From the settings and the current caches.
+  uint32_t ComputeDrawResolutionTargetE100(bool y) const;
+  // Sets the members above (true if changed).
+  bool UpdateDrawResolutionTargetE100();
   uint64_t pending_draw_resolution_scale_time_ms_ = 0;
   // 2D overlay placement of the current draw (rex::graphics::wide_aspect.h):
   // guest clip X -> x * overlay_scale_x_ + overlay_offset_x_ * w.

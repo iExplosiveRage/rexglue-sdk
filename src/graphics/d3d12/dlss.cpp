@@ -22,6 +22,7 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/draw_overrides.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -543,6 +544,32 @@ bool D3D12Dlss::InitializeNgx() {
   NVSDK_NGX_Parameter_SetI(ngx_parameters_, NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
   ngx_state_ = NgxState::kAvailable;
   REXGPU_INFO("DLSS: NGX initialized, DLSS is available");
+  // NVIDIA's optimal render size of each mode (as a ratio of a 4K output), for
+  // the render resolution of any output (draw_resolution_height).
+  {
+    const NVSDK_NGX_PerfQuality_Value modes[4] = {
+        NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_Balanced,
+        NVSDK_NGX_PerfQuality_Value_MaxPerf, NVSDK_NGX_PerfQuality_Value_UltraPerformance};
+    uint32_t ratios_e4[4] = {};
+    bool all = true;
+    for (uint32_t i = 0; i < 4; ++i) {
+      unsigned int optimal_width = 0, optimal_height = 0, max_width = 0, max_height = 0,
+                   min_width = 0, min_height = 0;
+      float sharpness = 0.0f;
+      NVSDK_NGX_Result optimal_result = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+          ngx_parameters_, 3840, 2160, modes[i], &optimal_width, &optimal_height, &max_width,
+          &max_height, &min_width, &min_height, &sharpness);
+      if (NVSDK_NGX_FAILED(optimal_result) || !optimal_height) {
+        all = false;
+        break;
+      }
+      ratios_e4[i] = uint32_t((uint64_t(optimal_height) * 10000 + 1080) / 2160);
+    }
+    if (all) {
+      TextureCache::SetDlssOptimalRatios(ratios_e4);
+      D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+    }
+  }
   return true;
 #else
   ngx_state_ = NgxState::kUnavailable;
@@ -732,6 +759,12 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
                                               uint32_t output_width, uint32_t output_height) {
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   frame_scene_taken_ = true;
+  const uint32_t valid_width =
+      scene_valid_width_ ? std::min(scene_valid_width_, width) : width;
+  const uint32_t valid_height =
+      scene_valid_height_ ? std::min(scene_valid_height_, height) : height;
+  scene_valid_width_ = 0;
+  scene_valid_height_ = 0;
 #if defined(REX_HAS_DLSS) || defined(REX_HAS_FSR_SDK)
   const Backend backend = SelectBackend();
   if (!width || !height || backend == Backend::kNone) {
@@ -800,8 +833,29 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       }
       return 0;
     };
+    // Any resolution (draw_resolution_height): any ratio up to 3x, DLSS's mode
+    // from it.
+    const bool any_ratio = TextureCache::GetConfigFractionalDrawResolution().target_e100_y != 0;
     if (output_width < width || output_height < height) {
       upscale = false;
+    } else if (any_ratio && backend == Backend::kDlss) {
+#if defined(REX_HAS_DLSS)
+      const float ratio = std::max(float(output_width) / float(width),
+                                   float(output_height) / float(height));
+      if (ratio > 3.05f) {
+        upscale = false;
+      } else if (ratio <= 1.55f) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+      } else if (ratio <= 1.8f) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_Balanced);
+      } else if (ratio <= 2.2f) {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_MaxPerf);
+      } else {
+        quality = uint32_t(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
+      }
+#else
+      upscale = false;
+#endif
     } else if (backend == Backend::kFsr) {
       upscale = output_width <= 3 * width && output_height <= 3 * height;
 #if defined(REX_HAS_DLSS)
@@ -987,7 +1041,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     command_list.D3DSetComputeRootDescriptorTable(3, debug_descriptors[2].second);
     command_list.D3DDispatch(group_count_x, group_count_y, 1);
   } else if (backend == Backend::kFsr) {
-    if (!RecordFsr(color, color_desc.Format, width, height, output_width, output_height, upscale,
+    if (!RecordFsr(color, color_desc.Format, valid_width, valid_height, output_width, output_height, upscale,
                    reset, dlss_output.resource.Get())) {
       return color_state;
     }
@@ -1034,8 +1088,8 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     ID3D12Resource* motion_resource = motion_.resource.Get();
     ID3D12Resource* output_resource = dlss_output.resource.Get();
     command_list.ExternalCallback([this, create, upscale, preset, quality, color, depth_resource,
-                                   motion_resource, output_resource, width, height, output_width,
-                                   output_height, jitter_x, jitter_y,
+                                   motion_resource, output_resource, width, height, valid_width,
+                                   valid_height, output_width, output_height, jitter_x, jitter_y,
                                    reset](ID3D12GraphicsCommandList* d3d_command_list) {
       dlss_output_valid_ = false;
       if (create) {
@@ -1089,8 +1143,8 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       eval_params.pInMotionVectors = motion_resource;
       eval_params.InJitterOffsetX = jitter_x;
       eval_params.InJitterOffsetY = jitter_y;
-      eval_params.InRenderSubrectDimensions.Width = width;
-      eval_params.InRenderSubrectDimensions.Height = height;
+      eval_params.InRenderSubrectDimensions.Width = valid_width;
+      eval_params.InRenderSubrectDimensions.Height = valid_height;
       eval_params.InReset = reset ? 1 : 0;
       eval_params.InMVScaleX = 1.0f;
       eval_params.InMVScaleY = 1.0f;
