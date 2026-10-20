@@ -273,15 +273,18 @@ void CommandProcessor::GetStats(system::NativeGpuStats* out, bool reset) {
 }
 
 bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
-                                    system::NativeScopeResult* result) {
+                                    system::NativeScopeResult* result,
+                                    const system::NativeRegisterWrite* writes,
+                                    uint32_t write_count) {
   system::NativeScopeResult local_result;
   system::NativeScopeResult& r = result ? *result : local_result;
   r = system::NativeScopeResult();
-  if (!native_mode_ || !dwords || !native_ready_.load(std::memory_order_acquire)) {
+  if (!native_mode_ || (!dwords && !write_count) ||
+      !native_ready_.load(std::memory_order_acquire)) {
     return true;
   }
   const uint64_t start_ns = NativeNowNs();
-  uint8_t* host = memory_->TranslatePhysical(physical);
+  uint8_t* host = dwords ? memory_->TranslatePhysical(physical) : nullptr;
   auto load = [&](uint32_t i) { return memory::load_and_swap<uint32_t>(host + i * 4); };
 
   std::lock_guard<std::recursive_mutex> backend_lock(native_backend_mutex_);
@@ -309,8 +312,22 @@ bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
     }
     run_start = UINT32_MAX;
   };
+  // The title's native register writes, in command buffer order: the same
+  // effect as the type-0 packets they replace.
+  uint32_t next_write = 0;
+  uint64_t write_dwords = 0;
+  auto apply_writes = [&](uint32_t before_dword) {
+    while (next_write < write_count && writes[next_write].at_dword <= before_dword) {
+      flush_run(before_dword);
+      const system::NativeRegisterWrite& write = writes[next_write++];
+      WriteRegistersFromMem(write.first_register, const_cast<uint32_t*>(write.values),
+                            write.count);
+      write_dwords += write.count;
+    }
+  };
   uint32_t pos = 0;
   while (pos < dwords) {
+    apply_writes(pos);
     const uint32_t header = load(pos);
     const uint32_t size = NativePacketDwords(header);
     if (size > dwords - pos) {
@@ -358,6 +375,7 @@ bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
     pos += size;
   }
   flush_run(pos);
+  apply_writes(UINT32_MAX);
   --t_native_backend_depth;
 
   const uint64_t elapsed_ns = NativeNowNs() - start_ns;
@@ -367,6 +385,8 @@ bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
   native_stats_.scope_dwords += r.executed_dwords;
   native_stats_.scope_left += r.left_packets;
   native_stats_.scope_ns += elapsed_ns;
+  native_stats_.register_writes += write_count;
+  native_stats_.register_dwords += write_dwords;
   if (!r.ok) {
     ++native_stats_.scope_failures;
   }

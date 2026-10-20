@@ -135,8 +135,8 @@ class CommandProcessor : public system::INativeGpu {
   // run the command buffer themselves (command_processor_native.cpp).
   bool native_mode() const { return native_mode_; }
   bool WaitUntilReady() override;
-  bool ExecuteScope(uint32_t physical, uint32_t dwords,
-                    system::NativeScopeResult* result) override;
+  bool ExecuteScope(uint32_t physical, uint32_t dwords, system::NativeScopeResult* result,
+                    const system::NativeRegisterWrite* writes, uint32_t write_count) override;
   system::NativeDrainState TryDrain() override;
   void WaitForRingProgress(uint32_t timeout_us) override;
   void SetSwapOwnerThread(uint32_t guest_thread_id) override;

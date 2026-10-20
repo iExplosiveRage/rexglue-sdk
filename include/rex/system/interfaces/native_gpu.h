@@ -36,6 +36,18 @@ struct NativeScopeResult {
   uint32_t left_headers[8] = {};  // the first packets left (header, then its first dword)
 };
 
+// A register write a title's native draw path makes instead of writing a
+// type-0 packet into the command buffer: count registers from first_register,
+// with big-endian values (as a packet would carry them). It takes effect in
+// command buffer order, right before the packet at dword at_dword of the
+// ExecuteScope range (at or past the end: after the range's last packet).
+struct NativeRegisterWrite {
+  uint32_t at_dword = 0;
+  uint32_t first_register = 0;
+  uint32_t count = 0;
+  const uint32_t* values = nullptr;
+};
+
 // Counters since the last GetStats(reset = true).
 struct NativeGpuStats {
   uint64_t drains = 0;            // TryDrain calls that ran
@@ -70,6 +82,8 @@ struct NativeGpuStats {
   uint64_t scope_left = 0;
   uint64_t scope_failures = 0;
   uint64_t scope_ns = 0;
+  uint64_t register_writes = 0;   // NativeRegisterWrite runs applied
+  uint64_t register_dwords = 0;
   uint32_t first_render_packet[4] = {};  // the first rendering packet a drain met (header, address)
 };
 
@@ -85,7 +99,10 @@ class INativeGpu {
   // calling thread, with the command processor's packet handlers, and turns
   // them into NOPs in guest memory. Sync and present packets (waits, fences,
   // interrupts, memory writes, indirect buffers, the swap) stay for the ring.
-  virtual bool ExecuteScope(uint32_t physical, uint32_t dwords, NativeScopeResult* result) = 0;
+  // writes (sorted by at_dword) are applied in between, in command buffer
+  // order; dwords may be 0 then.
+  virtual bool ExecuteScope(uint32_t physical, uint32_t dwords, NativeScopeResult* result,
+                            const NativeRegisterWrite* writes, uint32_t write_count) = 0;
 
   // Runs kicked commands on the calling thread until the ring is idle, a wait
   // isn't met yet or the swap belongs to another thread. Never blocks on a
