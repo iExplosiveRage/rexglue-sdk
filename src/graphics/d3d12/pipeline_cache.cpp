@@ -29,6 +29,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -50,6 +51,70 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
+
+REXCVAR_DEFINE_BOOL(gpu_shader_storage_seed, true, "GPU",
+                    "Merge the known shaders / pipelines shipped in the shader_seed folder next to the "
+                    "executable into the shader cache at startup, so they are translated and "
+                    "created while the game loads instead of at first use");
+
+namespace {
+
+// Appends the valid records of a seed storage file that the user's file lacks
+// (pipeline descriptions: fixed size, XXH3 of the description; shaders:
+// variable size, XXH3 of the microcode). A missing or foreign-version user
+// file is (re)started with the seed's header. Returns the records added.
+template <typename RecordReader>
+size_t MergeSeedStorage(const std::filesystem::path& seed_path,
+                        const std::filesystem::path& user_path, size_t header_size,
+                        RecordReader&& read_records) {
+  std::vector<uint8_t> seed, user;
+  auto read_all = [](const std::filesystem::path& path, std::vector<uint8_t>& out) {
+    FILE* f = rex::filesystem::OpenFile(path, "rb");
+    if (!f) {
+      return false;
+    }
+    rex::filesystem::Seek(f, 0, SEEK_END);
+    const int64_t size = rex::filesystem::Tell(f);
+    rex::filesystem::Seek(f, 0, SEEK_SET);
+    out.resize(size_t(std::max<int64_t>(size, 0)));
+    out.resize(fread(out.data(), 1, out.size(), f));
+    fclose(f);
+    return true;
+  };
+  if (!read_all(seed_path, seed) || seed.size() < header_size) {
+    return 0;
+  }
+  read_all(user_path, user);
+  bool user_valid =
+      user.size() >= header_size && !std::memcmp(user.data(), seed.data(), header_size);
+  std::set<uint64_t> have;
+  if (user_valid) {
+    read_records(user, [&](uint64_t hash, size_t, size_t) { have.insert(hash); });
+  }
+  std::vector<uint8_t> append;
+  read_records(seed, [&](uint64_t hash, size_t offset, size_t size) {
+    if (have.insert(hash).second) {
+      append.insert(append.end(), seed.begin() + offset, seed.begin() + offset + size);
+    }
+  });
+  if (append.empty() && user_valid) {
+    return 0;
+  }
+  FILE* f = rex::filesystem::OpenFile(user_path, user_valid ? "ab" : "wb");
+  if (!f) {
+    return 0;
+  }
+  if (!user_valid) {
+    fwrite(seed.data(), 1, header_size, f);
+  }
+  size_t records = 0;
+  read_records(append, [&](uint64_t, size_t, size_t) { ++records; }, true);
+  fwrite(append.data(), 1, append.size(), f);
+  fclose(f);
+  return records;
+}
+
+}  // namespace
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
                     "Dump DXIL conversion disassembly");
@@ -243,6 +308,52 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
   bool edram_rov_used =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+
+  // The seed (gpu_shader_storage_seed): known shaders and pipelines, merged in
+  // before the storage is read, so the warm-up below creates them all.
+  if (REXCVAR_GET(gpu_shader_storage_seed) && !edram_rov_used) {
+    const std::filesystem::path seed_root = rex::filesystem::GetExecutableFolder() / "shader_seed";
+    const std::string xpso_name = fmt::format("{:08X}.rtv.d3d12.xpso", title_id);
+    const std::string xsh_name = fmt::format("{:08X}.xsh", title_id);
+    const size_t pipelines_added = MergeSeedStorage(
+        seed_root / xpso_name, shader_storage_shareable_root / xpso_name, 12,
+        [](const std::vector<uint8_t>& data, auto&& fn, bool raw = false) {
+          const size_t start = raw ? 0 : 12;
+          for (size_t pos = start; pos + sizeof(PipelineStoredDescription) <= data.size();
+               pos += sizeof(PipelineStoredDescription)) {
+            PipelineStoredDescription record;
+            std::memcpy(&record, data.data() + pos, sizeof(record));
+            if (XXH3_64bits(&record.description, sizeof(record.description)) !=
+                record.description_hash) {
+              continue;
+            }
+            fn(record.description_hash, pos, sizeof(record));
+          }
+        });
+    const size_t shaders_added = MergeSeedStorage(
+        seed_root / xsh_name, shader_storage_shareable_root / xsh_name, 8,
+        [](const std::vector<uint8_t>& data, auto&& fn, bool raw = false) {
+          size_t pos = raw ? 0 : 8;
+          while (pos + 12 <= data.size()) {
+            uint64_t hash;
+            uint32_t dword_count;
+            std::memcpy(&hash, data.data() + pos, 8);
+            std::memcpy(&dword_count, data.data() + pos + 8, 4);
+            const size_t size = 12 + size_t(dword_count & 0x7FFFFFFF) * 4;
+            if (pos + size > data.size()) {
+              break;
+            }
+            if (XXH3_64bits(data.data() + pos + 12, size - 12) == hash) {
+              fn(hash, pos, size);
+            }
+            pos += size;
+          }
+        });
+    if (pipelines_added || shaders_added) {
+      REXGPU_INFO("Shader storage seed: added {} shaders and {} pipelines to the cache",
+                  shaders_added, pipelines_added);
+    }
+  }
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
@@ -708,6 +819,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
            pipeline_storage_file_);
   }
 
+  {
+    // What the warm-up translated / created (the rest happens at first use).
+    rex::perf::PipelineCacheStats& stats = rex::perf::GetPipelineCacheStats();
+    stats.storage_shader_translations.store(stats.shader_translations.load());
+    stats.storage_pipelines_created.store(stats.pipelines_created.load());
+  }
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
 
@@ -1061,6 +1178,7 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             D3D12Shader::D3D12Translation& translation,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
                                             IDxcCompiler* dxc_compiler) {
+  rex::perf::GetPipelineCacheStats().shader_translations.fetch_add(1, std::memory_order_relaxed);
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
 
   // Perform translation.
@@ -2679,6 +2797,7 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     const PipelineRuntimeDescription& runtime_description) {
+  rex::perf::GetPipelineCacheStats().pipelines_created.fetch_add(1, std::memory_order_relaxed);
   const PipelineDescription& description = runtime_description.description;
 
   if (runtime_description.pixel_shader != nullptr) {

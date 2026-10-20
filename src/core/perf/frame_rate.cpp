@@ -220,6 +220,11 @@ RenderInfo GetRenderInfo() {
   return info;
 }
 
+PipelineCacheStats& GetPipelineCacheStats() {
+  static PipelineCacheStats stats;
+  return stats;
+}
+
 TextureCacheStats& GetTextureCacheStats() {
   static TextureCacheStats stats;
   return stats;

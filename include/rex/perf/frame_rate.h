@@ -102,6 +102,17 @@ struct TextureCacheStats {
 };
 TextureCacheStats& GetTextureCacheStats();
 
+// Shader translations and pipeline (PSO) creations since startup, and how many
+// of them the startup storage warm-up did (the rest happened at first use).
+struct PipelineCacheStats {
+  std::atomic<uint64_t> shader_translations{0};
+  std::atomic<uint64_t> pipelines_created{0};
+  std::atomic<uint64_t> storage_shader_translations{0};
+  std::atomic<uint64_t> storage_pipelines_created{0};
+  std::atomic<uint64_t> storage_ms{0};
+};
+PipelineCacheStats& GetPipelineCacheStats();
+
 // GPU time per part of a frame, from timestamp queries (gpu_profile debug
 // command). Off unless a measurement is running.
 enum class GpuPass : uint32_t {
