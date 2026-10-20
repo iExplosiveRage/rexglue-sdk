@@ -877,9 +877,7 @@ uint8_t XThread::active_cpu() const {
   return pcr.prcb_data.current_cpu;
 }
 
-void XThread::SetActiveCpu(uint8_t cpu_index) {
-  // May be called during thread creation - don't skip if current == new.
-
+void XThread::SetGuestActiveCpu(uint8_t cpu_index) {
   assert_true(cpu_index < 6);
 
   // Write to guest KTHREAD (always available for guest threads).
@@ -893,6 +891,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
     X_KPCR& pcr = *memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
     pcr.prcb_data.current_cpu = cpu_index;
   }
+}
+
+void XThread::SetActiveCpu(uint8_t cpu_index) {
+  // May be called during thread creation - don't skip if current == new.
+
+  SetGuestActiveCpu(cpu_index);
 
   if (rex::thread::logical_processor_count() >= 6) {
     if (!REXCVAR_GET(ignore_thread_affinities)) {

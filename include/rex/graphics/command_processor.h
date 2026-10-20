@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -26,6 +27,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/system/interfaces/native_gpu.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/ui/presenter.h>
@@ -73,7 +75,7 @@ enum class GammaRampType {
   kPWL,
 };
 
-class CommandProcessor {
+class CommandProcessor : public system::INativeGpu {
  public:
   enum class SwapPostEffect {
     kNone,
@@ -129,6 +131,19 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  // Native renderer (gpu_native_renderer, latched in Initialize): guest threads
+  // run the command buffer themselves (command_processor_native.cpp).
+  bool native_mode() const { return native_mode_; }
+  bool WaitUntilReady() override;
+  bool ExecuteScope(uint32_t physical, uint32_t dwords,
+                    system::NativeScopeResult* result) override;
+  system::NativeDrainState TryDrain() override;
+  void WaitForRingProgress(uint32_t timeout_us) override;
+  void SetSwapOwnerThread(uint32_t guest_thread_id) override;
+  void GetStats(system::NativeGpuStats* out, bool reset) override;
+  // Something a stopped drain may be waiting for happened (a vblank).
+  void SignalNativeRingProgress();
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -165,7 +180,13 @@ class CommandProcessor {
   virtual void OnGammaRamp256EntryTableValueWritten() {}
   virtual void OnGammaRampPWLValueWritten() {}
 
+  // Backends that can run the native renderer.
+  virtual bool SupportsNativeRenderer() const { return false; }
+
   virtual void MakeCoherent();
+  // One check of a WAIT_REG_MEM condition (value_out: the value compared).
+  bool WaitRegMemMatches(uint32_t wait_info, uint32_t poll_reg_addr, uint32_t ref, uint32_t mask,
+                         uint32_t* value_out);
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
@@ -278,6 +299,41 @@ class CommandProcessor {
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 
  private:
+  // Native renderer (command_processor_native.cpp).
+  struct NativeIbLevel {
+    uint32_t ptr;   // physical
+    uint32_t size;  // dwords
+    uint32_t pos;   // dwords
+  };
+  static constexpr uint32_t kNativeIbStackSize = 4;
+  void NativeWorkerLoop();
+  void RunNativePendingFns();
+  void CallInThreadNative(std::function<void()> fn);
+  system::NativeDrainState NativeDrain(bool on_worker, bool* advanced, uint64_t* excluded_ns,
+                                       uint64_t* packets);
+  void NativeDispatchInterrupt(uint32_t cpu_mask, bool on_worker);
+  void BumpNativeRingProgress();
+
+  bool native_mode_ = false;
+  std::atomic<bool> native_ready_{false};
+  std::mutex native_ready_mutex_;
+  std::condition_variable native_ready_cv_;
+  // Held while the backend runs packets (never while guest code runs).
+  std::recursive_mutex native_backend_mutex_;
+  // Only ever try-locked: one drain at a time.
+  std::mutex native_drain_mutex_;
+  std::mutex native_pending_mutex_;
+  NativeIbLevel native_ib_stack_[kNativeIbStackSize] = {};
+  uint32_t native_ib_depth_ = 0;
+  std::atomic<uint32_t> native_swap_owner_{0};
+  uint64_t native_swap_blocked_since_ns_ = 0;
+  std::atomic<uint64_t> native_last_drain_ns_{0};
+  std::mutex native_progress_mutex_;
+  std::condition_variable native_progress_cv_;
+  std::atomic<uint64_t> native_progress_generation_{0};
+  std::mutex native_stats_mutex_;
+  system::NativeGpuStats native_stats_;
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

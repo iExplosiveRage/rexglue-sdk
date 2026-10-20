@@ -31,8 +31,10 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/net/session.h>
+#include <rex/ppc/context.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
@@ -481,6 +483,38 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+void GraphicsSystem::DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu) {
+  if (!interrupt_callback_) {
+    return;
+  }
+  auto thread = system::XThread::GetCurrentThread();
+  if (!thread || !thread->is_guest_thread()) {
+    DispatchInterruptCallback(source, cpu);
+    return;
+  }
+  if (cpu == 0xFFFFFFFF) {
+    cpu = 2;
+  }
+  PPCContext* context = thread->thread_state()->context();
+  // The handler runs on this thread's context: everything the code that was
+  // interrupted had in its registers comes back afterwards.
+  const PPCContext saved_context = *context;
+  const uint8_t saved_cpu = thread->active_cpu();
+  thread->SetGuestActiveCpu(uint8_t(cpu));
+  uint64_t args[] = {source, interrupt_callback_data_};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+                                         rex::countof(args));
+  thread->SetGuestActiveCpu(saved_cpu);
+  *context = saved_context;
+}
+
+system::INativeGpu* GraphicsSystem::native_gpu() const {
+  if (!command_processor_ || !command_processor_->native_mode()) {
+    return nullptr;
+  }
+  return command_processor_.get();
+}
+
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
@@ -495,6 +529,11 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+
+  // Native renderer: a drain stopped before the vsync wait may go on now.
+  if (command_processor_) {
+    command_processor_->SignalNativeRingProgress();
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

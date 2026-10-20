@@ -26,6 +26,7 @@ class Presenter;
 class WindowedAppContext;
 }  // namespace rex::ui
 namespace rex::system {
+class INativeGpu;
 class KernelState;
 }
 
@@ -78,6 +79,10 @@ class IGraphicsSystem {
     (void)title_id;
     (void)blocking;
   }
+
+  // The native renderer (gpu_native_renderer, latched at startup): null when
+  // this session renders through the emulated command processor.
+  virtual INativeGpu* native_gpu() const { return nullptr; }
 
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,

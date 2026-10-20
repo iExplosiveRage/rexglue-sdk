@@ -109,3 +109,10 @@ REXCVAR_DECLARE(bool, d3d12_readback_resolve);
 #endif  // REX_HAS_D3D12
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
+
+namespace rex::graphics {
+// gpu_native_renderer as latched once when the command processor starts (the
+// cvar itself changes live, from the settings menu too, but the renderer is
+// only chosen at startup).
+bool IsNativeRendererActive();
+}  // namespace rex::graphics

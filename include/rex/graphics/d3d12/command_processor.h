@@ -243,6 +243,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
 
  protected:
+  bool SupportsNativeRenderer() const override { return true; }
   bool SetupContext() override;
   void ShutdownContext() override;
 

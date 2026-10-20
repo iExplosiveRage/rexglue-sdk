@@ -76,6 +76,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+  // Native renderer: an interrupt on the calling guest thread, in the middle
+  // of its own code. The guest CPU number is set for the handler and put
+  // back, the host affinity is left alone, and the thread's registers are
+  // restored afterwards.
+  void DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu);
+
+  system::INativeGpu* native_gpu() const override;
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();

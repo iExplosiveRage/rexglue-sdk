@@ -344,7 +344,7 @@ bool RenderTargetCache::NativeRenderTargetsNoTransfers() const {
 }
 
 void RenderTargetCache::InitializeCommon() {
-  native_render_targets_ = REXCVAR_GET(gpu_native_renderer);
+  native_render_targets_ = IsNativeRendererActive();
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),

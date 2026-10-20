@@ -216,7 +216,7 @@ D3D12RenderTargetCache::Path D3D12RenderTargetCache::ChoosePath(
     path = Path::kHostRenderTargets;
   }
   // The native renderer only exists on top of host render targets.
-  if (REXCVAR_GET(gpu_native_renderer)) {
+  if (IsNativeRendererActive()) {
     path = Path::kHostRenderTargets;
   }
   return path;

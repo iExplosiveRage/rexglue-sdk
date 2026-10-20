@@ -368,6 +368,8 @@ class XThread : public XObject {
   void SetAffinity(uint32_t affinity);
   uint8_t active_cpu() const;
   void SetActiveCpu(uint8_t cpu_index);
+  // Only the guest-visible CPU number (KTHREAD and PCR), not the host affinity.
+  void SetGuestActiveCpu(uint8_t cpu_index);
 
   bool GetTLSValue(uint32_t slot, uint32_t* value_out);
   bool SetTLSValue(uint32_t slot, uint32_t value);

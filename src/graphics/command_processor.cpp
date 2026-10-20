@@ -102,7 +102,14 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   return ReadbackResolveMode::kDisabled;
 }
 
+// gpu_native_renderer as latched by the command processor (Initialize).
+std::atomic<bool> g_native_renderer_active{false};
+
 }  // namespace
+
+bool IsNativeRendererActive() {
+  return g_native_renderer_active.load(std::memory_order_acquire);
+}
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                    system::KernelState* kernel_state)
@@ -138,6 +145,17 @@ bool CommandProcessor::Initialize() {
     }
   }
 
+  // The renderer is chosen once, before the worker sets up the backend (the
+  // render target cache reads the latch there): changing the cvar later, from
+  // the settings menu too, takes effect at the next start.
+  native_mode_ = REXCVAR_GET(gpu_native_renderer) && SupportsNativeRenderer();
+  g_native_renderer_active.store(native_mode_, std::memory_order_release);
+  if (native_mode_) {
+    REXGPU_INFO("Native renderer: latched on (guest threads run the command buffer)");
+  } else if (REXCVAR_GET(gpu_native_renderer)) {
+    REXGPU_WARN("Native renderer unavailable with this backend, using the emulated path");
+  }
+
   worker_running_ = true;
   worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -153,6 +171,9 @@ bool CommandProcessor::Initialize() {
 void CommandProcessor::Shutdown() {
   worker_running_ = false;
   write_ptr_index_event_->Set();
+  if (native_mode_) {
+    BumpNativeRingProgress();
+  }
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
 }
@@ -161,6 +182,10 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
+  if (native_mode_) {
+    CallInThreadNative(std::move(fn));
+    return;
+  }
   if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
@@ -203,6 +228,19 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
+    return;
+  }
+
+  if (native_mode_) {
+    // Guest threads run the ring from here on; the worker only runs jobs and
+    // a watchdog.
+    {
+      std::lock_guard<std::mutex> lock(native_ready_mutex_);
+      native_ready_.store(true, std::memory_order_release);
+    }
+    native_ready_cv_.notify_all();
+    NativeWorkerLoop();
+    ShutdownContext();
     return;
   }
 
@@ -275,6 +313,11 @@ void CommandProcessor::Pause() {
   if (paused_) {
     return;
   }
+  if (native_mode_) {
+    // Guest threads render; suspending the worker wouldn't stop them.
+    REXGPU_WARN("CommandProcessor::Pause: not supported with the native renderer");
+    return;
+  }
   paused_ = true;
 
   thread::Fence fence;
@@ -345,6 +388,11 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
   write_ptr_index_ = value;
+  if (native_mode_) {
+    // The kicking thread drains right after this write; the worker isn't woken.
+    BumpNativeRingProgress();
+    return;
+  }
   write_ptr_index_event_->Set();
 }
 
@@ -1005,49 +1053,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t mask = reader->ReadAndSwap<uint32_t>();
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
-  bool is_memory = (wait_info & 0x10) != 0;
-
   bool matched = false;
   bool waited = false;
   do {
     uint32_t value = 0;
-    if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
-      value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
-    } else {
-      value = ReadRegisterValue(poll_reg_addr);
-      if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
-        MakeCoherent();
-        value = ReadRegisterValue(poll_reg_addr);
-      }
-    }
-    switch (wait_info & 0x7) {
-      case 0x0:  // Never.
-        matched = false;
-        break;
-      case 0x1:  // Less than reference.
-        matched = (value & mask) < ref;
-        break;
-      case 0x2:  // Less than or equal to reference.
-        matched = (value & mask) <= ref;
-        break;
-      case 0x3:  // Equal to reference.
-        matched = (value & mask) == ref;
-        break;
-      case 0x4:  // Not equal to reference.
-        matched = (value & mask) != ref;
-        break;
-      case 0x5:  // Greater than or equal to reference.
-        matched = (value & mask) >= ref;
-        break;
-      case 0x6:  // Greater than reference.
-        matched = (value & mask) > ref;
-        break;
-      case 0x7:  // Always
-        matched = true;
-        break;
-    }
+    matched = WaitRegMemMatches(wait_info, poll_reg_addr, ref, mask, &value);
     if (!matched) {
       if (!waited && rex::perf::IsLatencyWindowOpen()) {
         rex::perf::LatencyLog("cpwait_begin", poll_reg_addr, ref);
@@ -1088,6 +1098,52 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kExecuting);
 
   return true;
+}
+
+bool CommandProcessor::WaitRegMemMatches(uint32_t wait_info, uint32_t poll_reg_addr, uint32_t ref,
+                                         uint32_t mask, uint32_t* value_out) {
+  bool is_memory = (wait_info & 0x10) != 0;
+  bool matched = false;
+  uint32_t value = 0;
+  if (is_memory) {
+    value =
+        *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+    value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+  } else {
+    value = ReadRegisterValue(poll_reg_addr);
+    if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
+      MakeCoherent();
+      value = ReadRegisterValue(poll_reg_addr);
+    }
+  }
+  switch (wait_info & 0x7) {
+    case 0x0:  // Never.
+      matched = false;
+      break;
+    case 0x1:  // Less than reference.
+      matched = (value & mask) < ref;
+      break;
+    case 0x2:  // Less than or equal to reference.
+      matched = (value & mask) <= ref;
+      break;
+    case 0x3:  // Equal to reference.
+      matched = (value & mask) == ref;
+      break;
+    case 0x4:  // Not equal to reference.
+      matched = (value & mask) != ref;
+      break;
+    case 0x5:  // Greater than or equal to reference.
+      matched = (value & mask) >= ref;
+      break;
+    case 0x6:  // Greater than reference.
+      matched = (value & mask) > ref;
+      break;
+    case 0x7:  // Always
+      matched = true;
+      break;
+  }
+  *value_out = value;
+  return matched;
 }
 
 bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet,
