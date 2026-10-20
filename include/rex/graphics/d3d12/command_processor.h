@@ -805,6 +805,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // nullptr in this case) or a non-Xenos graphics or compute pipeline
   // (current_guest_pipeline_ is nullptr in this case).
   void* current_guest_pipeline_;
+  // The current draw's pipeline uses the ahead-of-time (XenosRecomp) shaders:
+  // their descriptor indices are a fixed table per fetch constant.
+  bool current_draw_aot_ = false;
+  // The descriptor index buffers hold an ahead-of-time table (the next draw
+  // rewrites them).
+  bool aot_indices_written_ = false;
   ID3D12PipelineState* current_external_pipeline_;
 
   // Currently bound graphics root signature.

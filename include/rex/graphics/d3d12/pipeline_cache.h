@@ -97,6 +97,16 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // Ahead-of-time shaders (XenosRecomp, gpu_native_aot_shaders): the pipeline
+  // to bind for a handle from ConfigurePipeline - its twin built from the
+  // precompiled DXIL when both stages are in the pack and the draw is eligible,
+  // otherwise the handle itself.
+  void* SelectAotPipeline(void* handle);
+  static bool IsAotPipelineHandle(void* handle) {
+    return reinterpret_cast<const Pipeline*>(handle)->is_aot;
+  }
+  bool HasAotShaders() const { return !aot_shaders_.empty(); }
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -290,7 +300,18 @@ class PipelineCache {
   static void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shader_out);
   const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
 
-  ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description);
+  struct AotShader {
+    uint32_t stage = 0;
+    uint32_t flags = 0;
+    uint32_t tex2d_mask = 0, tex3d_mask = 0, texcube_mask = 0;
+    std::vector<uint8_t> dxil;
+  };
+  // Precompiled shaders by guest microcode hash (Shader::ucode_data_hash).
+  std::unordered_map<uint64_t, AotShader> aot_shaders_;
+  void LoadAotShaders();
+  ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description,
+                                           const AotShader* aot_vertex = nullptr,
+                                           const AotShader* aot_pixel = nullptr);
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
@@ -350,6 +371,12 @@ class PipelineCache {
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;
     D3D12Shader::D3D12Translation* pending_pixel_shader = nullptr;
     uint8_t priority = 0;
+    // Ahead-of-time shaders: this is the precompiled-DXIL twin of a pipeline,
+    // or the twin of this pipeline (status 0 not tried, 1 created, -1 not
+    // eligible / failed).
+    bool is_aot = false;
+    std::atomic<int32_t> aot_status{0};
+    Pipeline* aot_twin = nullptr;
   };
   struct PipelineCreationPriorityComparator {
     bool operator()(const Pipeline* a, const Pipeline* b) const {

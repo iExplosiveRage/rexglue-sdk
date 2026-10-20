@@ -110,6 +110,13 @@ struct PipelineCacheStats {
   std::atomic<uint64_t> storage_shader_translations{0};
   std::atomic<uint64_t> storage_pipelines_created{0};
   std::atomic<uint64_t> storage_ms{0};
+  // Ahead-of-time (XenosRecomp) pipelines created, and pipelines not eligible.
+  std::atomic<uint64_t> aot_pipelines{0};
+  std::atomic<uint64_t> aot_ineligible{0};
+  std::atomic<uint64_t> storage_aot_pipelines{0};
+  // Draws with an ahead-of-time pipeline vs the runtime translation.
+  std::atomic<uint64_t> aot_draws{0};
+  std::atomic<uint64_t> runtime_draws{0};
 };
 PipelineCacheStats& GetPipelineCacheStats();
 

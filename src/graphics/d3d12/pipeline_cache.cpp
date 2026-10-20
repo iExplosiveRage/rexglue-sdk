@@ -52,6 +52,18 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
 
+REXCVAR_DEFINE_BOOL(gpu_native_aot_shaders, false, "GPU",
+                    "With gpu_native_renderer: draw with the shaders translated ahead of time by "
+                    "XenosRecomp (shader_pack folder next to the executable) where both stages are "
+                    "in the pack; the runtime DXBC translation is used for the rest (live)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(gpu_native_aot_filter, "", "GPU/Debug",
+                      "Testing: ahead-of-time shader pipelines to use - empty = all, "
+                      "'only:<hash>' = only pipelines with that VS or PS hash, "
+                      "'skip:<hash>,<hash>' = all but those")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(gpu_shader_storage_seed, true, "GPU",
                     "Merge the known shaders / pipelines shipped in the shader_seed folder next to the "
                     "executable into the shader cache at startup, so they are translated and "
@@ -176,6 +188,174 @@ PipelineCache::~PipelineCache() {
   Shutdown();
 }
 
+void PipelineCache::LoadAotShaders() {
+  aot_shaders_.clear();
+  if (!IsNativeRendererActive() ||
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
+    return;
+  }
+  const std::filesystem::path path =
+      rex::filesystem::GetExecutableFolder() / "shader_pack" / "424107DC.xaot";
+  FILE* f = rex::filesystem::OpenFile(path, "rb");
+  if (!f) {
+    return;
+  }
+  std::vector<uint8_t> data;
+  rex::filesystem::Seek(f, 0, SEEK_END);
+  data.resize(size_t(std::max<int64_t>(rex::filesystem::Tell(f), 0)));
+  rex::filesystem::Seek(f, 0, SEEK_SET);
+  data.resize(fread(data.data(), 1, data.size(), f));
+  fclose(f);
+  if (data.size() < 12 || std::memcmp(data.data(), "XAOT", 4)) {
+    return;
+  }
+  uint32_t version, count;
+  std::memcpy(&version, data.data() + 4, 4);
+  std::memcpy(&count, data.data() + 8, 4);
+  size_t pos = 12;
+  for (uint32_t i = 0; i < count && version == 1; ++i) {
+    if (pos + 32 > data.size()) {
+      break;
+    }
+    uint64_t hash;
+    uint32_t header[6];
+    std::memcpy(&hash, data.data() + pos, 8);
+    std::memcpy(header, data.data() + pos + 8, sizeof(header));
+    pos += 32;
+    const uint32_t size = header[5];
+    if (pos + size > data.size()) {
+      break;
+    }
+    AotShader& shader = aot_shaders_[hash];
+    shader.stage = header[0];
+    shader.flags = header[1];
+    shader.tex2d_mask = header[2];
+    shader.tex3d_mask = header[3];
+    shader.texcube_mask = header[4];
+    shader.dxil.assign(data.begin() + pos, data.begin() + pos + size);
+    pos += (size + 3) & ~size_t(3);
+  }
+  REXGPU_INFO("Ahead-of-time shaders: {} precompiled shaders loaded from {}", aot_shaders_.size(),
+              rex::path_to_utf8(path));
+}
+
+void* PipelineCache::SelectAotPipeline(void* handle) {
+  if (aot_shaders_.empty() || !handle || !REXCVAR_GET(gpu_native_aot_shaders)) {
+    return handle;
+  }
+  Pipeline* pipeline = reinterpret_cast<Pipeline*>(handle);
+  if (pipeline->is_aot) {
+    return handle;
+  }
+  int32_t status = pipeline->aot_status.load(std::memory_order_acquire);
+  if (!status) {
+    status = -1;
+    const PipelineRuntimeDescription& runtime_description = pipeline->description;
+    const PipelineDescription& description = runtime_description.description;
+    const AotShader* aot_vertex = nullptr;
+    const AotShader* aot_pixel = nullptr;
+    auto vs_it = aot_shaders_.find(description.vertex_shader_hash);
+    if (vs_it != aot_shaders_.end() && vs_it->second.stage == 0) {
+      aot_vertex = &vs_it->second;
+    }
+    bool eligible = aot_vertex && !runtime_description.geometry_shader &&
+                    runtime_description.vertex_shader &&
+                    runtime_description.vertex_shader->is_valid() &&
+                    DxbcShaderTranslator::Modification(description.vertex_shader_modification)
+                            .vertex.host_vertex_shader_type == Shader::HostVertexShaderType::kVertex;
+    if (eligible && description.pixel_shader_hash) {
+      auto ps_it = aot_shaders_.find(description.pixel_shader_hash);
+      if (ps_it != aot_shaders_.end() && ps_it->second.stage == 1 &&
+          runtime_description.pixel_shader && runtime_description.pixel_shader->is_valid()) {
+        aot_pixel = &ps_it->second;
+        // The translator also binds the signed views of every fetch constant
+        // that may have signed components; the pack reads only the unsigned
+        // ones (kSigned components are a known gap, unused by this game).
+      } else {
+        eligible = false;
+      }
+    }
+    if (eligible && !static_cast<const D3D12Shader&>(runtime_description.vertex_shader->shader())
+                         .GetTextureBindingsAfterTranslation()
+                         .empty()) {
+      eligible = false;  // vertex textures: not in the pack
+    }
+    if (eligible) {
+      ID3D12PipelineState* state = CreateD3D12Pipeline(runtime_description, aot_vertex, aot_pixel);
+      if (state) {
+        Pipeline* twin = new Pipeline;
+        std::memcpy(&twin->description, &runtime_description, sizeof(runtime_description));
+        twin->root_signature.store(pipeline->root_signature.load(std::memory_order_acquire),
+                                   std::memory_order_release);
+        twin->state.store(state, std::memory_order_release);
+        twin->is_aot = true;
+        pipeline->aot_twin = twin;
+        status = 1;
+        rex::perf::GetPipelineCacheStats().aot_pipelines.fetch_add(1, std::memory_order_relaxed);
+        REXGPU_INFO("Ahead-of-time shaders: pipeline VS {:016X} PS {:016X}",
+                    description.vertex_shader_hash, description.pixel_shader_hash);
+      } else {
+        REXGPU_WARN("Ahead-of-time shaders: pipeline VS {:016X} PS {:016X} failed, using the "
+                    "runtime translation",
+                    description.vertex_shader_hash, description.pixel_shader_hash);
+      }
+    } else {
+      if (rex::perf::GetPipelineCacheStats().aot_ineligible.fetch_add(1, std::memory_order_relaxed) <
+          24) {
+        REXGPU_INFO(
+            "Ahead-of-time shaders: not eligible VS {:016X} (pack {}) PS {:016X} (pack {}) gs {} "
+            "host vs type {} vs valid {} ps valid {} vs textures {}",
+            description.vertex_shader_hash, aot_vertex != nullptr, description.pixel_shader_hash,
+            aot_shaders_.count(description.pixel_shader_hash) != 0,
+            runtime_description.geometry_shader != nullptr,
+            uint32_t(DxbcShaderTranslator::Modification(description.vertex_shader_modification)
+                         .vertex.host_vertex_shader_type),
+            runtime_description.vertex_shader && runtime_description.vertex_shader->is_valid(),
+            runtime_description.pixel_shader && runtime_description.pixel_shader->is_valid(),
+            runtime_description.vertex_shader
+                ? static_cast<const D3D12Shader&>(runtime_description.vertex_shader->shader())
+                      .GetTextureBindingsAfterTranslation()
+                      .size()
+                : 0);
+      }
+    }
+    pipeline->aot_status.store(status, std::memory_order_release);
+  }
+  if (status != 1) {
+    return handle;
+  }
+  // gpu_native_aot_filter (testing).
+  thread_local std::string filter_text;
+  thread_local bool filter_only = false;
+  thread_local std::vector<uint64_t> filter_hashes;
+  const std::string& filter = REXCVAR_GET(gpu_native_aot_filter);
+  if (filter != filter_text) {
+    filter_text = filter;
+    filter_hashes.clear();
+    filter_only = filter.rfind("only:", 0) == 0;
+    size_t pos = filter.find(':');
+    while (pos != std::string::npos && pos + 1 < filter.size()) {
+      const size_t next = filter.find(',', pos + 1);
+      filter_hashes.push_back(std::strtoull(
+          filter.substr(pos + 1, next == std::string::npos ? std::string::npos : next - pos - 1)
+              .c_str(),
+          nullptr, 16));
+      pos = next;
+    }
+  }
+  if (!filter_text.empty()) {
+    const PipelineDescription& description = pipeline->description.description;
+    bool listed = false;
+    for (uint64_t hash : filter_hashes) {
+      listed |= hash == description.vertex_shader_hash || hash == description.pixel_shader_hash;
+    }
+    if (listed != filter_only) {
+      return handle;
+    }
+  }
+  return pipeline->aot_twin;
+}
+
 bool PipelineCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
 
@@ -260,6 +440,12 @@ void PipelineCache::Shutdown() {
     if (state) {
       state->Release();
     }
+    if (Pipeline* twin = it.second->aot_twin) {
+      if (ID3D12PipelineState* twin_state = twin->state.load(std::memory_order_acquire)) {
+        twin_state->Release();
+      }
+      delete twin;
+    }
     delete it.second;
   }
   pipelines_.clear();
@@ -287,6 +473,9 @@ void PipelineCache::Shutdown() {
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  if (aot_shaders_.empty()) {
+    LoadAotShaders();
+  }
 
   auto shader_storage_root = cache_root / "shaders";
   // For files that can be moved between different hosts.
@@ -819,11 +1008,20 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
            pipeline_storage_file_);
   }
 
+  // Ahead-of-time shaders: their pipelines too, at load time.
+  if (!aot_shaders_.empty() && REXCVAR_GET(gpu_native_aot_shaders)) {
+    for (auto& it : pipelines_) {
+      if (it.second->state.load(std::memory_order_acquire)) {
+        SelectAotPipeline(it.second);
+      }
+    }
+  }
   {
     // What the warm-up translated / created (the rest happens at first use).
     rex::perf::PipelineCacheStats& stats = rex::perf::GetPipelineCacheStats();
     stats.storage_shader_translations.store(stats.shader_translations.load());
     stats.storage_pipelines_created.store(stats.pipelines_created.load());
+    stats.storage_aot_pipelines.store(stats.aot_pipelines.load());
   }
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
@@ -2796,7 +2994,8 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 }
 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
-    const PipelineRuntimeDescription& runtime_description) {
+    const PipelineRuntimeDescription& runtime_description, const AotShader* aot_vertex,
+    const AotShader* aot_pixel) {
   rex::perf::GetPipelineCacheStats().pipelines_created.fetch_add(1, std::memory_order_relaxed);
   const PipelineDescription& description = runtime_description.description;
 
@@ -2928,6 +3127,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
     state_desc.VS.pShaderBytecode = runtime_description.vertex_shader->translated_binary().data();
     state_desc.VS.BytecodeLength = runtime_description.vertex_shader->translated_binary().size();
+    if (aot_vertex) {
+      state_desc.VS.pShaderBytecode = aot_vertex->dxil.data();
+      state_desc.VS.BytecodeLength = aot_vertex->dxil.size();
+    }
     PipelinePrimitiveTopologyType primitive_topology_type =
         PipelinePrimitiveTopologyType(description.primitive_topology_type_or_tessellation_mode);
     switch (primitive_topology_type) {
@@ -2956,6 +3159,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
     state_desc.PS.pShaderBytecode = runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength = runtime_description.pixel_shader->translated_binary().size();
+    if (aot_pixel) {
+      state_desc.PS.pShaderBytecode = aot_pixel->dxil.data();
+      state_desc.PS.BytecodeLength = aot_pixel->dxil.size();
+    }
   } else if (edram_rov_used) {
     state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
     state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();

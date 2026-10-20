@@ -3268,6 +3268,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
   }
+  // Ahead-of-time shaders (gpu_native_aot_shaders): the precompiled twin.
+  current_draw_aot_ = false;
+  if (pipeline_cache_->HasAotShaders()) {
+    pipeline_handle = pipeline_cache_->SelectAotPipeline(pipeline_handle);
+    current_draw_aot_ = PipelineCache::IsAotPipelineHandle(pipeline_handle);
+    (current_draw_aot_ ? rex::perf::GetPipelineCacheStats().aot_draws
+                       : rex::perf::GetPipelineCacheStats().runtime_draws)
+        .fetch_add(1, std::memory_order_relaxed);
+  }
 
   // DLSS upscaling: draws into the render target the scene was taken from
   // (the HUD) are drawn again into DLSS's output-size picture - those that
@@ -5655,6 +5664,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     // Bindless descriptors path.
     //
 
+    // Ahead-of-time shaders read a different (fixed) table: rebuild both
+    // stages' indices for this draw and the next one.
+    if (current_draw_aot_ || aot_indices_written_) {
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+    }
+
     // Check if need to write new descriptor indices.
     // Samplers have already been checked.
     if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
@@ -5837,6 +5853,87 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
       current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
+    }
+
+    aot_indices_written_ = false;
+    if (current_draw_aot_) {
+      // XenosRecomp-BL layout (b4): uint tex2d[32], tex3d[32], texcube[32],
+      // sampler[32] by fetch constant, then uint4 param_gen (.x = the PS
+      // register receiving it, or ~0).
+      auto write_aot_table = [&](const std::vector<D3D12Shader::TextureBinding>* textures,
+                                 const std::vector<D3D12Shader::SamplerBinding>* samplers,
+                                 const std::vector<uint32_t>& sampler_indices,
+                                 uint32_t param_gen_register,
+                                 ConstantBufferBinding& binding) -> bool {
+        uint32_t* table = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+            frame_current_, 528, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+            &binding.address));
+        if (!table) {
+          return false;
+        }
+        std::memset(table, 0, 528);
+        if (textures) {
+          for (const D3D12Shader::TextureBinding& texture : *textures) {
+            if (texture.is_signed) {
+              continue;
+            }
+            uint32_t array_offset = 0;
+            switch (texture.dimension) {
+              case xenos::FetchOpDimension::k3DOrStacked:
+                array_offset = 32;
+                break;
+              case xenos::FetchOpDimension::kCube:
+                array_offset = 64;
+                break;
+              default:
+                break;
+            }
+            table[array_offset + (texture.fetch_constant & 31)] =
+                texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
+                uint32_t(SystemBindlessView::kUnboundedSRVsStart);
+          }
+        }
+        if (samplers) {
+          // One sampler per fetch constant: the fetch constant's own filters
+          // where the shader has such a binding, else its first one.
+          uint32_t written = 0;
+          for (size_t pass = 0; pass < 2; ++pass) {
+            for (size_t i = 0; i < samplers->size(); ++i) {
+              const D3D12Shader::SamplerBinding& sampler = (*samplers)[i];
+              const uint32_t slot = sampler.fetch_constant & 31;
+              const bool plain = sampler.mag_filter == xenos::TextureFilter::kUseFetchConst &&
+                                 sampler.min_filter == xenos::TextureFilter::kUseFetchConst &&
+                                 sampler.mip_filter == xenos::TextureFilter::kUseFetchConst &&
+                                 sampler.aniso_filter == xenos::AnisoFilter::kUseFetchConst;
+              if ((written >> slot) & 1 || (!pass && !plain)) {
+                continue;
+              }
+              table[96 + slot] = sampler_indices[i];
+              written |= uint32_t(1) << slot;
+            }
+          }
+        }
+        table[128] = param_gen_register;
+        return true;
+      };
+      uint32_t param_gen_register = UINT32_MAX;
+      if (pixel_shader) {
+        const RegisterFile& aot_regs = *register_file_;
+        pixel_shader->GetInterpolatorInputMask(aot_regs.Get<reg::SQ_PROGRAM_CNTL>(),
+                                               aot_regs.Get<reg::SQ_CONTEXT_MISC>(),
+                                               param_gen_register);
+      }
+      if (!write_aot_table(&textures_vertex, &samplers_vertex,
+                           current_sampler_bindless_indices_vertex_, UINT32_MAX,
+                           cbuffer_binding_descriptor_indices_vertex_) ||
+          !write_aot_table(textures_pixel, samplers_pixel, current_sampler_bindless_indices_pixel_,
+                           param_gen_register, cbuffer_binding_descriptor_indices_pixel_)) {
+        return false;
+      }
+      current_graphics_root_up_to_date_ &=
+          ~((1u << kRootParameter_Bindless_DescriptorIndicesVertex) |
+            (1u << kRootParameter_Bindless_DescriptorIndicesPixel));
+      aot_indices_written_ = true;
     }
   } else {
     //
