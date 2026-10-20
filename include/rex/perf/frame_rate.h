@@ -113,6 +113,18 @@ struct PipelineCacheStats {
 };
 PipelineCacheStats& GetPipelineCacheStats();
 
+// Native render target pool (gpu_native_rt_pool): render target updates that
+// took the surface-keyed fast path vs the EDRAM ownership map, and direct
+// resolves whose source came from the pool vs the ownership walk.
+struct RenderTargetPoolStats {
+  std::atomic<uint64_t> pool_updates{0};
+  std::atomic<uint64_t> edram_updates{0};
+  std::atomic<uint64_t> resolve_pool_hits{0};
+  std::atomic<uint64_t> resolve_pool_misses{0};
+  std::atomic<uint64_t> ownership_changes{0};
+};
+RenderTargetPoolStats& GetRenderTargetPoolStats();
+
 // GPU time per part of a frame, from timestamp queries (gpu_profile debug
 // command). Off unless a measurement is running.
 enum class GpuPass : uint32_t {

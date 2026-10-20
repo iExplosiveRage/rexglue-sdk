@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include <rex/perf/frame_rate.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -343,6 +344,26 @@ bool RenderTargetCache::NativeRenderTargetsNoTransfers() const {
   return native_render_targets_ && !REXCVAR_GET(gpu_native_edram_transfers);
 }
 
+RenderTargetCache::RenderTarget* RenderTargetCache::FindNativePoolRenderTarget(
+    uint32_t base_tiles, uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples,
+    bool is_depth, uint32_t guest_format) const {
+  RenderTargetKey key;
+  key.base_tiles = base_tiles;
+  key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+  key.msaa_samples = msaa_samples;
+  key.is_depth = is_depth ? 1 : 0;
+  key.resource_format =
+      is_depth ? guest_format
+               : uint32_t(GetColorResourceFormat(xenos::ColorRenderTargetFormat(guest_format)));
+  auto it = render_targets_.find(key);
+  return it != render_targets_.end() ? it->second : nullptr;
+}
+
+bool RenderTargetCache::NativeRenderTargetPoolActive() const {
+  return native_render_targets_ && REXCVAR_GET(gpu_native_rt_pool) &&
+         GetPath() == Path::kHostRenderTargets;
+}
+
 void RenderTargetCache::InitializeCommon() {
   native_render_targets_ = IsNativeRendererActive();
   assert_true(ownership_ranges_.empty());
@@ -353,6 +374,7 @@ void RenderTargetCache::InitializeCommon() {
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
   ownership_ranges_.clear();
+  ++ownership_epoch_;
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                               std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -697,15 +719,49 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
-  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
-    const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
-    uint32_t rt_bit_index = rt_base_index.second;
-    // Native renderer: render targets keep their own contents, nothing is
-    // copied between render targets sharing EDRAM ranges.
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    (interlock_barrier_only || NativeRenderTargetsNoTransfers())
-                        ? nullptr
-                        : &last_update_transfers_[rt_bit_index]);
+  // Native render target pool: the same surfaces as the last update that went
+  // through the EDRAM map, each within the range it already claimed, and no
+  // ownership change anywhere since - the map already says exactly this, so
+  // ChangeOwnership would neither move ownership nor transfer anything. Any
+  // other surface's draw, clear or resolve on the EDRAM bumps the epoch and
+  // sends the next update through the map (aliases keep their transfers).
+  bool pool_hit = false;
+  const bool pool_active = !interlock_barrier_only && NativeRenderTargetPoolActive();
+  if (pool_active && ownership_epoch_ == native_pool_epoch_ &&
+      depth_and_color_rts_used_bits == native_pool_used_bits_) {
+    pool_hit = true;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      if (rt_keys[rt_bit_index].key != native_pool_keys_[rt_bit_index] ||
+          rt_lengths_tiles[i] > native_pool_lengths_[rt_bit_index]) {
+        pool_hit = false;
+        break;
+      }
+    }
+  }
+  if (pool_hit) {
+    rex::perf::GetRenderTargetPoolStats().pool_updates.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+      uint32_t rt_bit_index = rt_base_index.second;
+      // Native renderer: render targets keep their own contents, nothing is
+      // copied between render targets sharing EDRAM ranges.
+      ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                      (interlock_barrier_only || NativeRenderTargetsNoTransfers())
+                          ? nullptr
+                          : &last_update_transfers_[rt_bit_index]);
+    }
+    if (pool_active) {
+      rex::perf::GetRenderTargetPoolStats().edram_updates.fetch_add(1, std::memory_order_relaxed);
+      native_pool_used_bits_ = depth_and_color_rts_used_bits;
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+        native_pool_keys_[rt_bit_index] = rt_keys[rt_bit_index].key;
+        native_pool_lengths_[rt_bit_index] = rt_lengths_tiles[i];
+      }
+      native_pool_epoch_ = ownership_epoch_;
+    }
   }
 
   if (interlock_barrier_only) {
@@ -1460,6 +1516,10 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   assert_true(length_tiles <= xenos::kEdramTileCount);
   if (length_tiles == 0) {
     return;
+  }
+  ++ownership_epoch_;
+  if (native_render_targets_) {
+    rex::perf::GetRenderTargetPoolStats().ownership_changes.fetch_add(1, std::memory_order_relaxed);
   }
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();

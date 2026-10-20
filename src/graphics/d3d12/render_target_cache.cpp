@@ -21,6 +21,7 @@
 #include <tuple>
 #include <utility>
 
+#include <rex/perf/frame_rate.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
@@ -6038,8 +6039,38 @@ bool D3D12RenderTargetCache::TryDirectResolveToTexture(
   // One render target with the same pitch owning the whole area.
   uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 direct_texture_rectangles_);
+  // Native render target pool: the source surface by its key (base, pitch,
+  // MSAA, format), accepted when it alone owns the whole span (pitch padding
+  // included - stricter than the per-row walk below, never looser).
+  RenderTarget* pool_source = nullptr;
+  if (NativeRenderTargetPoolActive() && dump_rows && dump_pitch) {
+    const uint32_t base_tiles =
+        depth24 ? resolve_info.depth_original_base : resolve_info.color_original_base;
+    RenderTarget* found = FindNativePoolRenderTarget(base_tiles, dump_pitch, edram_info.msaa_samples,
+                                                     depth24, edram_info.format);
+    if (found) {
+      const uint32_t start_relative =
+          (dump_base + xenos::kEdramTileCount - base_tiles) & (xenos::kEdramTileCount - 1);
+      const uint32_t length = (dump_rows - 1) * dump_pitch + dump_row_length_used;
+      if (GetSingleOwner(base_tiles, start_relative, length) == found) {
+        pool_source = found;
+      }
+    }
+    if (pool_source) {
+      rex::perf::GetRenderTargetPoolStats().resolve_pool_hits.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+    } else {
+      rex::perf::GetRenderTargetPoolStats().resolve_pool_misses.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+  }
+  if (pool_source) {
+    direct_texture_rectangles_.clear();
+    direct_texture_rectangles_.emplace_back(pool_source, 0, dump_rows, 0, 0);
+  } else {
+    GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                   direct_texture_rectangles_);
+  }
   if (direct_texture_rectangles_.size() != 1) {
     if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
       REXGPU_INFO("DIRECT RESOLVE refused: {} owner rectangles", direct_texture_rectangles_.size());

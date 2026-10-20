@@ -30,6 +30,14 @@ REXCVAR_DEFINE_BOOL(gpu_native_edram_transfers, true, "GPU/Debug",
                     "With gpu_native_renderer: copy between render targets sharing EDRAM ranges "
                     "like the emulated path (false skips them: faster, but wrong for effects "
                     "that read one render target through another; live)");
+// Native render target pool: with gpu_native_renderer, render targets are
+// looked up by guest surface (EDRAM base, pitch, MSAA, format) - a draw that
+// binds the same surfaces as the last one, with no other surface having
+// touched the EDRAM since, skips the EDRAM ownership map; direct resolves find
+// their source surface by key. Live, for A/B.
+REXCVAR_DEFINE_BOOL(gpu_native_rt_pool, true, "GPU",
+                    "With gpu_native_renderer: render targets looked up by guest surface "
+                    "(skips the EDRAM ownership map while nothing aliases; live)");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");

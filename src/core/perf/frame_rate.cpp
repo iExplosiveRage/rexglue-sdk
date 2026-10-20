@@ -220,6 +220,11 @@ RenderInfo GetRenderInfo() {
   return info;
 }
 
+RenderTargetPoolStats& GetRenderTargetPoolStats() {
+  static RenderTargetPoolStats stats;
+  return stats;
+}
+
 PipelineCacheStats& GetPipelineCacheStats() {
   static PipelineCacheStats stats;
   return stats;

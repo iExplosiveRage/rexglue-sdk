@@ -221,6 +221,16 @@ class RenderTargetCache {
   // gpu_native_renderer: no EDRAM ownership transfers between render targets.
   bool native_render_targets_ = false;
   bool NativeRenderTargetsNoTransfers() const;
+  // gpu_native_rt_pool: render targets by guest surface (see Update).
+  bool NativeRenderTargetPoolActive() const;
+  // Bumped by every EDRAM ownership change (and when all render targets go).
+  uint64_t ownership_epoch_ = 0;
+  // The surfaces the last EDRAM-map update bound, by bit (0 depth, 1-4 color),
+  // the tiles each claimed, and the ownership epoch after it.
+  uint32_t native_pool_keys_[5] = {};
+  uint32_t native_pool_lengths_[5] = {};
+  uint32_t native_pool_used_bits_ = 0;
+  uint64_t native_pool_epoch_ = UINT64_MAX;
   // May be called from the destructor, or from the implementation shutdown to
   // destroy all render targets before destroying what they depend on in the
   // implementation.
@@ -604,6 +614,12 @@ class RenderTargetCache {
   // To be called by the implementation when interlocked writes to all of the
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
+
+  // The existing render target of a guest surface (no creation), for the
+  // native render target pool (gpu_native_rt_pool).
+  RenderTarget* FindNativePoolRenderTarget(uint32_t base_tiles, uint32_t pitch_tiles_at_32bpp,
+                                           xenos::MsaaSamples msaa_samples, bool is_depth,
+                                           uint32_t guest_format) const;
 
  private:
   const RegisterFile& register_file_;
