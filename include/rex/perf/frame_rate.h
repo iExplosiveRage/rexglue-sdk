@@ -57,6 +57,8 @@ void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32
 // Rendering below 1x: the percent of the 1x resolution the game is drawn at
 // (100 = off).
 void SetDrawResolutionPercent(uint32_t percent);
+// The native renderer was latched on at startup (gpu_native_renderer).
+void SetNativeRendererActive(bool active);
 
 struct RenderInfo {
   uint32_t frontbuffer_width = 0;
@@ -66,6 +68,7 @@ struct RenderInfo {
   uint32_t requested_scale_x = 0;
   uint32_t requested_scale_y = 0;
   uint32_t percent = 100;
+  bool native_renderer = false;
 };
 RenderInfo GetRenderInfo();
 

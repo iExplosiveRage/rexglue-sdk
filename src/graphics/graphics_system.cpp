@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <functional>
 #include <memory>
@@ -30,6 +31,7 @@
 #include <rex/perf/frame_rate.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 #include <rex/net/session.h>
 #include <rex/ppc/context.h>
 #include <rex/stream.h>
@@ -483,29 +485,62 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
-void GraphicsSystem::DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu) {
+uint32_t GraphicsSystem::DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu) {
   if (!interrupt_callback_) {
-    return;
+    return 0;
   }
   auto thread = system::XThread::GetCurrentThread();
   if (!thread || !thread->is_guest_thread()) {
     DispatchInterruptCallback(source, cpu);
-    return;
+    return 0;
   }
   if (cpu == 0xFFFFFFFF) {
     cpu = 2;
   }
   PPCContext* context = thread->thread_state()->context();
   // The handler runs on this thread's context: everything the code that was
-  // interrupted had in its registers comes back afterwards.
-  const PPCContext saved_context = *context;
+  // interrupted had in its registers comes back afterwards. Byte copies, so
+  // the check below compares exactly what was saved.
+  PPCContext saved_context;
+  std::memcpy(&saved_context, context, sizeof(PPCContext));
+  // The host FP control word (rounding, flush-to-zero) isn't in the copy: the
+  // recompiled code caches it in fpscr and only sets it again when the cached
+  // value says it changed, so the handler's changes would stay.
+  const uint32_t saved_host_fp = context->fpscr.getcsr();
+  uint8_t* pcr = memory_->TranslateVirtual(static_cast<uint32_t>(context->r13.u64));
+  const uint32_t saved_tls = memory::load_and_swap<uint32_t>(pcr);
   const uint8_t saved_cpu = thread->active_cpu();
   thread->SetGuestActiveCpu(uint8_t(cpu));
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
   thread->SetGuestActiveCpu(saved_cpu);
-  *context = saved_context;
+  std::memcpy(context, &saved_context, sizeof(PPCContext));
+  constexpr uint32_t kHostFpGuestBits = ppc::FPSCRRegister::GuestMask;
+  context->fpscr.setcsr((context->fpscr.getcsr() & ~kHostFpGuestBits) |
+                        (saved_host_fp & kHostFpGuestBits));
+  // ExecuteInterrupt puts the TLS pointer back, except when the handler
+  // couldn't run.
+  if (memory::load_and_swap<uint32_t>(pcr) != saved_tls) {
+    memory::store_and_swap<uint32_t>(pcr, saved_tls);
+  }
+
+  // What the interrupted code sees now, against what it had (expected 0).
+  uint32_t mismatches = 0;
+  if (std::memcmp(context, &saved_context, sizeof(PPCContext)) != 0) {
+    mismatches |= 1;
+  }
+  if ((context->fpscr.getcsr() & kHostFpGuestBits) != (saved_host_fp & kHostFpGuestBits)) {
+    mismatches |= 2;
+  }
+  if (memory::load_and_swap<uint32_t>(pcr) != saved_tls) {
+    mismatches |= 4;
+  }
+  if (thread->active_cpu() != saved_cpu) {
+    mismatches |= 8;
+  }
+  assert_zero(mismatches);
+  return mismatches;
 }
 
 system::INativeGpu* GraphicsSystem::native_gpu() const {

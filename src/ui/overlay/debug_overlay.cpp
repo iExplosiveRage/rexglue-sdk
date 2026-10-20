@@ -212,6 +212,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   if (std::string upscaler = UpscalerText(); !upscaler.empty()) {
     rows.emplace_back("Upscaler", std::move(upscaler));
   }
+  // The native renderer, when this session started with it (the setting
+  // itself applies at the next start).
+  if (render.native_renderer) {
+    rows.emplace_back("Renderer", "Native");
+  }
   // Presents per second and their 1% low (the 99th percentile time between
   // presents) over the latest ones (up to 255).
   if (present_count >= 10) {

@@ -448,17 +448,56 @@ void CommandProcessor::NativeDispatchInterrupt(uint32_t cpu_mask, bool on_worker
   if (!graphics_system_) {
     return;
   }
+  // The XDK's InsertCallback leaves the callback in SCRATCH_REG4 and, once
+  // the interrupt is through, 0x0BADF00D; its handler reads the write-back
+  // copy and traps (then calls it) on 0x0BADF00D. Seeing it here means an
+  // interrupt out of order: run the handler without a callback (it still
+  // clears its CPU bit, so the ring's wait for that goes on) and count it.
+  constexpr uint32_t kNoCallback = 0x0BADF00D;
+  constexpr uint32_t kCallbackScratch = 4;
+  uint8_t* callback_copy = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> backend_lock(native_backend_mutex_);
+    const auto& regs = *register_file_;
+    if (regs.values[XE_GPU_REG_SCRATCH_REG0 + kCallbackScratch] == kNoCallback &&
+        (regs.values[XE_GPU_REG_SCRATCH_UMSK] & (uint32_t(1) << kCallbackScratch))) {
+      callback_copy = memory_->TranslatePhysical(regs.values[XE_GPU_REG_SCRATCH_ADDR] +
+                                                 kCallbackScratch * 4);
+    }
+  }
+  if (callback_copy) {
+    memory::store_and_swap<uint32_t>(callback_copy, 0);
+    REXGPU_ERROR("Native renderer: INTERRUPT with the callback already 0x0BADF00D, dispatched "
+                 "without it");
+  }
   for (uint32_t n = 0; n < 6; ++n) {
     if (!(cpu_mask & (uint32_t(1) << n))) {
       continue;
     }
+    uint32_t mismatches = 0;
     if (on_worker) {
       graphics_system_->DispatchInterruptCallback(1, n);
     } else {
-      graphics_system_->DispatchInterruptOnGuestThread(1, n);
+      mismatches = graphics_system_->DispatchInterruptOnGuestThread(1, n);
+    }
+    if (mismatches) {
+      static std::atomic<uint32_t> logged{0};
+      if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        REXGPU_ERROR("Native renderer: the interrupted thread's state differs after an "
+                     "interrupt (mask {:X})",
+                     mismatches);
+      }
     }
     std::lock_guard<std::mutex> stats_lock(native_stats_mutex_);
     ++(on_worker ? native_stats_.interrupts_worker : native_stats_.interrupts);
+    if (mismatches) {
+      ++native_stats_.interrupt_restore_mismatches;
+    }
+  }
+  if (callback_copy) {
+    memory::store_and_swap<uint32_t>(callback_copy, kNoCallback);
+    std::lock_guard<std::mutex> stats_lock(native_stats_mutex_);
+    ++native_stats_.interrupt_badf00d_skips;
   }
 }
 

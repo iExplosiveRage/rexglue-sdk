@@ -78,9 +78,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
   // Native renderer: an interrupt on the calling guest thread, in the middle
   // of its own code. The guest CPU number is set for the handler and put
-  // back, the host affinity is left alone, and the thread's registers are
-  // restored afterwards.
-  void DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu);
+  // back, the host affinity is left alone, and the thread's registers, host
+  // FP control word and TLS pointer are restored afterwards. Returns what
+  // still differed after the restore (bits: 1 registers, 2 host FP control,
+  // 4 TLS pointer, 8 CPU number; expected 0, asserted in debug builds).
+  uint32_t DispatchInterruptOnGuestThread(uint32_t source, uint32_t cpu);
 
   system::INativeGpu* native_gpu() const override;
 

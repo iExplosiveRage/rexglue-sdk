@@ -17,9 +17,11 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(gpu_native_renderer, false, "GPU",
-                    "Native renderer (experimental): host render targets per surface with no "
-                    "EDRAM ownership transfers, resolves as host copies, clears as host clears; "
-                    "the game's D3D calls are hooked at the API level. Off = the emulated path.")
+                    "Native renderer (experimental): the game's own threads run its GPU commands "
+                    "at the D3D call that wrote them, with host render targets that need no "
+                    "EDRAM copies between them, instead of an emulated command processor "
+                    "thread. Needs a title with native renderer hooks. Applies at the next "
+                    "start. Off = the emulated path.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_native_edram_transfers, false, "GPU/Debug",
                     "With gpu_native_renderer: still copy between render targets sharing EDRAM "

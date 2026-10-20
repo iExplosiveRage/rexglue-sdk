@@ -459,6 +459,8 @@ void HitchStopCommand() {
 
 REXCVAR_DEFINE_COMMAND(quick_menu_toggle, rex::ReXApp::ToggleQuickMenuCommand, "Debug",
                        "Open or close the settings menu (F1)");
+REXCVAR_DEFINE_COMMAND(config_save, rex::ReXApp::SaveConfigCommand, "Debug",
+                       "Write the settings file now, as the settings menu does after a change");
 namespace rex {
 namespace {
 // gpu_state: what the GPU (command processor) thread is doing right now - for
@@ -1028,6 +1030,14 @@ std::atomic<ReXApp*> g_quick_menu_app{nullptr};
 void ReXApp::ToggleQuickMenuCommand() {
   if (ReXApp* app = g_quick_menu_app.load()) {
     app->app_context().CallInUIThreadDeferred([app]() { app->ToggleQuickMenu(); });
+  }
+}
+
+void ReXApp::SaveConfigCommand() {
+  // Console and pipe lines run on the UI thread, like the menu's saves.
+  if (ReXApp* app = g_quick_menu_app.load()) {
+    rex::cvar::SaveConfig(app->config_path_);
+    REXLOG_INFO("config_save: {}", app->config_path_.string());
   }
 }
 

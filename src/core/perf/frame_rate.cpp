@@ -36,6 +36,7 @@ std::atomic<uint32_t> g_scale_y{0};
 std::atomic<uint32_t> g_requested_scale_x{0};
 std::atomic<uint32_t> g_requested_scale_y{0};
 std::atomic<uint32_t> g_percent{100};
+std::atomic<bool> g_native_renderer{false};
 // Host presents (UI or guest output thread, one at a time): times by present
 // number, and swap -> present latencies of new guest frames.
 std::array<std::atomic<int64_t>, kSwapTimeHistory> g_present_times_ns{};
@@ -193,6 +194,10 @@ void SetDrawResolutionPercent(uint32_t percent) {
   g_percent.store(percent ? percent : 100, std::memory_order_relaxed);
 }
 
+void SetNativeRendererActive(bool active) {
+  g_native_renderer.store(active, std::memory_order_relaxed);
+}
+
 RenderInfo GetRenderInfo() {
   RenderInfo info;
   info.percent = g_percent.load(std::memory_order_relaxed);
@@ -202,6 +207,7 @@ RenderInfo GetRenderInfo() {
   info.scale_y = g_scale_y.load(std::memory_order_relaxed);
   info.requested_scale_x = g_requested_scale_x.load(std::memory_order_relaxed);
   info.requested_scale_y = g_requested_scale_y.load(std::memory_order_relaxed);
+  info.native_renderer = g_native_renderer.load(std::memory_order_relaxed);
   return info;
 }
 

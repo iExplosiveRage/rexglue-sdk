@@ -95,6 +95,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// The quick_menu_toggle debug command: opens / closes the settings menu of
   /// the running app (tests through the command pipe).
   static void ToggleQuickMenuCommand();
+  /// The config_save debug command: writes the settings file now, as the
+  /// settings menu does after a change (tests set a cvar through the pipe,
+  /// save, restart).
+  static void SaveConfigCommand();
 
  protected:
   ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo ppc_info,

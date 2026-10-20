@@ -151,6 +151,8 @@ bool CommandProcessor::Initialize() {
   native_mode_ = REXCVAR_GET(gpu_native_renderer) && SupportsNativeRenderer();
   g_native_renderer_active.store(native_mode_, std::memory_order_release);
   if (native_mode_) {
+    // The F3 overlay shows the renderer this session runs, not the setting.
+    rex::perf::SetNativeRendererActive(true);
     REXGPU_INFO("Native renderer: latched on (guest threads run the command buffer)");
   } else if (REXCVAR_GET(gpu_native_renderer)) {
     REXGPU_WARN("Native renderer unavailable with this backend, using the emulated path");

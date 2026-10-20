@@ -57,6 +57,13 @@ struct NativeGpuStats {
   uint64_t watchdog_drains = 0;   // watchdog drains that ran something
   uint64_t interrupts = 0;        // INTERRUPT packets dispatched on guest threads
   uint64_t interrupts_worker = 0;  // on the worker (watchdog)
+  // INTERRUPTs whose callback was already the XDK's 0x0BADF00D (its handler
+  // would trap and call it): dispatched without the callback (expected 0).
+  uint64_t interrupt_badf00d_skips = 0;
+  // Guest-thread dispatches after which the interrupted thread's state wasn't
+  // exactly as before (registers, host FP control, TLS pointer, CPU number;
+  // expected 0).
+  uint64_t interrupt_restore_mismatches = 0;
   uint64_t scopes = 0;
   uint64_t scope_packets = 0;
   uint64_t scope_dwords = 0;
