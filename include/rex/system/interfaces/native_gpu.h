@@ -90,6 +90,10 @@ class INativeGpu {
   // timeout.
   virtual void WaitForRingProgress(uint32_t timeout_us) = 0;
 
+  // A vblank came since this thread's last TryDrain: a wait in the ring may
+  // be met now (a cheap check for threads that drain at API call boundaries).
+  virtual bool VblankSinceLastDrain() = 0;
+
   // The guest thread that runs Swap: XE_SWAP (and the present) runs there.
   virtual void SetSwapOwnerThread(uint32_t guest_thread_id) = 0;
 

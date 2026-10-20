@@ -36,13 +36,20 @@ namespace {
 // The drain running on this thread (a guest callback it dispatched may kick
 // and come back here).
 thread_local bool t_native_draining = false;
-// The ring progress generation this thread's last drain started from.
+// The ring progress generation and the vblank count this thread's last drain
+// started from.
 thread_local uint64_t t_native_seen_generation = 0;
+thread_local uint64_t t_native_seen_vblanks = 0;
 // Depth of the backend lock on this thread (CallInThread runs jobs inline).
 thread_local uint32_t t_native_backend_depth = 0;
 
 constexpr uint64_t kNativeSwapOwnerTimeoutNs = 2'000'000;
-constexpr uint64_t kNativeWatchdogNs = 2'000'000;
+// The worker wakes this often for jobs, and drains a ring nobody drained for
+// kNativeWatchdogNs. Guest threads drain at kicks, waits and (after a vblank)
+// API calls, so this is only a safety net; a vblank that lands while the
+// render thread waits for the game thread is picked up at its next frame.
+constexpr uint64_t kNativeWorkerWakeMs = 2;
+constexpr uint64_t kNativeWatchdogNs = 20'000'000;
 
 uint64_t NativeNowNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -201,7 +208,7 @@ void CommandProcessor::NativeWorkerLoop() {
   while (worker_running_) {
     RunNativePendingFns();
     rex::thread::Wait(write_ptr_index_event_.get(), false,
-                      std::chrono::milliseconds(int64_t(kNativeWatchdogNs / 1000000)));
+                      std::chrono::milliseconds(int64_t(kNativeWorkerWakeMs)));
     if (!worker_running_) {
       break;
     }
@@ -229,8 +236,13 @@ void CommandProcessor::BumpNativeRingProgress() {
 
 void CommandProcessor::SignalNativeRingProgress() {
   if (native_mode_) {
+    native_vblanks_.fetch_add(1, std::memory_order_relaxed);
     BumpNativeRingProgress();
   }
+}
+
+bool CommandProcessor::VblankSinceLastDrain() {
+  return native_vblanks_.load(std::memory_order_relaxed) != t_native_seen_vblanks;
 }
 
 void CommandProcessor::WaitForRingProgress(uint32_t timeout_us) {
@@ -367,6 +379,7 @@ system::NativeDrainState CommandProcessor::TryDrain() {
   }
   // Anything signalled from now on wakes this thread's next WaitForRingProgress.
   t_native_seen_generation = native_progress_generation_.load(std::memory_order_relaxed);
+  t_native_seen_vblanks = native_vblanks_.load(std::memory_order_relaxed);
   if (!native_ready_.load(std::memory_order_acquire)) {
     return system::NativeDrainState::kNotReady;
   }
