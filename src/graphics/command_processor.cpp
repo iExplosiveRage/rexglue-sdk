@@ -1008,6 +1008,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  bool waited = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1048,6 +1049,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!waited && rex::perf::IsLatencyWindowOpen()) {
+        rex::perf::LatencyLog("cpwait_begin", poll_reg_addr, ref);
+      }
+      waited = true;
       {
         rex::perf::GpuThreadState& thread_state = rex::perf::GetGpuThreadState();
         thread_state.wait_reg_mem_address.store(poll_reg_addr, std::memory_order_relaxed);
@@ -1077,6 +1082,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (waited) {
+    rex::perf::LatencyLog("cpwait_end", poll_reg_addr, ref);
+  }
   rex::perf::SetGpuThreadWhere(rex::perf::GpuThreadWhere::kExecuting);
 
   return true;

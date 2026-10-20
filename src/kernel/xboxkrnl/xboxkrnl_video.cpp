@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
@@ -496,6 +497,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+
+  // Latency probe (latency_log): the guest's end of a frame.
+  rex::perf::RecordGuestVdSwap();
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

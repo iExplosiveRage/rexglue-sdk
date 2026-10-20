@@ -27,6 +27,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/frame_pacing.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/net/session.h>
@@ -283,6 +284,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           } else {
             interval_ticks = REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           }
+          // The guest clock can read a tick lower than before (a re-based
+          // snapshot): unsigned, current - last would wrap to ~1.8e19 and this
+          // loop would fire vblanks forever (an interrupt storm, FPS < 10).
+          if (current_time < last_frame_time) {
+            last_frame_time = current_time;
+          }
+          // After a long stall, catch up a few vblanks, not the whole backlog.
+          if (current_time - last_frame_time > 8 * interval_ticks) {
+            last_frame_time = current_time - 8 * interval_ticks;
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
@@ -474,6 +485,7 @@ void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 
+  rex::perf::LatencyLog("vblank");
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {
     command_processor_->increment_counter();

@@ -12,6 +12,15 @@
 #include <atomic>
 #include <chrono>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(latency_log, false, "Perf",
+                    "Debug: log each new controller press's way to the screen as [Latency] "
+                    "lines (guest read, guest vblanks and swaps, GPU swap, present) with QPC "
+                    "milliseconds, for 400 ms after the press.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::perf {
 
 namespace {
@@ -55,13 +64,53 @@ size_t ReadIntervals(const std::array<std::atomic<int64_t>, kSwapTimeHistory>& t
   }
   return frames;
 }
+std::atomic<int64_t> g_latency_window_until_ns{0};
+std::atomic<uint64_t> g_guest_vdswap_count{0};
 }  // namespace
+
+bool IsLatencyLogging() {
+  return REXCVAR_GET(latency_log);
+}
+
+void LatencyOpenWindow() {
+  if (!REXCVAR_GET(latency_log)) {
+    return;
+  }
+  g_latency_window_until_ns.store(SteadyNowNs() + 400'000'000, std::memory_order_relaxed);
+}
+
+bool IsLatencyWindowOpen() {
+  return REXCVAR_GET(latency_log) &&
+         SteadyNowNs() < g_latency_window_until_ns.load(std::memory_order_relaxed);
+}
+
+void LatencyLog(const char* event, uint64_t a, uint64_t b) {
+  const int64_t now = SteadyNowNs();
+  if (!REXCVAR_GET(latency_log) || now >= g_latency_window_until_ns.load(std::memory_order_relaxed)) {
+    return;
+  }
+  REXLOG_INFO("[Latency] {} {} {} t={:.3f} vdswap={} xeswap={} present={}", event, a, b,
+              double(now) * 1.0e-6, g_guest_vdswap_count.load(std::memory_order_relaxed),
+              g_guest_swap_count.load(std::memory_order_relaxed),
+              g_present_count.load(std::memory_order_relaxed));
+}
+
+uint64_t RecordGuestVdSwap() {
+  const uint64_t index = g_guest_vdswap_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  LatencyLog("vdswap");
+  return index;
+}
+
+uint64_t GetGuestVdSwapCount() {
+  return g_guest_vdswap_count.load(std::memory_order_relaxed);
+}
 
 void RecordHostPresent(bool new_guest_frame) {
   const int64_t now = SteadyNowNs();
   const uint64_t index = g_present_count.load(std::memory_order_relaxed);
   g_present_times_ns[index % kSwapTimeHistory].store(now, std::memory_order_relaxed);
   g_present_count.store(index + 1, std::memory_order_release);
+  LatencyLog("present", new_guest_frame ? 1 : 0);
   const uint64_t swaps = g_guest_swap_count.load(std::memory_order_acquire);
   if (new_guest_frame && swaps) {
     const int64_t swap_time =
@@ -104,6 +153,7 @@ void RecordGuestSwap() {
   const uint64_t index = g_guest_swap_count.load(std::memory_order_relaxed);
   g_swap_times_ns[index % kSwapTimeHistory].store(now, std::memory_order_relaxed);
   g_guest_swap_count.store(index + 1, std::memory_order_release);
+  LatencyLog("xeswap");
 }
 
 uint64_t GetGuestSwapCount() {

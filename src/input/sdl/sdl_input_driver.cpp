@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <string_view>
 
@@ -26,9 +28,25 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+REXCVAR_DEFINE_BOOL(input_poll_on_read, true, "Input",
+                    "Read the controllers at the moment the game asks for their state. Off = "
+                    "the state of the last update the UI thread ran, which the game's previous "
+                    "read queued (up to a frame old).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::input::sdl {
 
 namespace {
+
+// Steady clock time of the latest controller update (SDL_UpdateGamepads),
+// from whichever thread ran it.
+std::atomic<int64_t> g_controllers_updated_ns{0};
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
@@ -338,6 +356,20 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   auto is_active = this->is_active();
 
   if (is_active) {
+    // The state the game reads is the one of the last controller update. The
+    // update queued below runs on the UI thread after this read, so without a
+    // fresh one here a press would wait for the game's next read (a frame).
+    // SDL_UpdateGamepads is thread safe (SDL's joystick lock); the events it
+    // generates reach HandleEvent (event watch) on this thread, and are
+    // applied by DrainAndLock below. Several reads within 1 ms (one per user)
+    // share one update.
+    if (REXCVAR_GET(input_poll_on_read)) {
+      const int64_t now = SteadyNowNs();
+      if (now - g_controllers_updated_ns.load(std::memory_order_relaxed) >= 1'000'000) {
+        SDL_UpdateGamepads();
+        g_controllers_updated_ns.store(now, std::memory_order_relaxed);
+      }
+    }
     QueueControllerUpdate();
   }
 
@@ -868,6 +900,7 @@ void SDLInputDriver::QueueControllerUpdate() {
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
       SDL_PumpEvents();
+      g_controllers_updated_ns.store(SteadyNowNs(), std::memory_order_relaxed);
       sdl_pumpevents_queued_ = false;
     });
   }

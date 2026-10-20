@@ -25,6 +25,7 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/system/kernel_state.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
@@ -304,6 +305,21 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     ui_toggle_combo_held_[user_index] = combo_held;
   }
 
+  if (user_index == 0 && rex::perf::IsLatencyLogging()) {
+    // Latency probe: a button the guest sees pressed now and not at its
+    // previous read of user 0.
+    static uint16_t previous_buttons = 0;
+    const uint16_t buttons =
+        (result == X_ERROR_SUCCESS && out_state) ? uint16_t(out_state->gamepad.buttons) : 0;
+    if (buttons & ~previous_buttons) {
+      rex::perf::LatencyOpenWindow();
+      rex::perf::LatencyLog("read", buttons & ~previous_buttons, buttons);
+    } else {
+      rex::perf::LatencyLog("poll", buttons);
+    }
+    previous_buttons = buttons;
+  }
+
   if (result == X_ERROR_SUCCESS && out_state && user_index < kMaxGuestUsers &&
       consumed_buttons_[user_index] != 0) {
     const uint16_t buttons = out_state->gamepad.buttons;
@@ -329,6 +345,8 @@ void InputSystem::InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t 
                    std::chrono::steady_clock::now().time_since_epoch())
                    .count()) +
       duration_ms;
+  rex::perf::LatencyOpenWindow();
+  rex::perf::LatencyLog("inject", buttons, duration_ms);
 }
 
 X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state) {

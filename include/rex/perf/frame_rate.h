@@ -35,6 +35,19 @@ size_t GetHostPresentIntervals(float* out_ms, size_t max_count);
 // milliseconds, oldest first (up to the last 255).
 size_t GetGuestToPresentLatencies(float* out_ms, size_t max_count);
 
+// Input latency probe (debug cvar latency_log): "[Latency] <event>" log lines
+// with the steady clock in milliseconds (QPC milliseconds on Windows, the
+// clock PresentMon --qpc_time_ms uses), for a press's way to the screen.
+// Lines are written for 400 ms after a new button press the guest read
+// (LatencyOpenWindow), so a whole session doesn't flood the log.
+bool IsLatencyLogging();
+void LatencyOpenWindow();
+bool IsLatencyWindowOpen();
+void LatencyLog(const char* event, uint64_t a = 0, uint64_t b = 0);
+// Guest VdSwap calls (the guest thread's end of a frame), for the probe.
+uint64_t RecordGuestVdSwap();
+uint64_t GetGuestVdSwapCount();
+
 // Guest frontbuffer size (before resolution scaling) of the latest swap.
 void RecordGuestFrontbuffer(uint32_t width, uint32_t height);
 
