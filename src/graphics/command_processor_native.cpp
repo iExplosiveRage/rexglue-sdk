@@ -406,6 +406,77 @@ bool CommandProcessor::ExecuteScope(uint32_t physical, uint32_t dwords,
   return r.ok;
 }
 
+bool CommandProcessor::ExecuteCommands(const system::NativeCommand* commands, uint32_t count) {
+  if (!native_mode_ || !count || !native_ready_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  const uint64_t start_ns = NativeNowNs();
+  uint64_t draws = 0, shaders = 0, register_dwords = 0;
+  bool ok = true;
+  {
+    std::lock_guard<std::recursive_mutex> backend_lock(native_backend_mutex_);
+    ++t_native_backend_depth;
+    for (uint32_t i = 0; i < count; ++i) {
+      const system::NativeCommand& c = commands[i];
+      switch (c.type) {
+        case system::NativeCommandType::kRegisters:
+          WriteRegistersFromMem(c.first_register, const_cast<uint32_t*>(c.values), c.count);
+          register_dwords += c.count;
+          break;
+        case system::NativeCommandType::kShader: {
+          // As PM4_IM_LOAD_IMMEDIATE / PM4_IM_LOAD: the microcode, then the
+          // active shader of that stage.
+          const auto shader_type = static_cast<xenos::ShaderType>(c.shader_type);
+          Shader* shader = LoadShader(shader_type, c.guest_address,
+                                      const_cast<uint32_t*>(c.values), c.count);
+          if (shader_type == xenos::ShaderType::kVertex) {
+            active_vertex_shader_ = shader;
+          } else if (shader_type == xenos::ShaderType::kPixel) {
+            active_pixel_shader_ = shader;
+          } else {
+            ok = false;
+          }
+          ++shaders;
+          break;
+        }
+        case system::NativeCommandType::kDraw: {
+          // As an auto-indexed PM4_DRAW_INDX_2 (ExecutePacketType3Draw).
+          reg::VGT_DRAW_INITIATOR initiator;
+          initiator.value = c.draw_initiator;
+          WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator.value);
+          if (initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+            ok = false;
+            break;
+          }
+          auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+          if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+            IssueDraw(initiator.prim_type, initiator.num_indices, nullptr,
+                      xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type));
+          }
+          ++draws;
+          break;
+        }
+        case system::NativeCommandType::kBinMask:
+          if (c.first_register) {
+            bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (uint64_t(c.values[0]) << 32);
+          } else {
+            bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | c.values[0];
+          }
+          break;
+      }
+    }
+    --t_native_backend_depth;
+  }
+  const uint64_t elapsed_ns = NativeNowNs() - start_ns;
+  std::lock_guard<std::mutex> stats_lock(native_stats_mutex_);
+  ++native_stats_.command_lists;
+  native_stats_.command_draws += draws;
+  native_stats_.command_shaders += shaders;
+  native_stats_.command_register_dwords += register_dwords;
+  native_stats_.scope_ns += elapsed_ns;
+  return ok;
+}
+
 system::NativeDrainState CommandProcessor::TryDrain() {
   if (!native_mode_) {
     return system::NativeDrainState::kIdle;

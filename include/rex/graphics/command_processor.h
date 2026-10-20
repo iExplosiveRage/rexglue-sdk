@@ -137,6 +137,7 @@ class CommandProcessor : public system::INativeGpu {
   bool WaitUntilReady() override;
   bool ExecuteScope(uint32_t physical, uint32_t dwords, system::NativeScopeResult* result,
                     const system::NativeRegisterWrite* writes, uint32_t write_count) override;
+  bool ExecuteCommands(const system::NativeCommand* commands, uint32_t count) override;
   system::NativeDrainState TryDrain() override;
   void WaitForRingProgress(uint32_t timeout_us) override;
   void SetSwapOwnerThread(uint32_t guest_thread_id) override;

@@ -48,6 +48,29 @@ struct NativeRegisterWrite {
   const uint32_t* values = nullptr;
 };
 
+// One step of a D3D call the title hands over as typed commands instead of
+// command buffer packets (INativeGpu::ExecuteCommands): the backend runs them
+// in order with direct calls, without the packet processor.
+enum class NativeCommandType : uint32_t {
+  kRegisters,  // count registers from first_register = values (big-endian)
+  kShader,     // load microcode: shader_type (0 vertex, 1 pixel), values = count
+               // big-endian dwords at guest physical address guest_address
+  kDraw,       // an auto-indexed draw with draw_initiator (VGT_DRAW_INITIATOR);
+               // with RB_MODECONTROL = copy it's a resolve
+  kBinMask,    // the predicated-tiling bin mask: low (first_register 0) or
+               // high (1) half = values[0] (native-endian)
+};
+
+struct NativeCommand {
+  NativeCommandType type = NativeCommandType::kRegisters;
+  uint32_t first_register = 0;
+  uint32_t count = 0;
+  const uint32_t* values = nullptr;
+  uint32_t shader_type = 0;
+  uint32_t guest_address = 0;
+  uint32_t draw_initiator = 0;
+};
+
 // Counters since the last GetStats(reset = true).
 struct NativeGpuStats {
   uint64_t drains = 0;            // TryDrain calls that ran
@@ -84,6 +107,10 @@ struct NativeGpuStats {
   uint64_t scope_ns = 0;
   uint64_t register_writes = 0;   // NativeRegisterWrite runs applied
   uint64_t register_dwords = 0;
+  uint64_t command_lists = 0;     // ExecuteCommands calls (native clears / resolves)
+  uint64_t command_draws = 0;     // their draws / copies
+  uint64_t command_shaders = 0;
+  uint64_t command_register_dwords = 0;
   uint32_t first_render_packet[4] = {};  // the first rendering packet a drain met (header, address)
 };
 
@@ -103,6 +130,10 @@ class INativeGpu {
   // order; dwords may be 0 then.
   virtual bool ExecuteScope(uint32_t physical, uint32_t dwords, NativeScopeResult* result,
                             const NativeRegisterWrite* writes, uint32_t write_count) = 0;
+
+  // Runs a D3D call's typed commands now, on the calling thread, with direct
+  // backend calls (register file writes, shader loads, IssueDraw / IssueCopy).
+  virtual bool ExecuteCommands(const NativeCommand* commands, uint32_t count) = 0;
 
   // Runs kicked commands on the calling thread until the ring is idle, a wait
   // isn't met yet or the swap belongs to another thread. Never blocks on a
