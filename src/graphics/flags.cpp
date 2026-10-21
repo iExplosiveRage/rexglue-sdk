@@ -16,11 +16,12 @@
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
-REXCVAR_DEFINE_BOOL(gpu_native_renderer, false, "GPU",
-                    "Native renderer (experimental): the game's own threads run its GPU commands "
+REXCVAR_DEFINE_BOOL(gpu_native_renderer, true, "GPU",
+                    "Native renderer (the default): the game's own threads run its GPU commands "
                     "at the D3D call that wrote them, with host render targets, instead of an "
                     "emulated command processor thread. Needs a title with native renderer "
-                    "hooks. Applies at the next start. Off = the emulated path.")
+                    "hooks (others use the emulated path). Applies at the next start. Off = the "
+                    "emulated path.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 // On by default: Burst Limit's depth of field in fights reads a render target
 // through another one at the same EDRAM range, so skipping the copies (false)
