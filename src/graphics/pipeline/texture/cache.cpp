@@ -572,8 +572,14 @@ bool ComputeFractionalDrawResolution(TextureCache::FractionalDrawResolution& pla
   // 640x360, 320x180...) are then whole pixels at the lower size - with
   // partly covered last columns and rows its glow and blur passes come out
   // visibly weaker (measured: 87% vs 85 / 90 / 75%).
-  const uint32_t percent =
+  uint32_t percent =
       std::clamp((render_y * 2 + scale_y * 5) / (scale_y * 10) * 5, UINT32_C(25), UINT32_C(100));
+  // At most 3x below the output (DLSS Ultra Performance's and FSR's limit):
+  // the 5% step must not round below a third (1440p / 5K Ultra Performance
+  // rounded to 1.30x / 1.30x of 720p = 3.08x, rejected -> DLAA).
+  while (upscaling_out && percent < 100 && 3 * scale_y * percent < target_y) {
+    percent += 5;
+  }
   // X with the same percent: the nearest whole scale while upscaling (not above
   // the output), else at least as many pixels as the output shows.
   uint32_t scale_x = upscaling_out ? (render_x + percent / 2) / percent
@@ -581,6 +587,10 @@ bool ComputeFractionalDrawResolution(TextureCache::FractionalDrawResolution& pla
   if (upscaling_out) {
     while (scale_x > 1 && scale_x * percent > target_x) {
       --scale_x;
+    }
+    while (3 * scale_x * percent < target_x &&
+           scale_x < TextureCache::kMaxDrawResolutionScaleAlongAxis) {
+      ++scale_x;
     }
   }
   // 16:9: exactly the Y scale (only a wider picture renders wider).
