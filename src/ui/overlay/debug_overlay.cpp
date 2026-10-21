@@ -200,20 +200,10 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   char text[96];
   const rex::perf::RenderInfo render = rex::perf::GetRenderInfo();
   if (render.scale_x && render.frontbuffer_width) {
-    // (Below 1x: the part of the 1x frame the game is drawn in.)
-    const uint32_t render_width =
-        (render.frontbuffer_width * render.scale_x * render.percent) / 100;
-    const uint32_t render_height =
-        (render.frontbuffer_height * render.scale_y * render.percent) / 100;
-    // The output the backend presents (any resolution: not a whole scale).
-    const uint32_t output_width =
-        render.output_e100_x
-            ? uint32_t((uint64_t(render.frontbuffer_width) * render.output_e100_x + 50) / 100)
-            : render.frontbuffer_width * std::max(render.requested_scale_x, render.scale_x);
-    const uint32_t output_height =
-        render.output_e100_y
-            ? uint32_t((uint64_t(render.frontbuffer_height) * render.output_e100_y + 50) / 100)
-            : render.frontbuffer_height * std::max(render.requested_scale_y, render.scale_y);
+    const uint32_t render_width = render.render_width();
+    const uint32_t render_height = render.render_height();
+    const uint32_t output_width = render.output_width();
+    const uint32_t output_height = render.output_height();
     // "render -> output" when the scene is upscaled to a larger picture.
     if (output_width > render_width + 1 || output_height > render_height + 1) {
       std::snprintf(text, sizeof(text), "%ux%u -> %ux%u", render_width, render_height,

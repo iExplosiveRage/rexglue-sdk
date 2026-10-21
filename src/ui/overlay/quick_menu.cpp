@@ -1013,35 +1013,42 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
              config_.title);
   }
   {
-    std::string status;
+    // One resolution: the picture shown (the output - an upscaler's render
+    // resolution is in the F3 overlay), then the FPS. Right-aligned in the
+    // room the title leaves; smaller, then the FPS alone, if it wouldn't fit.
+    std::string resolution, fps;
     const rex::perf::RenderInfo info = rex::perf::GetRenderInfo();
     if (info.frontbuffer_width && info.scale_x && info.scale_y) {
-      const uint32_t render_width =
-          (info.frontbuffer_width * info.scale_x * info.percent + 99) / 100;
-      const uint32_t render_height =
-          (info.frontbuffer_height * info.scale_y * info.percent + 99) / 100;
-      const uint32_t output_width =
-          info.frontbuffer_width * std::max(info.requested_scale_x, info.scale_x);
-      const uint32_t output_height =
-          info.frontbuffer_height * std::max(info.requested_scale_y, info.scale_y);
-      char text[96];
-      if (render_width != output_width || render_height != output_height) {
-        std::snprintf(text, sizeof(text), "%ux%u \xC2\xBB %ux%u", render_width, render_height,
-                      output_width, output_height);
-      } else {
-        std::snprintf(text, sizeof(text), "%ux%u", render_width, render_height);
-      }
-      status = text;
+      char text[48];
+      std::snprintf(text, sizeof(text), "%ux%u", info.output_width(), info.output_height());
+      resolution = text;
     }
     if (fps_ > 0.0f) {
       char text[32];
-      std::snprintf(text, sizeof(text), "%s%.0f FPS", status.empty() ? "" : "   ", fps_);
-      status += text;
+      std::snprintf(text, sizeof(text), "%.0f FPS", fps_);
+      fps = text;
+    }
+    std::string status = resolution;
+    if (!fps.empty()) {
+      status += (status.empty() ? "" : "   ") + fps;
+    }
+    const float room =
+        content_right - (content_left + TextSize(42.0f * u, config_.title).x + 24.0f * u);
+    float size = 22.0f * u;
+    if (!status.empty() && TextSize(size, status).x > room) {
+      size = std::max(16.0f * u, size * room / TextSize(size, status).x);
+      if (TextSize(size, status).x > room) {
+        status = fps;
+        size = 22.0f * u;
+        if (TextSize(size, status).x > room) {
+          status.clear();
+        }
+      }
     }
     if (!status.empty()) {
-      const float size = 22.0f * u;
       DrawText(draw_list, size,
-               ImVec2(content_right - TextSize(size, status).x, y + 12.0f * u),
+               ImVec2(content_right - TextSize(size, status).x,
+                      y + 12.0f * u + (22.0f * u - size) * 0.5f),
                color(theme.status), status);
     }
   }

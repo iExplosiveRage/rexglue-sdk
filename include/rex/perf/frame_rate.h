@@ -75,6 +75,22 @@ struct RenderInfo {
   uint32_t output_e100_x = 0;
   uint32_t output_e100_y = 0;
   bool native_renderer = false;
+
+  // The pixels the game renders at (below 1x: the part of the 1x frame it's
+  // drawn in) and the output the backend presents (NVIDIA DLSS / AMD FSR
+  // upscale the scene to it) - what the F3 overlay and the settings menu show.
+  uint32_t render_width() const { return frontbuffer_width * scale_x * percent / 100; }
+  uint32_t render_height() const { return frontbuffer_height * scale_y * percent / 100; }
+  uint32_t output_width() const {
+    return output_e100_x ? uint32_t((uint64_t(frontbuffer_width) * output_e100_x + 50) / 100)
+                         : frontbuffer_width * (requested_scale_x > scale_x ? requested_scale_x
+                                                                            : scale_x);
+  }
+  uint32_t output_height() const {
+    return output_e100_y ? uint32_t((uint64_t(frontbuffer_height) * output_e100_y + 50) / 100)
+                         : frontbuffer_height * (requested_scale_y > scale_y ? requested_scale_y
+                                                                             : scale_y);
+  }
 };
 RenderInfo GetRenderInfo();
 

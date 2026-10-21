@@ -583,7 +583,11 @@ bool ComputeFractionalDrawResolution(TextureCache::FractionalDrawResolution& pla
       --scale_x;
     }
   }
-  scale_x = std::clamp(scale_x, UINT32_C(1), TextureCache::kMaxDrawResolutionScaleAlongAxis);
+  // 16:9: exactly the Y scale (only a wider picture renders wider).
+  if (target_x <= target_y) {
+    scale_x = scale_y;
+  }
+  scale_x = std::clamp(scale_x, scale_y, TextureCache::kMaxDrawResolutionScaleAlongAxis);
   plan.scale_x = scale_x;
   plan.scale_y = scale_y;
   plan.percent = percent;
@@ -705,6 +709,9 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
       !dlss_active && (fsr == "quality" || fsr == "balanced" || fsr == "performance" ||
                        fsr == "ultra_performance") &&
       rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kAvailable;
+  // (Not X from Y's render scale: the D3D12 DLSS path needs one of DLSS's own
+  // ratios on each axis, else it falls back to DLAA for the session. At 16:9
+  // the X and Y scales are equal, so both axes come out the same.)
   if (dlss_upscaling) {
     x_out = GetDlssRenderScale(clamped_x, dlss);
     y_out = GetDlssRenderScale(clamped_y, dlss);
