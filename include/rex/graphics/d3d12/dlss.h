@@ -185,6 +185,8 @@ class D3D12Dlss {
   // Upscaling failed: anti-aliasing at the configured scale from now on (for
   // that upscaler).
   void DisableUpscaling(Backend backend, const char* reason);
+  // Clears the upscaling failures after a mode / model / resolution change.
+  void RetryUpscalingIfRequested();
   // FSR failed entirely: off from now on.
   void DisableFsr();
   // Records FSR for ProcessScene (its inputs ready, the output in

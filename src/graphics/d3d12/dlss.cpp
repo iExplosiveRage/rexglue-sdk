@@ -10,6 +10,9 @@
 #include <rex/graphics/d3d12/dlss.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <string_view>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -342,6 +345,10 @@ D3D12Dlss::~D3D12Dlss() {
   Shutdown();
 }
 
+namespace {
+void RegisterUpscalerRetryCallbacks();
+}  // namespace
+
 bool D3D12Dlss::Initialize() {
   rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kUnavailable);
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
@@ -394,6 +401,7 @@ bool D3D12Dlss::Initialize() {
     return false;
   }
 
+  RegisterUpscalerRetryCallbacks();
   // Whether DLSS works decides the render scale of its upscaling modes, so NGX
   // is checked right away on NVIDIA GPUs.
   if (provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kNvidia) {
@@ -696,6 +704,48 @@ const std::array<float, 16>* D3D12Dlss::FrameCamera() const {
   return best && best->second >= 2 ? &best->first : nullptr;
 }
 
+namespace {
+// An upscaling failure is no longer sticky for the session: the next change of
+// the mode, the DLSS model or the resolution tries upscaling again (a size
+// mismatch while a resolution or mode switch settles must not leave a DLSS
+// mode stuck on DLAA).
+std::atomic<bool> g_upscaler_retry{false};
+
+void RegisterUpscalerRetryCallbacks() {
+  static std::once_flag registered;
+  std::call_once(registered, [] {
+    for (const char* name :
+         {"dlss_mode", "dlss_preset", "fsr_mode", "draw_resolution_height",
+          "draw_resolution_scale_x", "draw_resolution_scale_y", "resolution_scale",
+          "draw_resolution_percent", "aspect_ratio"}) {
+      rex::cvar::RegisterChangeCallback(name, [](std::string_view, std::string_view) {
+        // Back to the full availability right away, so the render size planned
+        // for the new settings is the upscaling one again.
+        if (rex::graphics::GetDlssAvailability() == rex::graphics::DlssAvailability::kDlaaOnly) {
+          rex::graphics::SetDlssAvailability(rex::graphics::DlssAvailability::kAvailable);
+        }
+        if (rex::graphics::GetFsrAvailability() == rex::graphics::FsrAvailability::kNativeOnly) {
+          rex::graphics::SetFsrAvailability(rex::graphics::FsrAvailability::kAvailable);
+        }
+        g_upscaler_retry.store(true, std::memory_order_release);
+        D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
+      });
+    }
+  });
+}
+}  // namespace
+
+void D3D12Dlss::RetryUpscalingIfRequested() {
+  if (!g_upscaler_retry.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  if (upscaling_failed_ || fsr_upscaling_failed_) {
+    REXGPU_INFO("DLSS / FSR: settings changed - trying upscaling again");
+  }
+  upscaling_failed_ = false;
+  fsr_upscaling_failed_ = false;
+}
+
 void D3D12Dlss::DisableUpscaling(Backend backend, const char* reason) {
   if (backend == Backend::kFsr) {
     if (fsr_upscaling_failed_) {
@@ -758,6 +808,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
                                               uint32_t width, uint32_t height,
                                               uint32_t output_width, uint32_t output_height) {
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  RetryUpscalingIfRequested();
   frame_scene_taken_ = true;
   const uint32_t valid_width =
       scene_valid_width_ ? std::min(scene_valid_width_, width) : width;
@@ -782,7 +833,8 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   D3D12_RESOURCE_DESC color_desc = color->GetDesc();
   if (color_desc.SampleDesc.Count != 1 || width > color_desc.Width ||
       height > color_desc.Height) {
-    if (upscaling_requested) {
+    // (Not while a resolution / mode switch settles: the sizes are mixed then.)
+    if (upscaling_requested && !command_processor_.IsDrawResolutionScaleChangePending()) {
       DisableUpscaling(backend, "the scene is multisampled or smaller than expected");
     }
     return color_state;
