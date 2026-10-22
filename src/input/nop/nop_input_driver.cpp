@@ -9,11 +9,20 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstring>
+#include <string>
 
 #include <rex/input/flags.h>
+#include <rex/cvar.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_UINT32(input_test_pads, 0, "Input",
+                      "Debug: number of idle virtual controllers that count as real pads (pad 1 = "
+                      "guest user 0, pad 2 = user 1...), for automated tests of multi-pad setups "
+                      "with pad_press <buttons> <ms> <user>")
+    .range(0, 4);
 
 namespace rex::input::nop {
 
@@ -21,6 +30,14 @@ namespace {
 
 // A single device, so its handle is a constant.
 constexpr rex::input::DeviceId kNopDevice = static_cast<rex::input::DeviceId>(0x4E4F5000);
+// input_test_pads devices: kNopDevice + 1 + n.
+constexpr uint32_t kMaxTestPads = 4;
+
+bool IsNopDevice(rex::input::DeviceId id) {
+  const uint64_t value = static_cast<uint64_t>(id);
+  const uint64_t base = static_cast<uint64_t>(kNopDevice);
+  return value >= base && value <= base + std::min<uint32_t>(REXCVAR_GET(input_test_pads), kMaxTestPads);
+}
 
 }  // namespace
 
@@ -42,11 +59,20 @@ void NopInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   info.name = "None";
   info.synthetic = true;
   out.push_back(info);
+
+  const uint32_t test_pads = std::min<uint32_t>(REXCVAR_GET(input_test_pads), kMaxTestPads);
+  for (uint32_t n = 0; n < test_pads; ++n) {
+    DeviceInfo pad;
+    pad.id = static_cast<rex::input::DeviceId>(static_cast<uint32_t>(kNopDevice) + 1 + n);
+    pad.name = "Test pad " + std::to_string(n + 1);
+    pad.synthetic = false;
+    out.push_back(pad);
+  }
 }
 
 X_RESULT NopInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
                                                X_INPUT_CAPABILITIES* out_caps) {
-  if (id != kNopDevice) {
+  if (!IsNopDevice(id)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_caps) {
@@ -69,7 +95,7 @@ X_RESULT NopInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
 }
 
 X_RESULT NopInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
-  if (id != kNopDevice) {
+  if (!IsNopDevice(id)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_state) {
@@ -80,7 +106,7 @@ X_RESULT NopInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 }
 
 X_RESULT NopInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
-  if (id != kNopDevice) {
+  if (!IsNopDevice(id)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   // Accept vibration but do nothing
@@ -89,7 +115,7 @@ X_RESULT NopInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
 
 X_RESULT NopInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
                                             X_INPUT_KEYSTROKE* out_keystroke) {
-  if (id != kNopDevice) {
+  if (!IsNopDevice(id)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   // No keystrokes available
