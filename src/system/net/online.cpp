@@ -71,6 +71,15 @@ REXCVAR_DEFINE_INT32(online_join_timeout_ms, 9000, "Online",
                      "after 10 s).");
 REXCVAR_DEFINE_INT32(online_search_wait_ms, 1500, "Online",
                      "How long a session search waits for the lobby's room list.");
+REXCVAR_DEFINE_BOOL(online_lobby_connect_early, true, "Online",
+                    "Connect to the lobby in the background at game start (and stay connected) "
+                    "instead of when the online menu opens.");
+REXCVAR_DEFINE_INT32(online_connect_wait_ms, 6000, "Online",
+                     "How long a search started while the lobby is still connecting waits for "
+                     "the connection.");
+REXCVAR_DEFINE_INT32(online_debug_connect_fail, 0, "Online",
+                     "Test: the first N lobby connection attempts go to an unroutable address "
+                     "(a hanging first connect). 0 = off.");
 REXCVAR_DEFINE_STRING(online_stun_override, "", "Online",
                       "Test: STUN server host:port instead of the lobby's.");
 REXCVAR_DEFINE_STRING(online_turn_override, "", "Online",
@@ -101,6 +110,7 @@ constexpr uint32_t kVirtualBase = 0xC6120000;  // 198.18.0.0/16
 constexpr int kNetVersion = 2;
 constexpr uint32_t kContextGameType = 0x800A;
 constexpr uint32_t kTitleContexts[] = {3, 4, 5, 6};
+constexpr char kConnectingNotice[] = "Connecting to the online lobby...";
 
 int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -426,6 +436,13 @@ class Service {
     notice_ms_ = NowMs();
     notice_seconds_ = seconds;
   }
+  // Ends the notice early when it's still `text`.
+  void ClearNotice(const std::string& text) {
+    std::lock_guard<std::mutex> lock(shared_mutex_);
+    if (notice_ == text) {
+      notice_.clear();
+    }
+  }
   bool GetNotice(Notice* out) {
     std::lock_guard<std::mutex> lock(shared_mutex_);
     if (notice_.empty()) {
@@ -495,6 +512,21 @@ class Service {
     properties_[id] = value;
   }
 
+  // At game start: connect to the lobby in the background so it's ready when
+  // the online menu opens (online_lobby_connect_early). Lobby mode only.
+  void ConnectEarly() {
+    // Without a lobby URL (LAN / VPN play) the mode is left to be decided by
+    // the game's first socket, as before.
+    if (!REXCVAR_GET(online_lobby_connect_early) || REXCVAR_GET(online_lobby_url).empty() ||
+        !lobby_mode()) {
+      return;
+    }
+    Post([this] {
+      REXSYS_INFO("[Lobby] early connect at startup");
+      EnsureLobby();
+    });
+  }
+
   void SocketOpened() {
     if (!lobby_mode()) {
       return;
@@ -511,7 +543,9 @@ class Service {
     }
     Post([this] {
       sockets_open_ = std::max(0, sockets_open_ - 1);
-      if (sockets_open_ == 0) {
+      // With the early connection the lobby stays connected for the whole
+      // run (ready for the next visit to the online menu).
+      if (sockets_open_ == 0 && !REXCVAR_GET(online_lobby_connect_early)) {
         const uint64_t token = ++idle_token_;
         PostAt(NowMs() + 60000, [this, token] {
           if (token == idle_token_ && sockets_open_ == 0 && !host_.active && !guest_.active &&
@@ -558,6 +592,16 @@ class Service {
       EnsureLobby();
       if (welcomed_.load()) {
         SendCreate();
+      } else {
+        // The room is listed as soon as the lobby connects (welcome).
+        REXSYS_WARN("[Lobby] create: lobby still connecting, the room follows the welcome");
+        PostNotice(kConnectingNotice, 30.0);
+        const int wait = std::max(1000, REXCVAR_GET(online_connect_wait_ms));
+        PostAt(NowMs() + wait, [this] {
+          if (host_.active && !welcomed_.load()) {
+            PostNotice("Online lobby not reachable yet: your room is listed once it connects.");
+          }
+        });
       }
     });
   }
@@ -687,10 +731,23 @@ class Service {
     std::vector<SearchResult> results;
     const int64_t start = NowMs();
     if (!welcomed_.load()) {
-      REXSYS_WARN("[Lobby] search: lobby unreachable (not connected), 0 results");
-      PostNotice("Online lobby not reachable yet. Try again in a moment.");
+      // Still connecting (first start, a retry): wait a little for the
+      // lobby instead of answering "no rooms" at once.
       Post([this] { EnsureLobby(); });
-      return results;
+      const int wait = std::max(0, REXCVAR_GET(online_connect_wait_ms));
+      REXSYS_WARN("[Lobby] search: lobby not connected yet, waiting up to {} ms", wait);
+      PostNotice(kConnectingNotice, 30.0);
+      while (!welcomed_.load() && NowMs() - start < wait) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      ClearNotice(kConnectingNotice);
+      if (!welcomed_.load()) {
+        REXSYS_WARN("[Lobby] search: lobby unreachable (not connected after {} ms), 0 results",
+                    NowMs() - start);
+        PostNotice("Online lobby not reachable yet. Try again in a moment.");
+        return results;
+      }
+      REXSYS_WARN("[Lobby] search: lobby connected after {} ms, searching", NowMs() - start);
     }
     auto promise = std::make_shared<std::promise<json>>();
     auto future = promise->get_future();
@@ -925,7 +982,9 @@ class Service {
       return;
     }
     lobby_started_ = true;
+    lobby_start_ms_ = NowMs();
     REXSYS_INFO("[Lobby] connecting {}", url_);
+    lobby_->SetDebugFailAttempts(REXCVAR_GET(online_debug_connect_fail));
     LobbyClient::Callbacks callbacks;
     callbacks.on_state = [this](bool open, const std::string& why) {
       Post([this, open, why] { OnLobbyState(open, why); });
@@ -944,7 +1003,8 @@ class Service {
   void OnLobbyState(bool open, const std::string& why) {
     if (open) {
       lobby_failures_ = 0;
-      REXSYS_INFO("[Lobby] connected, sending hello");
+      REXSYS_INFO("[Lobby] connected, sending hello ({} ms after the first connect)",
+                  NowMs() - lobby_start_ms_);
       json hello{{"t", "hello"},
                  {"game", "burstlimit"},
                  {"version", Version()},
@@ -978,7 +1038,12 @@ class Service {
       return;  // stopped on purpose
     }
     REXSYS_WARN("[Lobby] disconnected ({}), reconnecting", why);
-    if (was_welcomed || lobby_failures_++ == 0) {
+    // A dropped connection is announced; failed connects stay quiet (the
+    // early connect runs at the title, retries are quick, and a search
+    // says when the lobby is unreachable), except a third failure in a row
+    // while the game is in its online menus.
+    const int failures = was_welcomed ? 0 : ++lobby_failures_;
+    if (was_welcomed || (failures == 3 && sockets_open_ > 0)) {
       PostNotice(peer_ && peer_connected_
                      ? "Online lobby connection lost (" + why + "), the match goes on"
                      : "Online lobby connection lost: " + why);
@@ -1141,6 +1206,7 @@ class Service {
       client_id_ = JsonString(message, "id");
       servers_ = ServersFrom(message);
       welcomed_.store(true);
+      ClearNotice(kConnectingNotice);
       auth_retried_ = false;
       auth_retry_.clear();
       REXSYS_WARN("[Lobby] welcome id={} stun={}:{} turn={}", client_id_,
@@ -1758,6 +1824,7 @@ class Service {
   std::unique_ptr<LobbyClient> lobby_;
   bool lobby_started_ = false;
   int lobby_failures_ = 0;
+  int64_t lobby_start_ms_ = 0;
   std::string client_id_;
   IceServers servers_;
   IceServers match_servers_;
@@ -1869,6 +1936,10 @@ uint32_t VirtualIp() {
 
 bool IsVirtualIp(uint32_t ip) {
   return (ip & 0xFFFF0000u) == kVirtualBase;
+}
+
+void ConnectLobbyEarly() {
+  Service::Get().ConnectEarly();
 }
 
 void OnGameSocketOpened() {

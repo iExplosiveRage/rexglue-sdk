@@ -69,6 +69,12 @@ bool GetNotice(Notice* out);
 /// call (the game's first VDP socket).
 bool IsLobbyMode();
 
+/// At game start, after SetGameVersion: when online_lobby_url is set (lobby
+/// mode) and online_lobby_connect_early is on, starts connecting to the lobby
+/// in the background and stays connected, so the online menu finds it ready.
+/// Does nothing in the LAN / VPN mode. Never blocks.
+void ConnectLobbyEarly();
+
 /// This PC's virtual address (host byte order, 198.18.A.B).
 uint32_t VirtualIp();
 

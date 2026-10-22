@@ -44,6 +44,10 @@ class LobbyClient {
 
   /// To be called when a {"t":"pong"} arrives (the owner parses messages).
   virtual void OnPong() = 0;
+
+  /// Debug: the first `count` connection attempts go to an unroutable
+  /// address (a hanging first connect). 0 = off.
+  virtual void SetDebugFailAttempts(int count) { (void)count; }
 };
 
 }  // namespace rex::net::online
