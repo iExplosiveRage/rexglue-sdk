@@ -45,8 +45,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (user_profile->IsSignedIn(user_index)) {
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
         // maybe online profile?
@@ -66,8 +66,10 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
-  if (user_index == 0) {
-    REXKRNL_DEBUG("[BurstLive2] user 0 -> Xbox LIVE sign-in state 2");
+  // The one profile is signed in to Xbox LIVE on one user index: user 0, or
+  // the controller the title made player 1 (UserProfile::set_signed_in_user).
+  if (REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
+    REXKRNL_DEBUG("[BurstLive2] user {} -> Xbox LIVE sign-in state 2", uint32_t(user_index));
     return 2;
   }
   return 0;
@@ -89,11 +91,11 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (!user_profile->IsSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
@@ -105,11 +107,11 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (!user_profile->IsSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
@@ -120,7 +122,8 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (!user_profile->IsSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -128,7 +131,6 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   auto user_name = rex::string::to_utf16(user_profile->name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
@@ -208,8 +210,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  if (!xuids && !REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
+    // Only the signed-in user has a profile.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
@@ -305,8 +307,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  if (!REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
+    // Only the signed-in user has a profile.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -376,7 +378,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  if (!REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -387,7 +389,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
+  if (!REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -418,7 +420,7 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index >= 4) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (user_index) {
+  if (!REX_KERNEL_STATE()->user_profile()->IsSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
   return 6 /* 6 appears to be Gold */;
@@ -432,8 +434,8 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   if (user_index >= 4) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (user_profile->IsSignedIn(user_index)) {
       if (user_profile->signin_state() == 0) {
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
@@ -442,7 +444,7 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
         result = X_ERROR_SUCCESS;
       }
     } else {
-      // Only support user 0.
+      // Only the signed-in user.
       result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
     }
   }
@@ -468,8 +470,9 @@ u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
 
   // To fix game modes that display a 4 profile signin UI (even if playing
   // alone):
-  // XN_SYS_SIGNINCHANGED
-  REX_KERNEL_STATE()->BroadcastNotification(0x0000000A, 1);
+  // XN_SYS_SIGNINCHANGED (data = signed-in users mask)
+  REX_KERNEL_STATE()->BroadcastNotification(
+      0x0000000A, 1u << REX_KERNEL_STATE()->user_profile()->signed_in_user());
   // Games seem to sit and loop until we trigger this notification:
   // XN_SYS_UI (off)
   REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);

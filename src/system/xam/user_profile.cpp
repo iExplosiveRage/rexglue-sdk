@@ -95,6 +95,22 @@ UserProfile::UserProfile() {
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
 }
 
+void UserProfile::set_signed_in_user(uint32_t user_index) {
+  if (user_index >= 4) {
+    return;
+  }
+  const uint32_t previous = signed_in_user_.exchange(user_index, std::memory_order_relaxed);
+  if (previous != user_index) {
+    REXSYS_INFO("[Signin] profile {} signed in on user {} (was user {})", name_, user_index,
+                previous);
+    // XN_SYS_SIGNINCHANGED (data = signed-in users mask): titles cache who is
+    // signed in and refresh it on this notification, as on a console.
+    if (kernel_state_) {
+      kernel_state_->BroadcastNotification(0x0000000A, 1u << user_index);
+    }
+  }
+}
+
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);

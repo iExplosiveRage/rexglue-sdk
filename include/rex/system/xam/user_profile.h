@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -221,6 +223,14 @@ class UserProfile {
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
+  // The guest user index (0-3) the one profile is signed in on; every other
+  // index reports no user. 0 until the title moves it (e.g. to the controller
+  // that pressed Start, when another device holds user 0), so the player is
+  // signed in to Xbox LIVE whichever pad they play with.
+  uint32_t signed_in_user() const { return signed_in_user_.load(std::memory_order_relaxed); }
+  bool IsSignedIn(uint32_t user_index) const { return user_index == signed_in_user(); }
+  void set_signed_in_user(uint32_t user_index);
+
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
 
   void AddSetting(std::unique_ptr<Setting> setting);
@@ -229,6 +239,7 @@ class UserProfile {
  private:
   uint64_t xuid_;
   std::string name_;
+  std::atomic<uint32_t> signed_in_user_{0};
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;
