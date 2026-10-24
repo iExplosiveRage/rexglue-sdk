@@ -20,6 +20,7 @@ set(REXUI_CORE_SOURCES
     windowed_app.cpp
     windowed_app_context.cpp
     windowed_app_context_sdl.cpp
+    ui_watchdog.cpp
 )
 
 # Optional overlay dialogs

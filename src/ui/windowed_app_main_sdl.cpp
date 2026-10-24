@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/ui_watchdog.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
@@ -66,7 +67,17 @@ int RunWindowedApp(int argc, char** argv) {
     }
     app->SetParsedArguments(std::move(parsed));
 
-    result = app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
+    // The start (paths, window, graphics, maybe the game) runs before the loop:
+    // watched too.
+    rex::ui::StartUIWatchdog();
+    rex::ui::UIThreadBusyBegin();
+    bool initialized;
+    {
+      rex::ui::UIThreadPhase phase("starting up");
+      initialized = app->OnInitialize();
+    }
+    rex::ui::UIThreadBusyEnd();
+    result = initialized ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
 
     app->InvokeOnDestroy();
   }

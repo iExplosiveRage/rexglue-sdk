@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/ui/ui_watchdog.h>
 #include <rex/rex_app.h>
 
 #include <atomic>
@@ -768,6 +769,25 @@ bool ReXApp::SetupEnvironment() {
     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
 
   REXLOG_DEBUG("{} starting", GetName());
+#if REX_PLATFORM_WIN32
+  // Under Wine / Proton: which one (for Linux reports).
+  if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+    using GetVersionFn = const char*(__cdecl*)();
+    using GetHostVersionFn = void(__cdecl*)(const char**, const char**);
+    if (auto wine_version =
+            reinterpret_cast<GetVersionFn>(GetProcAddress(ntdll, "wine_get_version"))) {
+      const char* sysname = nullptr;
+      const char* release = nullptr;
+      if (auto host_version = reinterpret_cast<GetHostVersionFn>(
+              GetProcAddress(ntdll, "wine_get_host_version"))) {
+        host_version(&sysname, &release);
+      }
+      const char* proton = std::getenv("PROTON_VERSION");
+      REXLOG_INFO("Running under Wine {} on {} {}{}{}", wine_version(), sysname ? sysname : "?",
+                  release ? release : "?", proton ? ", Proton " : "", proton ? proton : "");
+    }
+  }
+#endif
   if (!game_data_root_.empty()) {
     REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
   }
@@ -1166,6 +1186,7 @@ void ReXApp::LaunchModule() {
           });
     }
 
+    ui::UIThreadPhase phase("starting the game");
     OnPreLaunchModule();
 
     auto main_thread = runtime_->PrepareModuleLaunch();
@@ -1180,6 +1201,7 @@ void ReXApp::LaunchModule() {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+        ui::UIThreadPhase storage_phase("loading the shader storage (cache)");
         graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
       }
     }
@@ -1202,6 +1224,7 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
   return [this](PathConfig paths) {
     if (shutting_down_.load(std::memory_order_acquire))
       return;
+    ui::UIThreadPhase phase("setting up the game (runtime)");
     if (!ConstructRuntime(std::move(paths))) {
       app_context().QuitFromUIThread();
       return;

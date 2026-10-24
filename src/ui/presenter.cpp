@@ -15,6 +15,7 @@
 #include <chrono>
 #include <utility>
 
+#include <rex/ui/ui_watchdog.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/draw_overrides.h>
@@ -406,7 +407,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
-      const bool ui_tick = WaitForUITickFromUIThread();
+      bool ui_tick;
+      {
+        UIThreadPhase phase("waiting for the display (vertical blank)");
+        ui_tick = WaitForUITickFromUIThread();
+      }
 
       // A repaint only for the UI drawers (they ask for one every frame while
       // shown, such as the debug overlay) at the monitor's refresh rate would
@@ -437,11 +442,15 @@ void Presenter::PaintFromUIThread(bool force_paint) {
         // block in Present). Wait for the next vblank and present the newest
         // guest frame then.
         if (vsync) {
+          UIThreadPhase phase("waiting for the display (VSync present slot)");
           WaitForVsyncPresentSlotFromUIThread();
         }
         ui_painted_guest_output_refresh_count_ =
             guest_output_refresh_count_.load(std::memory_order_acquire);
-        paint_result = PaintAndPresent(draw_ui);
+        {
+          UIThreadPhase phase("drawing and presenting a frame");
+          paint_result = PaintAndPresent(draw_ui);
+        }
 #if REX_PLATFORM_WIN32
         {
           std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
@@ -1581,6 +1590,12 @@ bool Presenter::WaitForUITickFromUIThread() {
   }
   std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   uint64_t last_vblank_before_wait = dxgi_ui_tick_last_vblank_;
+  // Bounded: the vblank thread may stop ticking without losing its output
+  // (an emulated WaitForVBlank under Wine / Proton that never returns, a
+  // driver stall). The UI thread must never wait for it forever - that is a
+  // frozen, black, "not responding" window. 100 ms is several refreshes even
+  // at 30 Hz, so on a working display this never triggers.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   while (true) {
     // Guest output present requests should interrupt the wait as quickly as
     // possible as they should be fulfilled as early as possible.
@@ -1598,7 +1613,15 @@ bool Presenter::WaitForUITickFromUIThread() {
           std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
       return true;
     }
-    dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
+    if (dxgi_ui_tick_signal_condition_.wait_until(dxgi_ui_tick_lock, deadline) ==
+        std::cv_status::timeout) {
+      if (!ui_tick_timeout_logged_) {
+        ui_tick_timeout_logged_ = true;
+        REXLOG_WARN("Presenter: no vertical blank from the display for 100 ms, drawing the UI "
+                    "without waiting for it");
+      }
+      return false;
+    }
   }
 #endif  // XE_PLATFORM
   return false;

@@ -25,6 +25,17 @@ std::wstring Widen(const std::string& text) {
   return out;
 }
 
+// Wine's WinHTTP doesn't know WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY (it is
+// taken as "no proxy", so a proxy set for Wine is skipped): the default proxy
+// settings there (Wine's own, or http_proxy).
+DWORD ProxyAccessType() {
+  static const bool wine = [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version");
+  }();
+  return wine ? WINHTTP_ACCESS_TYPE_DEFAULT_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+}
+
 }  // namespace
 
 HttpResponse HttpRequest(const std::string& method, const std::string& url,
@@ -46,7 +57,7 @@ HttpResponse HttpRequest(const std::string& method, const std::string& url,
     return response;
   }
   const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
-  HINTERNET session = WinHttpOpen(L"burstlimit-online", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+  HINTERNET session = WinHttpOpen(L"burstlimit-online", ProxyAccessType(),
                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) {
     session = WinHttpOpen(L"burstlimit-online", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,

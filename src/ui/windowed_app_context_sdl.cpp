@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/ui_watchdog.h>
 #include <rex/ui/window_sdl.h>
 
 namespace rex::ui {
@@ -85,19 +86,23 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
 }
 
 int SDLWindowedAppContext::RunMainMessageLoop() {
+  StartUIWatchdog();
   while (!HasQuitFromUIThread()) {
     SDL_Event event;
     if (!SDL_WaitEvent(&event)) {
       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
       return EXIT_FAILURE;
     }
+    UIThreadBusyBegin();
     ProcessEvent(event);
+    UIThreadBusyEnd();
   }
   return EXIT_SUCCESS;
 }
 
 void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
   if (event.type == wakeup_event_type_) {
+    UIThreadPhase phase("running UI thread tasks");
     ExecutePendingFunctionsFromUIThread();
     return;
   }
@@ -119,6 +124,7 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       }
     }
     if (WindowSDL* window = GetWindow(event.user.windowID)) {
+      UIThreadPhase phase("painting the window");
       window->HandlePaintEvent();
     }
     return;

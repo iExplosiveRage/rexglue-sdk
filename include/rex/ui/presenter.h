@@ -1079,6 +1079,8 @@ class Presenter {
   // The shutdown flag is modifiable only from the UI thread.
   bool dxgi_ui_tick_thread_shutdown_ = false;
   bool dxgi_ui_tick_force_requested_ = false;
+  // WaitForUITickFromUIThread gave up waiting for a vblank (logged once).
+  bool ui_tick_timeout_logged_ = false;
 
   std::condition_variable dxgi_ui_tick_control_condition_;
   // May be signaled by guest output refreshing.
