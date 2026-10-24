@@ -77,6 +77,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void HandleEvent(const SDL_Event& event);
   std::unique_lock<std::mutex> DrainAndLock();
   void ProcessEventLocked(const SDL_Event& event);
+  // A joystick SDL can't map gets a generic gamepad mapping (hid_generic_mapping).
+  bool AddGenericMapping(SDL_JoystickID id, const char* name, const char* guid);
   void OnJoystickDeviceAddedLocked(const SDL_Event& event);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);

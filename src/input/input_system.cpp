@@ -116,6 +116,10 @@ void InputSystem::RefreshDevices() {
                                  [&](const DeviceInfo& d) { return d.id == seen[i].id; });
     if (existing != devices_.end()) {
       seen[i].ordinal = existing->ordinal;
+      // A synthetic device moved to another guest user (keyboard_player).
+      if (existing->user_index != seen[i].user_index) {
+        changed = true;
+      }
       continue;
     }
     fresh[i] = true;
@@ -349,7 +353,8 @@ void InputSystem::InjectButtons(uint32_t user_index, uint16_t buttons, uint32_t 
   rex::perf::LatencyLog("inject", buttons, duration_ms);
 }
 
-X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state) {
+X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state,
+                                    bool pads_only) {
   SCOPE_profile_cpu_f("hid");
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (!assignment_) {
@@ -364,7 +369,8 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
   bool any = false;
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
-    if (!driver) {
+    const DeviceInfo* info = DeviceInfoFor(id);
+    if (!driver || (pads_only && info && info->synthetic)) {
       continue;
     }
     X_INPUT_STATE state = {};
@@ -372,6 +378,11 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    // What the player last touched: the keyboard or a controller (the NOP
+    // stand-in never gives input).
+    if (info && !IsNeutral(state.gamepad) && (info->keyboard || !info->synthetic)) {
+      last_input_keyboard_.store(info->keyboard, std::memory_order_relaxed);
+    }
     if (!any) {
       merged = state;
       any = true;
@@ -380,11 +391,17 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
     }
   }
 
+  // A pads-only read sees part of the user: it doesn't decide whether the
+  // user is connected.
   if (!any) {
-    UpdateConnectedUser(user_index, false);
+    if (!pads_only) {
+      UpdateConnectedUser(user_index, false);
+    }
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  UpdateConnectedUser(user_index, true);
+  if (!pads_only) {
+    UpdateConnectedUser(user_index, true);
+  }
   AdjustDeadzoneLevels(user_index, &merged.gamepad);
   if (static_cast<uint16_t>(merged.gamepad.buttons) != 0 && user_index < kMaxGuestUsers) {
     last_used_user_ = user_index;
@@ -398,6 +415,8 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
                                          std::chrono::steady_clock::now().time_since_epoch())
                                          .count());
     if (now_ms < injected_until_ms_[user_index]) {
+      // Automation stands in for a controller.
+      last_input_keyboard_.store(false, std::memory_order_relaxed);
       merged.gamepad.buttons =
           static_cast<uint16_t>(uint16_t(merged.gamepad.buttons) | injected_buttons_[user_index]);
       merged.gamepad.left_trigger = std::max<uint8_t>(uint8_t(merged.gamepad.left_trigger),

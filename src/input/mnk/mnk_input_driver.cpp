@@ -23,40 +23,64 @@
 #include <cstring>
 #include <string_view>
 
-REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+// On by default: the keyboard plays as a controller next to the pads (both
+// drive player 1, or the keyboard is player keyboard_player), so the game is
+// playable without one.
+REXCVAR_DEFINE_BOOL(mnk_mode, true, "Input",
+                    "Keyboard play: the keyboard works as a controller (with or without a pad)");
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "Use the mouse for the right stick. Off means the right stick comes "
                     "from the keybind_rstick_* keys only");
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
+REXCVAR_DEFINE_UINT32(keyboard_player, 1, "Input",
+                      "The player the keyboard controls: 1 (together with the first "
+                      "controller) or 2-4 (for example player 2 of a local Versus next to a pad)")
+    .range(1, 4);
 
-REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
-REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
-REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
-REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button");
-REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger");
-REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger");
-REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder");
-REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder");
-REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
-REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down");
-REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
-REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
+// The defaults suit a fighting game on one keyboard: move with WASD or the
+// arrows, the right hand on J / K / L / I / U / O. Each value is a
+// comma-separated list of keys, a key optionally with Shift+ / Ctrl+ / Alt+.
+REXCVAR_DEFINE_STRING(keybind_a, "Space,L", "Input/Keybinds/Controller", "A button");
+REXCVAR_DEFINE_STRING(keybind_b, "K,Backspace", "Input/Keybinds/Controller", "B button");
+REXCVAR_DEFINE_STRING(keybind_x, "J", "Input/Keybinds/Controller", "X button");
+REXCVAR_DEFINE_STRING(keybind_y, "I", "Input/Keybinds/Controller", "Y button");
+REXCVAR_DEFINE_STRING(keybind_left_trigger, "U", "Input/Keybinds/Controller", "Left trigger");
+REXCVAR_DEFINE_STRING(keybind_right_trigger, "O", "Input/Keybinds/Controller", "Right trigger");
+REXCVAR_DEFINE_STRING(keybind_left_shoulder, "Q", "Input/Keybinds/Controller", "Left shoulder");
+REXCVAR_DEFINE_STRING(keybind_right_shoulder, "E", "Input/Keybinds/Controller", "Right shoulder");
+REXCVAR_DEFINE_STRING(keybind_lstick_up, "W,Up", "Input/Keybinds/Controller", "Left stick up");
+REXCVAR_DEFINE_STRING(keybind_lstick_down, "S,Down", "Input/Keybinds/Controller",
+                      "Left stick down");
+REXCVAR_DEFINE_STRING(keybind_lstick_left, "A,Left", "Input/Keybinds/Controller",
+                      "Left stick left");
+REXCVAR_DEFINE_STRING(keybind_lstick_right, "D,Right", "Input/Keybinds/Controller",
+                      "Left stick right");
 REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press");
-REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up");
-REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down");
-REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left");
-REXCVAR_DEFINE_STRING(keybind_rstick_right, "Right", "Input/Keybinds/Controller",
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "Numpad8", "Input/Keybinds/Controller", "Right stick up");
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "Numpad2", "Input/Keybinds/Controller",
+                      "Right stick down");
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "Numpad4", "Input/Keybinds/Controller",
+                      "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_rstick_right, "Numpad6", "Input/Keybinds/Controller",
                       "Right stick right");
-REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press");
-REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up");
-REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down");
-REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left");
-REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller",
+REXCVAR_DEFINE_STRING(keybind_rstick_press, "G", "Input/Keybinds/Controller", "Right stick press");
+REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up,Shift+W", "Input/Keybinds/Controller",
+                      "D-pad up");
+REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down,Shift+S", "Input/Keybinds/Controller",
+                      "D-pad down");
+REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left,Shift+A", "Input/Keybinds/Controller",
+                      "D-pad left");
+REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right,Shift+D", "Input/Keybinds/Controller",
                       "D-pad right");
-REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button");
-REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
+REXCVAR_DEFINE_STRING(keybind_back, "Tab", "Input/Keybinds/Controller", "Back button");
+REXCVAR_DEFINE_STRING(keybind_start, "Return", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
+// The menu keys: what they press depends on the screen (SetMenuKeyButtons).
+REXCVAR_DEFINE_STRING(keybind_menu_confirm, "Return", "Input/Keybinds/Controller",
+                      "Menu confirm (A, Start at the title)");
+REXCVAR_DEFINE_STRING(keybind_menu_back, "Escape", "Input/Keybinds/Controller",
+                      "Menu back (B, pause in a fight)");
 
 REXCVAR_DEFINE_BOOL(mnk_passthrough, false, "Input",
                     "Surface raw keystrokes to the title instead of emulating a pad, for "
@@ -145,6 +169,10 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
 }
 
 std::atomic<bool> mouse_look_active{true};
+
+// SetMenuKeyButtons: confirm in the low 16 bits, back in the high.
+std::atomic<uint32_t> menu_key_buttons{uint32_t(X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_START) |
+                                       (uint32_t(X_INPUT_GAMEPAD_B) << 16)};
 
 // ui::VirtualKey follows Windows VK_ numbering; the guest wants USB HID usage
 // page 0x07.
@@ -299,6 +327,10 @@ std::array<PadBind, 24> PadBinds() {
 
 }  // namespace
 
+void SetMenuKeyButtons(uint16_t confirm, uint16_t back) {
+  menu_key_buttons.store(uint32_t(confirm) | (uint32_t(back) << 16), std::memory_order_relaxed);
+}
+
 void SetMouseLookActive(bool active) {
   mouse_look_active.store(active, std::memory_order_relaxed);
 }
@@ -393,6 +425,9 @@ void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   info.subtype =
       IsPassthroughEnabled() ? XINPUT_DEVSUBTYPE_USB_KEYBOARD : XINPUT_DEVSUBTYPE_GAMEPAD;
   info.synthetic = true;
+  info.keyboard = true;
+  const uint32_t player = REXCVAR_GET(keyboard_player);
+  info.user_index = player >= 2 && player <= kMaxGuestUsers ? int32_t(player - 1) : -1;
   out.push_back(info);
 }
 
@@ -440,7 +475,18 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
                           has_focus_ && is_active());
 
-  if (!is_active() || !has_focus_) {
+  std::lock_guard lock(state_mutex_);
+
+  // The keys that count: the real ones while the game has the input (focus,
+  // no dialog over it), and any injected ones.
+  const bool live = is_active() && has_focus_;
+  bool keys[256];
+  bool any_injected = false;
+  for (int i = 0; i < 256; ++i) {
+    keys[i] = (live && key_down_[i]) || injected_down_[i];
+    any_injected |= injected_down_[i];
+  }
+  if (!live && !any_injected) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -448,63 +494,92 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_SUCCESS;
   }
 
-  std::lock_guard lock(state_mutex_);
-
+  // The menu keys press what the screen wants them to (SetMenuKeyButtons);
+  // while they do, they're kept from the other binds (Enter is also Start).
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+  {
+    const uint32_t menu = menu_key_buttons.load(std::memory_order_relaxed);
+    const uint16_t confirm_buttons = uint16_t(menu & 0xFFFF);
+    const uint16_t back_buttons = uint16_t(menu >> 16);
+    bool menu_keys[256] = {};
+    auto take = [&](const std::string& bind, uint16_t pad_buttons) {
+      if (!pad_buttons || !IsBindPressed(keys, bind)) {
+        return;
+      }
+      buttons |= pad_buttons;
+      std::string_view rest(bind);
+      while (!rest.empty()) {
+        const size_t comma = rest.find(',');
+        std::string_view token = TrimSpaces(rest.substr(0, comma));
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+        TakeModifiers(token);
+        const uint16_t vk = static_cast<uint16_t>(rex::ui::ParseVirtualKey(token));
+        if (vk && vk < 256) {
+          menu_keys[vk] = true;
+        }
+      }
+    };
+    take(REXCVAR_GET(keybind_menu_confirm), confirm_buttons);
+    take(REXCVAR_GET(keybind_menu_back), back_buttons);
+    for (int i = 0; i < 256; ++i) {
+      keys[i] = keys[i] && !menu_keys[i];
+    }
+  }
+
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_x)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_y)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_left_shoulder)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_right_shoulder)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_lstick_press)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_rstick_press)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_back)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_start)))
     buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_dpad_up)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_dpad_down)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_dpad_left)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = IsBindPressed(keys, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+  uint8_t rt = IsBindPressed(keys, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_lstick_left)))
     lx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_lstick_right)))
     lx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_lstick_up)))
     ly += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_lstick_down)))
     ly -= INT16_MAX;
 
   int32_t rx = 0;
   int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_rstick_left)))
     rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_rstick_right)))
     rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_rstick_up)))
     ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+  if (IsBindPressed(keys, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
@@ -713,7 +788,11 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  const bool injected = rex::ui::Window::IsInjectingKey();
+  if (!IsEnabled() || (!has_focus_ && !injected))
+    return;
+  // Typing into a text box (the console) is not playing.
+  if (!injected && attached_window_ && attached_window_->IsTextInputActive())
     return;
   std::lock_guard lock(state_mutex_);
   if (IsPassthroughEnabled()) {
@@ -721,7 +800,13 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   }
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, true);
+  if (injected) {
+    if (vk < 256) {
+      injected_down_[vk] = true;
+    }
+  } else {
+    SetKeyState(vk, true);
+  }
   RefreshBoundKeystrokesLocked();
 }
 
@@ -734,7 +819,13 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
     return;
   }
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, false);
+  if (rex::ui::Window::IsInjectingKey()) {
+    if (vk < 256) {
+      injected_down_[vk] = false;
+    }
+  } else {
+    SetKeyState(vk, false);
+  }
   RefreshBoundKeystrokesLocked();
 }
 

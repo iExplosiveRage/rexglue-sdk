@@ -25,6 +25,14 @@ namespace rex::input::mnk {
 void SetMouseLookActive(bool active);
 bool IsMouseLookActive();
 
+/// What the menu keys (keybind_menu_confirm / keybind_menu_back, Enter and Esc
+/// by default) press on the emulated pad, as X_INPUT_GAMEPAD_* bits - set by
+/// the title for the screen it is on: in menus Enter = A (+ Start for a
+/// "press Start" title), Esc = B; in gameplay Esc = Start (pause). 0 = the key
+/// only does what the other keybind_* settings bind it to. Default: confirm =
+/// A + Start, back = B. Any thread.
+void SetMenuKeyButtons(uint16_t confirm, uint16_t back);
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
@@ -85,6 +93,9 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Keys pressed by Window::InjectKey (automation): they count without focus
+  // and survive focus changes.
+  bool injected_down_[256] = {};
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

@@ -29,7 +29,7 @@ namespace rex::ui {
 // RB), by physical position: kPlayStation shows Cross / Circle / Triangle and
 // L1 / R1, kNintendo B / A / X and L / R (the bottom face button is Nintendo's
 // B). Any thread; a game sets it from its own setting.
-enum class ButtonGlyphs { kXbox, kPlayStation, kNintendo };
+enum class ButtonGlyphs { kXbox, kPlayStation, kNintendo, kKeyboard };
 void SetButtonGlyphs(ButtonGlyphs glyphs);
 ButtonGlyphs GetButtonGlyphs();
 

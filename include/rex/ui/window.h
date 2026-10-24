@@ -349,6 +349,14 @@ class Window {
   void SetCursorAutoHideDelayMs(uint32_t delay_ms) { cursor_auto_hide_delay_ms_ = delay_ms; }
 
   bool HasFocus() const { return HasActualState() ? has_focus_ : false; }
+
+  // Debugging / automation (UI thread): a key pressed or released as if typed
+  // on the keyboard, through the same listeners - also while the window is in
+  // the background (the keyboard play device takes injected keys without
+  // focus). IsInjectingKey is true on the UI thread while one is dispatched.
+  void InjectKey(VirtualKey key, bool down);
+  static bool IsInjectingKey();
+
   // May be applied in a delayed way or dropped at all, HasFocus will not
   // necessarily be true immediately.
   void Focus();

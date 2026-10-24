@@ -461,6 +461,12 @@ REXCVAR_DEFINE_COMMAND(quick_menu_toggle, rex::ReXApp::ToggleQuickMenuCommand, "
                        "Open or close the settings menu (F1)");
 REXCVAR_DEFINE_COMMAND(config_save, rex::ReXApp::SaveConfigCommand, "Debug",
                        "Write the settings file now, as the settings menu does after a change");
+REXCVAR_DEFINE_COMMAND_ARGS(key_press, [](std::string_view a) { rex::ReXApp::KeyCommand(a, 0); },
+                            "Debug", "Press a key as if typed: key_press <key> [ms]");
+REXCVAR_DEFINE_COMMAND_ARGS(key_down, [](std::string_view a) { rex::ReXApp::KeyCommand(a, 1); },
+                            "Debug", "Hold a key down as if typed: key_down <key>");
+REXCVAR_DEFINE_COMMAND_ARGS(key_up, [](std::string_view a) { rex::ReXApp::KeyCommand(a, 2); },
+                            "Debug", "Release a key held with key_down: key_up <key>");
 namespace rex {
 namespace {
 // gpu_state: what the GPU (command processor) thread is doing right now - for
@@ -1033,6 +1039,50 @@ void ReXApp::ToggleQuickMenuCommand() {
   }
 }
 
+// key_press <key> [ms] / key_down <key> / key_up <key>: a key typed on the
+// keyboard (names as in the keybind settings: J, Space, Return, Escape, Up,
+// F1...) - through the window's listeners like a real one, so the game's
+// keyboard play, the menus and the binds all see it, also in the background.
+void ReXApp::KeyCommand(std::string_view args, int mode) {
+  ReXApp* app = g_quick_menu_app.load();
+  if (!app || !app->window_) {
+    REXLOG_WARN("key_press: no window yet");
+    return;
+  }
+  std::string text(args);
+  const size_t space = text.find(' ');
+  const std::string name = text.substr(0, space);
+  uint32_t ms = 80;
+  if (space != std::string::npos) {
+    try {
+      ms = uint32_t(std::stoul(text.substr(space + 1)));
+    } catch (...) {
+    }
+  }
+  const ui::VirtualKey key = ui::ParseVirtualKey(name);
+  if (key == ui::VirtualKey::kNone) {
+    REXLOG_WARN("key_press: unknown key '{}'", name);
+    return;
+  }
+  // Console and pipe lines run on the UI thread.
+  if (mode != 2) {
+    app->window_->InjectKey(key, true);
+  }
+  if (mode == 0) {
+    std::thread([app, key, ms]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      app->app_context().CallInUIThreadDeferred([app, key]() {
+        if (app->window_) {
+          app->window_->InjectKey(key, false);
+        }
+      });
+    }).detach();
+  } else if (mode == 2) {
+    app->window_->InjectKey(key, false);
+  }
+  REXLOG_INFO("key_press: {} {}", name, mode == 0 ? std::to_string(ms) + " ms" : mode == 1 ? "down" : "up");
+}
+
 void ReXApp::SaveConfigCommand() {
   // Console and pipe lines run on the UI thread, like the menu's saves.
   if (ReXApp* app = g_quick_menu_app.load()) {
@@ -1366,10 +1416,12 @@ void ReXApp::ToggleQuickMenu() {
       return ui::ReadGamepadsBeforeGame();
     }
     // Any controller can drive the menu; the stick pushed the furthest wins.
+    // Not the keyboard play device: the menu reads the keyboard itself (else
+    // the arrows / Enter would act twice).
     int stick_distance = 0;
     for (uint32_t user_index = 0; user_index < rex::input::kMaxGuestUsers; ++user_index) {
       rex::input::X_INPUT_STATE state = {};
-      if (input_sys->GetStateForUI(user_index, &state) != X_ERROR_SUCCESS) {
+      if (input_sys->GetStateForUI(user_index, &state, true) != X_ERROR_SUCCESS) {
         continue;
       }
       pad.buttons |= static_cast<uint16_t>(state.gamepad.buttons);

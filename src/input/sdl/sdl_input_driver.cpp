@@ -15,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <string>
 #include <string_view>
 
 #include <rex/assert.h>
@@ -28,6 +29,10 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
+REXCVAR_DEFINE_BOOL(hid_generic_mapping, true, "Input",
+                    "Controllers SDL has no mapping for (some DirectInput-only and laptop "
+                    "gamepads) get a generic one (buttons 1-4 = A B X Y, the last ones = "
+                    "Back / Start, the first stick and hat = moving) instead of being ignored");
 REXCVAR_DEFINE_BOOL(input_poll_on_read, true, "Input",
                     "Read the controllers at the moment the game asks for their state. Off = "
                     "the state of the last update the UI thread ran, which the game's previous "
@@ -630,11 +635,81 @@ void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
       name ? name : "?", SDL_GetJoystickVendorForID(id), SDL_GetJoystickProductForID(id), guid_text,
       is_gamepad);
   if (!is_gamepad) {
+    if (REXCVAR_GET(hid_generic_mapping) && AddGenericMapping(id, name, guid_text)) {
+      return;
+    }
     REXLOG_WARN(
         "SDL JoystickAdded: \"{}\" has no gamepad mapping, so it will not be usable. Add one to "
         "the file named by --hid_mappings_file.",
         name ? name : "?");
   }
+}
+
+bool SDLInputDriver::AddGenericMapping(SDL_JoystickID id, const char* name, const char* guid) {
+  // Only things that look like a gamepad: not wheels, guitars, flight sticks.
+  const SDL_JoystickType type = SDL_GetJoystickTypeForID(id);
+  if (type != SDL_JOYSTICK_TYPE_UNKNOWN && type != SDL_JOYSTICK_TYPE_GAMEPAD) {
+    return false;
+  }
+  SDL_Joystick* joystick = SDL_OpenJoystick(id);
+  if (!joystick) {
+    return false;
+  }
+  const int buttons = SDL_GetNumJoystickButtons(joystick);
+  const int axes = SDL_GetNumJoystickAxes(joystick);
+  const int hats = SDL_GetNumJoystickHats(joystick);
+  SDL_CloseJoystick(joystick);
+  if (buttons < 4) {
+    return false;
+  }
+  // The usual generic USB pad: 4 face buttons, L1 R1 L2 R2, Select, Start,
+  // L3, R3 (fewer buttons: Back / Start are the last two).
+  std::string mapping = std::string(guid) + "," + (name && *name ? name : "Generic gamepad");
+  auto button = [&](const char* what, int index) {
+    if (index >= 0 && index < buttons) {
+      mapping += std::string(",") + what + ":b" + std::to_string(index);
+    }
+  };
+  button("a", 0);
+  button("b", 1);
+  button("x", 2);
+  button("y", 3);
+  if (buttons >= 10) {
+    button("leftshoulder", 4);
+    button("rightshoulder", 5);
+    button("lefttrigger", 6);
+    button("righttrigger", 7);
+    button("back", 8);
+    button("start", 9);
+    button("leftstick", 10);
+    button("rightstick", 11);
+  } else {
+    if (buttons >= 8) {
+      button("leftshoulder", 4);
+      button("rightshoulder", 5);
+    }
+    button("back", buttons - 2);
+    button("start", buttons - 1);
+  }
+  if (axes >= 2) {
+    mapping += ",leftx:a0,lefty:a1";
+  }
+  if (axes >= 4) {
+    mapping += ",rightx:a2,righty:a3";
+  }
+  if (hats >= 1) {
+    mapping += ",dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8";
+  }
+  // SDL announces the pad as a gamepad once it has a mapping.
+  if (SDL_AddGamepadMapping(mapping.c_str()) < 0) {
+    REXLOG_WARN("SDL JoystickAdded: \"{}\": generic mapping refused: {}", name ? name : "?",
+                SDL_GetError());
+    return false;
+  }
+  REXLOG_INFO("SDL JoystickAdded: \"{}\" had no gamepad mapping; using a generic one ({} buttons, "
+              "{} axes, {} hats): {}",
+              name ? name : "?", buttons, axes, hats, mapping);
+  return true;
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {

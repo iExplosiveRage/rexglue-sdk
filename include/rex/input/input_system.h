@@ -51,7 +51,9 @@ class InputSystem : public system::IInputSystem {
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   /// GetState for the emulator's own UI, which reads while the guest is blocked.
-  X_RESULT GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state);
+  /// `pads_only`: without the synthetic devices (the keyboard), for UI that
+  /// reads the keyboard itself.
+  X_RESULT GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state, bool pads_only = false);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
@@ -84,6 +86,9 @@ class InputSystem : public system::IInputSystem {
   /// using - the one most recently in the player's hands - or 0 when that is
   /// unknown, the keyboard or no controller. Any thread.
   uint8_t GetGamepadType(uint32_t user_index);
+  /// Whether the last input any player gave (a button, a stick or a trigger)
+  /// came from the keyboard rather than a controller. Any thread.
+  bool LastInputWasKeyboard() const { return last_input_keyboard_.load(std::memory_order_relaxed); }
 
  private:
   using JoystickValue = std::pair<uint16_t, uint16_t>;
@@ -114,6 +119,7 @@ class InputSystem : public system::IInputSystem {
 
   std::bitset<kMaxGuestUsers> connected_users_;
   uint32_t last_used_user_ = 0;
+  std::atomic<bool> last_input_keyboard_{false};
   // {left, right} stick maxima, scaling the deadzone percentages.
   std::array<std::pair<JoystickValue, JoystickValue>, kMaxGuestUsers> user_max_joystick_value_ = {};
 

@@ -95,6 +95,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// The quick_menu_toggle debug command: opens / closes the settings menu of
   /// the running app (tests through the command pipe).
   static void ToggleQuickMenuCommand();
+  /// key_press / key_down / key_up (mode 0 / 1 / 2).
+  static void KeyCommand(std::string_view args, int mode);
   /// The config_save debug command: writes the settings file now, as the
   /// settings menu does after a change (tests set a cvar through the pipe,
   /// save, restart).

@@ -32,6 +32,10 @@ struct DeviceInfo {
   // unknown or synthetic. Lets the game show the controller's own button glyphs.
   uint8_t gamepad_type = 0;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  bool keyboard = false;   // the keyboard (keyboard/mouse emulation)
+  // Synthetic devices only: the guest user they feed (-1 = user 0, merged with
+  // the first pad). Lets the keyboard be player 2 next to a pad.
+  int32_t user_index = -1;
 };
 
 }  // namespace rex::input

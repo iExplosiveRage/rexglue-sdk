@@ -22,7 +22,10 @@ void SlotAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) {
   // not promote pad two to player one.
   for (const auto& device : devices) {
     if (device.synthetic) {
-      users_[0].push_back(device.id);
+      const uint32_t user = device.user_index >= 0 && uint32_t(device.user_index) < kMaxGuestUsers
+                                ? uint32_t(device.user_index)
+                                : 0;
+      users_[user].push_back(device.id);
     } else if (device.ordinal < kMaxGuestUsers) {
       users_[device.ordinal].push_back(device.id);
     }

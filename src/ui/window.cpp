@@ -690,6 +690,28 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
   }
 }
 
+namespace {
+thread_local bool g_injecting_key = false;
+}  // namespace
+
+bool Window::IsInjectingKey() {
+  return g_injecting_key;
+}
+
+void Window::InjectKey(VirtualKey key, bool down) {
+  WindowDestructionReceiver destruction_receiver(this);
+  // A press is a first press (no auto-repeat); a release follows a press.
+  KeyEvent e(this, key, 1, !down, false, false, false, false);
+  const bool was_injecting = g_injecting_key;
+  g_injecting_key = true;
+  if (down) {
+    OnKeyDown(e, destruction_receiver);
+  } else {
+    OnKeyUp(e, destruction_receiver);
+  }
+  g_injecting_key = was_injecting;
+}
+
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {

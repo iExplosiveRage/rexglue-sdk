@@ -154,15 +154,17 @@ enum class Face { kBottom, kRight, kLeft, kTop };
 
 // What the glyph of `face` is called in the hints' text.
 const char* FaceName(Face face) {
-  static constexpr const char* kNames[3][4] = {{"A", "B", "X", "Y"},
+  static constexpr const char* kNames[4][4] = {{"A", "B", "X", "Y"},
                                                {"Cross", "Circle", "Square", "Triangle"},
-                                               {"B", "A", "Y", "X"}};
+                                               {"B", "A", "Y", "X"},
+                                               {"Enter", "Esc", "Tab", "Y"}};
   return kNames[g_button_glyphs.load(std::memory_order_relaxed)][int(face)];
 }
 
 // LB or RB as the controller calls it.
 const char* ShoulderName(bool right) {
-  static constexpr const char* kNames[3][2] = {{"LB", "RB"}, {"L1", "R1"}, {"L", "R"}};
+  static constexpr const char* kNames[4][2] = {
+      {"LB", "RB"}, {"L1", "R1"}, {"L", "R"}, {"Page Up", "Page Down"}};
   return kNames[g_button_glyphs.load(std::memory_order_relaxed)][right ? 1 : 0];
 }
 
@@ -171,12 +173,60 @@ const char* ShoulderName(bool right) {
 // The game's button drawing while the menu draws (QuickMenuArt::button), if any.
 const std::function<bool(ImDrawList*, int, float, float, float, float)>* g_art_button = nullptr;
 
+// The width a face button's glyph takes (a key cap with the key's name is
+// wider than a round button).
+// Key names are written in the plain overlay font (the game's font has a
+// thick outline, too heavy on a small key cap), no shadow.
+struct PlainText {
+  decltype(g_art_text) art = g_art_text;
+  ImU32 shadow = g_text_shadow;
+  PlainText() {
+    g_art_text = nullptr;
+    g_text_shadow = 0;
+  }
+  ~PlainText() {
+    g_art_text = art;
+    g_text_shadow = shadow;
+  }
+};
+
+constexpr float kKeyTextScale = 0.95f;
+
+float FaceGlyphWidth(Face face, float radius) {
+  if (ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed)) == ButtonGlyphs::kKeyboard) {
+    PlainText plain;
+    return std::max(radius * 2.0f,
+                    TextSize(radius * kKeyTextScale, FaceName(face)).x + radius * 1.0f);
+  }
+  return radius * 2.0f;
+}
+
 void DrawFaceGlyph(ImDrawList* draw_list, ImVec2 center, float radius, Face face, float alpha) {
+  auto color = [alpha](int r, int g, int b) { return IM_COL32(r, g, b, int(255.0f * alpha)); };
+  const auto glyphs = ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed));
+  if (glyphs == ButtonGlyphs::kKeyboard) {
+    // A light key cap with the key's name (the menu's own keys: Enter, Esc),
+    // like the keyboard icons the game's prompts get. `center` is the middle
+    // of FaceGlyphWidth.
+    const char* name = FaceName(face);
+    const float half_width = FaceGlyphWidth(face, radius) * 0.5f;
+    PlainText plain;
+    const float text_size = radius * kKeyTextScale;
+    const ImVec2 extent = TextSize(text_size, name);
+    const ImVec2 min(center.x - half_width, center.y - radius);
+    const ImVec2 max(center.x + half_width, center.y + radius);
+    const float rounding = radius * 0.35f;
+    draw_list->AddRectFilled(ImVec2(min.x, min.y + radius * 0.12f),
+                             ImVec2(max.x, max.y + radius * 0.12f), color(70, 70, 76), rounding);
+    draw_list->AddRectFilled(min, max, color(242, 242, 244), rounding);
+    draw_list->AddRect(min, max, color(70, 70, 76), rounding, 0, std::max(1.5f, radius * 0.14f));
+    DrawText(draw_list, text_size, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f),
+             color(52, 52, 58), name);
+    return;
+  }
   if (g_art_button && (*g_art_button)(draw_list, int(face), center.x, center.y, radius, alpha)) {
     return;
   }
-  auto color = [alpha](int r, int g, int b) { return IM_COL32(r, g, b, int(255.0f * alpha)); };
-  const auto glyphs = ButtonGlyphs(g_button_glyphs.load(std::memory_order_relaxed));
   if (glyphs == ButtonGlyphs::kPlayStation) {
     draw_list->AddCircleFilled(center, radius, color(34, 38, 46), 32);
     draw_list->AddCircle(center, radius - 0.75f, color(92, 100, 114), 32, 1.5f);
@@ -219,6 +269,13 @@ void DrawFaceGlyph(ImDrawList* draw_list, ImVec2 center, float radius, Face face
   const ImVec2 extent = TextSize(letter_size, letter);
   DrawText(draw_list, letter_size, ImVec2(center.x - extent.x * 0.5f, center.y - extent.y * 0.5f),
            color(255, 255, 255), letter);
+}
+
+// What cancels waiting for a key: Esc, or the controller's B.
+std::string CancelKeys() {
+  return GetButtonGlyphs() == ButtonGlyphs::kKeyboard ? std::string("Esc")
+                                                       : std::string("Esc or ") +
+                                                             FaceName(Face::kRight);
 }
 
 // Colors faded in with the menu.
@@ -423,27 +480,64 @@ void QuickMenuDialog::FinishCapture(VirtualKey key) {
     capture_message_ = "That key can't be used.";
     return;
   }
-  switch (key) {
-    case VirtualKey::kUp:
-    case VirtualKey::kDown:
-    case VirtualKey::kLeft:
-    case VirtualKey::kRight:
-    case VirtualKey::kPrior:
-    case VirtualKey::kNext:
-    case VirtualKey::kReturn:
-      capture_message_ = KeyLabel(name) + " is used by this menu.";
-      return;
-    default:
-      break;
+  // A key of keyboard play (a controller button, keybind_*): the game doesn't
+  // read the keyboard while this menu is open, so the menu's own keys can be
+  // bound too. Its value can list alternatives ("W,Up"): the key picked
+  // replaces the first one, the others stay.
+  const rex::cvar::FlagEntry* capturing_info = rex::cvar::GetFlagInfo(capturing_->cvar);
+  const bool controller_bind =
+      capturing_info && capturing_info->category == "Input/Keybinds/Controller";
+  if (!controller_bind) {
+    switch (key) {
+      case VirtualKey::kUp:
+      case VirtualKey::kDown:
+      case VirtualKey::kLeft:
+      case VirtualKey::kRight:
+      case VirtualKey::kPrior:
+      case VirtualKey::kNext:
+      case VirtualKey::kReturn:
+        capture_message_ = KeyLabel(name) + " is used by this menu.";
+        return;
+      default:
+        break;
+    }
   }
-  // With keyboard play on, the keys of the emulated controller are taken too.
+  // The new value of the setting.
+  std::string value = name;
+  if (controller_bind) {
+    const std::string old_value = rex::cvar::GetFlagByName(capturing_->cvar);
+    const size_t comma = old_value.find(',');
+    if (comma != std::string::npos) {
+      // Drop alternatives equal to the new key.
+      std::string rest;
+      size_t start = comma + 1;
+      while (start <= old_value.size()) {
+        const size_t end = std::min(old_value.find(',', start), old_value.size());
+        const std::string token = old_value.substr(start, end - start);
+        if (!token.empty() && token != name) {
+          rest += "," + token;
+        }
+        start = end + 1;
+      }
+      value += rest;
+    }
+  }
+  // With keyboard play on, the keys of the emulated controller are taken too
+  // (each key does one thing; the menu keys Enter / Esc may also be a button).
   if (rex::cvar::Query<bool>("mnk_mode")) {
     for (const std::string& flag : rex::cvar::ListFlagsByCategory("Input/Keybinds/Controller")) {
+      if (flag == capturing_->cvar) {
+        continue;
+      }
+      const bool menu_key = flag == "keybind_menu_confirm" || flag == "keybind_menu_back";
       const std::string keys = rex::cvar::GetFlagByName(flag);
       size_t start = 0;
       while (start <= keys.size()) {
-        const size_t end = std::min(keys.find_first_of(",+", start), keys.size());
-        if (end > start && ParseVirtualKey(std::string_view(keys).substr(start, end - start)) == key) {
+        const size_t end = std::min(keys.find(',', start), keys.size());
+        std::string_view token = std::string_view(keys).substr(start, end - start);
+        // A key with a modifier (Shift+Up) is another key than the bare one.
+        const bool has_modifier = token.find('+') != std::string_view::npos && token.size() > 1;
+        if (!has_modifier && !menu_key && ParseVirtualKey(token) == key) {
           const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(flag);
           capture_message_ = KeyLabel(name) + " is used by keyboard play" +
                              (info && !info->description.empty()
@@ -465,8 +559,8 @@ void QuickMenuDialog::FinishCapture(VirtualKey key) {
     capture_message_ += ".";
     return;
   }
-  if (name != rex::cvar::GetFlagByName(capturing_->cvar)) {
-    Set(*capturing_, name);
+  if (value != rex::cvar::GetFlagByName(capturing_->cvar)) {
+    Set(*capturing_, value);
   }
   StopCapture();
 }
@@ -729,11 +823,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) {
       section_step = 1;
     }
-    // With keyboard play on, Enter is the Start button of the emulated pad
-    // (Space is A).
-    if ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-         ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
-        !rex::cvar::Query<bool>("mnk_mode")) {
+    // The menu reads the controllers without the keyboard play device, so
+    // Enter is only this menu's (not also the emulated pad's Start / A).
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
       activate = true;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1204,8 +1297,10 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     } else if (item.kind == QuickMenuItem::Kind::kKey) {
       // The key on a key cap, pulsing while it waits for a key.
       const bool waiting = capturing_ == &item;
+      // A list of keys ("W,Up") shows its first one, the one this row sets.
+      const std::string first_key = current.substr(0, current.find(','));
       const std::string key_text =
-          waiting ? "Press a key" : (current.empty() ? "None" : KeyLabel(current));
+          waiting ? "Press a key" : (first_key.empty() ? "None" : KeyLabel(first_key));
       const ImVec2 key_extent = TextSize(value_size, key_text);
       const ImVec2 cap_min(right - key_extent.x - 32.0f * u, center_y - 19.0f * u);
       const ImVec2 cap_max(right, center_y + 19.0f * u);
@@ -1305,10 +1400,8 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
   if (capturing_) {
     const std::string text =
         capture_message_.empty()
-            ? "Press the key to use for " + capturing_->label + ". Esc or " +
-                  FaceName(Face::kRight) + " cancels."
-            : capture_message_ + " Press another key, or Esc or " + FaceName(Face::kRight) +
-                  " to cancel.";
+            ? "Press the key to use for " + capturing_->label + ". " + CancelKeys() + " cancels."
+            : capture_message_ + " Press another key, or " + CancelKeys() + " to cancel.";
     DrawTextFitted(draw_list, 23.0f * u, 15.0f * u, ImVec2(content_left, y + 6.0f * u),
                    capture_message_.empty() ? color(theme.highlight) : color(theme.warning),
                    text, content_right - content_left, help_bottom);
@@ -1336,16 +1429,19 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
     float x = content_left;
     auto draw_button = [&](Face face, const char* text) {
       const float radius = 15.0f * u;
-      DrawFaceGlyph(draw_list, ImVec2(x + radius, center_y), radius, face, color.alpha);
-      x += radius * 2.0f + 9.0f * u;
+      const float width = FaceGlyphWidth(face, radius);
+      DrawFaceGlyph(draw_list, ImVec2(x + width * 0.5f, center_y), radius, face, color.alpha);
+      x += width + 9.0f * u;
       DrawText(draw_list, hint_size, ImVec2(x, center_y - TextSize(hint_size, text).y * 0.5f),
                color(theme.help), text);
       x += TextSize(hint_size, text).x + 26.0f * u;
     };
     draw_button(Face::kBottom, "Change");
     draw_button(Face::kRight, "Close");
+    // The quick toggle is a controller button (Y); the keyboard has its own key for it.
     if (!config_.quick_toggle_label.empty() &&
-        rex::cvar::GetFlagInfo(config_.quick_toggle_cvar)) {
+        rex::cvar::GetFlagInfo(config_.quick_toggle_cvar) &&
+        GetButtonGlyphs() != ButtonGlyphs::kKeyboard) {
       draw_button(Face::kTop, config_.quick_toggle_label.c_str());
     }
     const char* saved = "Saved automatically";
