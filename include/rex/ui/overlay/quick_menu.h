@@ -83,6 +83,9 @@ struct QuickMenuItem {
   // `empty_text` is shown and A does nothing.
   std::function<std::vector<std::pair<std::string, std::string>>()> list;
   std::string empty_text = "None";
+  // kAction with `list`: the help for the picked value (shown instead of
+  // `help` while it returns text), e.g. the description of a list entry.
+  std::function<std::string(const std::string& value)> list_help;
 };
 
 // A result line under the help of a section, e.g. what an action did.

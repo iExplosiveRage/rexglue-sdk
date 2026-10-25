@@ -1416,9 +1416,18 @@ void QuickMenuDialog::OnDraw(ImGuiIO& io) {
                 6.0f * u;
     }
     if (!rows.empty() && help_y < help_bottom - 16.0f * u) {
+      const QuickMenuItem& selected = section.items[selected_item_];
+      std::string help = selected.help;
+      if (selected.list_help && selected_item_ < lists_.size() &&
+          selected_item_ < list_picks_.size() && !lists_[selected_item_].empty()) {
+        const size_t pick = std::min(list_picks_[selected_item_], lists_[selected_item_].size() - 1);
+        std::string picked_help = selected.list_help(lists_[selected_item_][pick].first);
+        if (!picked_help.empty()) {
+          help = std::move(picked_help);
+        }
+      }
       DrawTextFitted(draw_list, 23.0f * u, 14.0f * u, ImVec2(content_left, help_y),
-                     color(theme.help), section.items[selected_item_].help,
-                     content_right - content_left, help_bottom);
+                     color(theme.help), help, content_right - content_left, help_bottom);
     }
   }
 

@@ -41,6 +41,7 @@
 #include <rex/system/xobject.h>
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xthread.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/system/xtimer.h>
 
 namespace rex::system {
@@ -305,12 +306,40 @@ void KernelState::LoadAchievementsData() {
     achievement_manager_.LoadMetadataFile(*metadata_path);
   }
 
-  // Set up the unlock save path and restore persisted state.
+  // Set up the unlock save path and restore persisted state: one file per
+  // profile (achievements/<XUID>/<title>.toml), so a title's unlocks belong to
+  // the profile that earned them. A file from before (achievements/<title>.toml,
+  // no profile) is taken over by the first profile that has none yet.
   const auto user_root = emulator_->user_data_root();
   if (!user_root.empty()) {
-    achievement_manager_.SetUnlockSavePath(user_root / "achievements" /
-                                           fmt::format("{:08X}.toml", title_id()));
+    const auto title_file = fmt::format("{:08X}.toml", title_id());
+    const uint64_t xuid = user_profile_ ? user_profile_->xuid() : 0;
+    std::filesystem::path path = user_root / "achievements" / title_file;
+    if (xuid != 0) {
+      const std::filesystem::path legacy = path;
+      path = user_root / "achievements" / fmt::format("{:016X}", xuid) / title_file;
+      std::error_code ec;
+      if (!std::filesystem::exists(path, ec) && std::filesystem::exists(legacy, ec)) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+        std::filesystem::rename(legacy, path, ec);
+        if (ec) {
+          std::filesystem::copy_file(legacy, path, ec);
+        }
+        REXSYS_INFO("Achievements: moved {} to the profile's {}", legacy.string(), path.string());
+      }
+    }
+    achievement_manager_.SetUnlockSavePath(path);
     achievement_manager_.LoadUnlockState();
+    REXSYS_INFO("Achievements: {} in the title data, {} unlocked ({})",
+                achievement_manager_.ListAchievements().size(),
+                [&] {
+                  size_t n = 0;
+                  for (const auto& a : achievement_manager_.ListAchievements()) {
+                    n += achievement_manager_.IsUnlocked(a.id) ? 1 : 0;
+                  }
+                  return n;
+                }(),
+                path.string());
   }
 }
 
