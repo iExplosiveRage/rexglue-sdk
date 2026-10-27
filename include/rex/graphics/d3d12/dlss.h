@@ -57,6 +57,15 @@ class D3D12FfxUpscaler;
 // itself, stretched. Draws that can't be mirrored (that test depth or stencil,
 // use the pixel position, write elsewhere too...) give up the output-size
 // picture for the frame.
+//
+// A frame here is the game's frame - from its first scene draw to the scene
+// draws of the next one - not the time between two swaps: with the native
+// renderer the swap of a frame is often handled after the next frame's scene
+// has already been drawn (the swap waits in the ring while the draws run at
+// the API calls). Each frame's upscaled picture is kept (two of them) until its
+// own swap, the jitter and the history go on from frame to frame, and a swap
+// without a new frame shows the last picture again where the game's frame is
+// still the same.
 class D3D12Dlss {
  public:
   explicit D3D12Dlss(D3D12CommandProcessor& command_processor);
@@ -80,11 +89,16 @@ class D3D12Dlss {
   // HUD (not jittered).
   bool scene_taken() const { return frame_scene_taken_; }
   // Added to the texture LOD bias (in 1/32) of the draws making the scene when
-  // DLSS upscales it, for the detail of the output resolution.
+  // DLSS upscales it, for the detail of the output resolution (NVIDIA's
+  // recommended log2(render / output) - 1).
   int32_t scene_lod_bias() const { return frame_scene_taken_ ? 0 : lod_bias_; }
 
-  // For every scene draw before the HUD, with its vertex shader float
-  // constants c0-c3.
+  // dlss_debug_log is counting down.
+  static bool DebugLogging();
+
+  // For every scene draw, with its vertex shader float constants c0-c3. A
+  // scene draw after the handover, once the frame's picture is complete, starts
+  // the next frame (its jitter applies to this draw already).
   void OnSceneDraw(const float* constants_c0_c3);
   // Whether the next HUD-class draw should hand the scene over.
   bool WantsScene() const;
@@ -107,14 +121,14 @@ class D3D12Dlss {
 
   // Upscaling: mirroring the draws into the scene's render target into the
   // output-size picture.
-  bool IsHudMirrorActive() const { return hud_state_ == HudState::kMirroring; }
+  bool IsHudMirrorActive() const { return picture().hud_state == HudState::kMirroring; }
   // The render target (resource) whose draws are mirrored.
-  ID3D12Resource* hud_render_target() const { return hud_render_target_; }
+  ID3D12Resource* hud_render_target() const { return picture().hud_render_target; }
   // RTV / DSV formats of the output-size targets.
-  DXGI_FORMAT hud_color_format() const { return hud_color_format_; }
-  DXGI_FORMAT hud_depth_format() const { return hud_depth_format_; }
-  uint32_t hud_width() const { return hud_width_; }
-  uint32_t hud_height() const { return hud_height_; }
+  DXGI_FORMAT hud_color_format() const { return picture().hud_color_format; }
+  DXGI_FORMAT hud_depth_format() const { return picture().hud_depth_format; }
+  uint32_t hud_width() const { return picture().hud_width; }
+  uint32_t hud_height() const { return picture().hud_height; }
   // Binds the output-size targets (color, and depth / stencil if with_depth)
   // for a mirrored draw.
   void BindHudTargets(bool with_depth);
@@ -129,7 +143,9 @@ class D3D12Dlss {
 
   // Before presenting, in frames with upscaling configured: makes the
   // output-size picture to present (see the class comment) from the frame the
-  // game presents (its texture, view and the frame's size in it). The
+  // game presents (its texture, view and the frame's size in it) and the
+  // picture of the frame this swap is for: the oldest complete frame not
+  // presented yet, else the current one, else (no new frame) the last one. The
   // comparison leaves out edge_pixels at the top and left - where resolves at a
   // draw resolution scale fill the guest's half-pixel gap with the next
   // pixels. Returns false if it can't - the frame is presented as it is then.
@@ -145,8 +161,11 @@ class D3D12Dlss {
   // After the draw resolution scale (or the scale DLSS upscales to) changed,
   // with the GPU idle.
   void OnDrawResolutionScaleChanged();
-  // After the frame's swap, outside a submission.
-  void EndFrame();
+  // After the swap, outside a submission. Returns whether the current frame
+  // ended with it (false when the swap was of an earlier frame, or there was
+  // no new frame) - the render target cache's handover state is the current
+  // frame's then and stays.
+  bool EndFrame();
 
  private:
   struct Texture {
@@ -166,6 +185,41 @@ class D3D12Dlss {
     // A draw couldn't be mirrored.
     kInvalid,
   };
+
+  // The output-size picture of a frame and what's needed to present it.
+  struct Picture {
+    // DLSS's output, then the HUD.
+    Texture upscaled;
+    // Its depth / stencil for the mirrored draws (their pipelines have one).
+    Texture hud_depth;
+    // The render target at the freeze.
+    Texture frozen;
+    HudState hud_state = HudState::kNone;
+    // DLSS upscaled the scene.
+    bool upscaled_frame = false;
+    // When the command list runs: DLSS made its output - the work using it
+    // (copying it into the render target, presenting it) checks this then, as
+    // NGX only fails when the commands are recorded on the GPU's command list.
+    bool output_valid = false;
+    ID3D12Resource* hud_render_target = nullptr;
+    DXGI_FORMAT hud_color_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT hud_depth_format = DXGI_FORMAT_UNKNOWN;
+    uint32_t hud_width = 0;
+    uint32_t hud_height = 0;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+  };
+  static constexpr uint32_t kPictureCount = 2;
+  Picture& picture() { return pictures_[picture_]; }
+  const Picture& picture() const { return pictures_[picture_]; }
+
+  // The end of the current frame (at its swap, or at the next frame's first
+  // scene draw): the history, the jitter and the LOD bias for the next one.
+  void FinishFrame();
+  // Makes a picture the current frame's (nothing in it yet).
+  void StartPicture(uint32_t picture_index);
+  // The picture to compose at a swap (see ComposeUpscaledOutput), or -1.
+  int32_t PictureToPresent() const;
 
   // The upscaler the scene goes to: DLSS if it's on and works, else FSR.
   Backend SelectBackend() const;
@@ -193,7 +247,7 @@ class D3D12Dlss {
   // UNORDERED_ACCESS). False if it can't run.
   bool RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint32_t width, uint32_t height,
                  uint32_t output_width, uint32_t output_height, bool upscale, bool reset,
-                 ID3D12Resource* output);
+                 ID3D12Resource* output, uint32_t picture_index);
 
   uint32_t scene_valid_width_ = 0;
   uint32_t scene_valid_height_ = 0;
@@ -210,8 +264,9 @@ class D3D12Dlss {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> compare_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> present_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> present_pipeline_;
-  // One RTV and one DSV for the output-size targets, written when they're
-  // (re)created - only at a handover, when nothing recorded uses them.
+  // An RTV and a DSV for the output-size targets of each picture, written at
+  // its handover - the commands that used them before (two frames earlier)
+  // have been submitted by then.
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> hud_rtv_heap_;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> hud_dsv_heap_;
 
@@ -219,12 +274,21 @@ class D3D12Dlss {
   Texture motion_;
   // DLAA's output, or the upscaled scene back at the render resolution.
   Texture output_;
-  // Upscaling: the output-size picture (DLSS's output, then the HUD).
-  Texture upscaled_;
-  // Its depth / stencil for the mirrored draws (their pipelines have one).
-  Texture hud_depth_;
-  // The render target at the freeze, and the comparison's tile results.
-  Texture frozen_;
+  // Upscaling: the output-size pictures of the frames (see Picture).
+  Picture pictures_[kPictureCount];
+  // The current frame's picture.
+  uint32_t picture_ = 0;
+  // Complete frames whose swap hasn't been handled yet, oldest first (their
+  // pictures, -1 for frames without one).
+  std::vector<int32_t> pictures_to_present_;
+  // The picture presented last (shown again by a swap without a new frame), or
+  // -1.
+  int32_t picture_presented_ = -1;
+  // Swaps in a row without a frame of their own; from this many on, the next
+  // frame starts a new history.
+  static constexpr uint32_t kMaxSwapsWithoutFrame = 3;
+  uint32_t swaps_without_frame_ = 0;
+  // The comparison's tile results.
   Texture tiles_;
   // The picture presented.
   Texture present_;
@@ -266,25 +330,15 @@ class D3D12Dlss {
   bool frame_scene_taken_ = false;
   // DLSS (or the debug view) replaced the scene.
   bool frame_processed_ = false;
-  // DLSS upscaled the scene.
-  bool frame_upscaled_ = false;
-  // When the command list runs: DLSS made its output - the work using it
-  // (copying it into the render target, presenting it) checks this then, as
-  // NGX only fails when the commands are recorded on the GPU's command list.
-  bool dlss_output_valid_ = false;
   // Distinct c0-c3 of the scene draws and how many draws used each.
   std::vector<std::pair<std::array<float, 16>, uint32_t>> frame_cameras_;
   std::array<float, 16> frame_camera_{};
   bool frame_camera_valid_ = false;
-  HudState hud_state_ = HudState::kNone;
-  ID3D12Resource* hud_render_target_ = nullptr;
-  DXGI_FORMAT hud_color_format_ = DXGI_FORMAT_UNKNOWN;
-  DXGI_FORMAT hud_depth_format_ = DXGI_FORMAT_UNKNOWN;
-  uint32_t hud_width_ = 0;
-  uint32_t hud_height_ = 0;
-  uint32_t frame_render_width_ = 0;
-  uint32_t frame_render_height_ = 0;
   std::set<std::string> hud_invalid_logged_;
+  // dlss_debug_log counters of this frame.
+  uint32_t debug_scene_draws_ = 0;
+  uint32_t debug_late_scene_draws_ = 0;
+  uint64_t debug_frame_ = 0;
 
   // Across frames.
   Backend previous_backend_ = Backend::kNone;

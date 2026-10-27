@@ -2477,6 +2477,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   } else if (!g_frame_trace.empty()) {
     g_frame_trace.clear();
   }
+  if (D3D12Dlss::DebugLogging()) {
+    REXGPU_INFO("DLSSDBG swap of frontbuffer {:08X} {}x{} after {} draws", frontbuffer_ptr,
+                frontbuffer_width, frontbuffer_height, g_frame_trace_draws);
+  }
   g_frame_trace_fence_wait_ns = 0;
   g_frame_trace_fence_waits = 0;
   g_frame_trace_draws = 0;
@@ -2877,10 +2881,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
 
-  if (dlss_) {
-    dlss_->EndFrame();
+  // With the native renderer the swap may be of the frame before the one
+  // being drawn - the scene handover state then belongs to the current frame.
+  if (!dlss_ || dlss_->EndFrame()) {
+    render_target_cache_->EndSceneFrame();
   }
-  render_target_cache_->EndSceneFrame();
 
   // Between frames and outside the presenter's refresh, apply a draw
   // resolution scale changed in the settings.
@@ -3059,6 +3064,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         dlss_->OnSceneDraw(camera_constants);
       } else {
         dlss_take_scene = dlss_->WantsScene();
+        if (dlss_take_scene && D3D12Dlss::DebugLogging()) {
+          REXGPU_INFO(
+              "DLSSDBG handover at vs {:016X} ps {:016X} pitch {} color0 {:08X}",
+              vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+              regs.Get<reg::RB_SURFACE_INFO>().surface_pitch, regs[XE_GPU_REG_RB_COLOR_INFO]);
+        }
       }
     }
   }

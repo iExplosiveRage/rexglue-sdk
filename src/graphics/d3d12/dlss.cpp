@@ -53,11 +53,20 @@ REXCVAR_DEFINE_STRING(dlss_preset, "m", "GPU",
 REXCVAR_DEFINE_INT32(dlss_debug_view, 0, "GPU/Debug",
                      "Show DLSS's inputs instead of its output: 0 = off, 1 = motion vectors, "
                      "2 = depth; 3 = with upscaling, tint red what's presented from the game's "
-                     "own (not upscaled) frame")
-    .range(0, 3);
+                     "own (not upscaled) frame; 4 = the scene as DLSS gets it (jittered), not "
+                     "processed")
+    .range(0, 4);
 
 REXCVAR_DEFINE_BOOL(dlss_jitter, true, "GPU/Debug",
                     "Jitter the scene for DLSS (off = no temporal anti-aliasing, to compare)");
+
+REXCVAR_DEFINE_INT32(dlss_debug_log, 0, "GPU/Debug",
+                     "Log what the scene upscaler does (scene handovers, jitter, LOD bias, "
+                     "the presented picture) for this many presented frames (counts down)");
+
+REXCVAR_DEFINE_INT32(dlss_debug_jitter_phase, -1, "GPU/Debug",
+                     "Jitter the scene by this phase of the sequence every frame, -1 = off (with "
+                     "dlss_debug_view 4, to measure the jitter in the picture)");
 
 REXCVAR_DEFINE_INT32(dlss_jitter_sign, 0, "GPU/Debug",
                      "Negate the jitter given to DLSS: bit 0 = X, bit 1 = Y (to check its "
@@ -389,7 +398,7 @@ bool D3D12Dlss::Initialize() {
   }
   D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-  heap_desc.NumDescriptors = 1;
+  heap_desc.NumDescriptors = kPictureCount;
   heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
   if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&hud_rtv_heap_)))) {
     REXGPU_ERROR("DLSS: failed to create the RTV heap");
@@ -460,9 +469,12 @@ void D3D12Dlss::Shutdown() {
   depth_ = {};
   motion_ = {};
   output_ = {};
-  upscaled_ = {};
-  hud_depth_ = {};
-  frozen_ = {};
+  for (Picture& picture : pictures_) {
+    picture = {};
+  }
+  picture_ = 0;
+  pictures_to_present_.clear();
+  picture_presented_ = -1;
   tiles_ = {};
   present_ = {};
   hud_dsv_heap_.Reset();
@@ -644,15 +656,16 @@ bool D3D12Dlss::EnsureTexture(Texture& texture, DXGI_FORMAT format, uint32_t wid
 
 bool D3D12Dlss::EnsureHudDepth(DXGI_FORMAT resource_format, uint32_t width, uint32_t height) {
   const DXGI_FORMAT dsv_format = GetDsvFormat(resource_format);
+  Texture& hud_depth = picture().hud_depth;
   if (dsv_format == DXGI_FORMAT_UNKNOWN) {
     return false;
   }
-  if (hud_depth_.resource) {
-    D3D12_RESOURCE_DESC desc = hud_depth_.resource->GetDesc();
+  if (hud_depth.resource) {
+    D3D12_RESOURCE_DESC desc = hud_depth.resource->GetDesc();
     if (desc.Format == resource_format && desc.Width == width && desc.Height == height) {
       return true;
     }
-    ReleaseLater(hud_depth_);
+    ReleaseLater(hud_depth);
   }
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   D3D12_RESOURCE_DESC desc = {};
@@ -667,12 +680,12 @@ bool D3D12Dlss::EnsureHudDepth(DXGI_FORMAT resource_format, uint32_t width, uint
   desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   D3D12_CLEAR_VALUE clear_value = {};
   clear_value.Format = dsv_format;
-  hud_depth_.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+  hud_depth.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   if (FAILED(provider.GetDevice()->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
-          hud_depth_.state, &clear_value, IID_PPV_ARGS(&hud_depth_.resource)))) {
+          hud_depth.state, &clear_value, IID_PPV_ARGS(&hud_depth.resource)))) {
     REXGPU_ERROR("DLSS: failed to create the HUD depth texture ({}x{})", width, height);
-    hud_depth_ = {};
+    hud_depth = {};
     return false;
   }
   return true;
@@ -781,10 +794,60 @@ void D3D12Dlss::DisableFsr() {
   D3D12CommandProcessor::RequestDrawResolutionScaleFromSettings();
 }
 
+bool D3D12Dlss::DebugLogging() {
+  return REXCVAR_GET(dlss_debug_log) > 0;
+}
+
 void D3D12Dlss::OnSceneDraw(const float* constants_c0_c3) {
-  if (frame_scene_taken_ || !IsEnabled()) {
+  if (!IsEnabled()) {
     return;
   }
+  if (frame_scene_taken_) {
+    // While the HUD is still mirrored, a depth-tested draw of the same frame
+    // (it can't be mirrored).
+    if (picture().hud_state == HudState::kMirroring) {
+      if (DebugLogging() && !debug_late_scene_draws_++) {
+        REXGPU_INFO("DLSSDBG f{} scene draw while mirroring the HUD", debug_frame_);
+      }
+      return;
+    }
+    // The game's next frame, drawn before the swap of this one was handled
+    // (the native renderer runs the draws at the API calls, the swap when the
+    // ring is read): this frame ends here, its picture waits for its swap.
+    if (DebugLogging()) {
+      REXGPU_INFO(
+          "DLSSDBG f{} ends at the next frame's first scene draw (picture {}, hud state "
+          "{})",
+          debug_frame_, picture_, int(picture().hud_state));
+    }
+    const int32_t finished_picture = picture().upscaled_frame ? int32_t(picture_) : -1;
+    FinishFrame();
+    // At most one frame waits for its swap besides this one (the oldest
+    // would never get its picture otherwise).
+    if (pictures_to_present_.size() >= kPictureCount) {
+      pictures_to_present_.erase(pictures_to_present_.begin());
+    }
+    pictures_to_present_.push_back(finished_picture);
+    // The next frame's picture: one no swap waits for.
+    uint32_t next_picture = (picture_ + 1) % kPictureCount;
+    for (uint32_t i = 0; i < kPictureCount; ++i) {
+      const uint32_t candidate = (picture_ + 1 + i) % kPictureCount;
+      if (std::find(pictures_to_present_.begin(), pictures_to_present_.end(), int32_t(candidate)) ==
+          pictures_to_present_.end()) {
+        next_picture = candidate;
+        break;
+      }
+    }
+    // Every picture waits: the oldest frame's swap shows the newer picture
+    // where it's the same (the comparison).
+    for (int32_t& waiting : pictures_to_present_) {
+      if (waiting == int32_t(next_picture)) {
+        waiting = -1;
+      }
+    }
+    StartPicture(next_picture);
+  }
+  ++debug_scene_draws_;
   frame_scene_drawn_ = true;
   for (auto& camera : frame_cameras_) {
     if (!std::memcmp(camera.first.data(), constants_c0_c3, sizeof(float) * 16)) {
@@ -864,6 +927,11 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   // Performance), FSR at up to 3x; with the output's aspect ratio. The debug
   // views show the inputs at the render resolution.
   int32_t debug_view = REXCVAR_GET(dlss_debug_view);
+  if (debug_view == 4) {
+    // The input as it is (jittered), not processed - the jitter goes on.
+    frame_processed_ = true;
+    return color_state;
+  }
   bool upscale =
       (output_width != width || output_height != height) &&
       !(backend == Backend::kDlss ? upscaling_failed_ : fsr_upscaling_failed_) &&
@@ -958,10 +1026,12 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
       !EnsureTexture(output_, output_format, width, height, "output")) {
     return color_state;
   }
+  const uint32_t picture_index = picture_;
+  Picture& pic = picture();
   if (upscale &&
-      (!EnsureTexture(upscaled_, output_format, output_width, output_height, "upscaled",
-                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
-                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+      (!EnsureTexture(
+           pic.upscaled, output_format, output_width, output_height, "upscaled",
+           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
        !EnsureHudDepth(depth->GetDesc().Format, output_width, output_height))) {
     return color_state;
   }
@@ -1033,6 +1103,15 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     reset = true;
   }
 
+  if (DebugLogging()) {
+    REXGPU_INFO(
+        "DLSSDBG f{} scene {}x{} -> {}x{} (valid {}x{}) {} {}: {} scene draws, jitter "
+        "{:.4f} {:.4f}, lod bias {}/32, camera {}, motion {}, reset {}",
+        debug_frame_, width, height, output_width, output_height, valid_width, valid_height,
+        backend_name, upscale ? "upscaling" : "same size", debug_scene_draws_, jitter_[0],
+        jitter_[1], lod_bias_, camera != nullptr, inputs_constants.has_motion, reset);
+  }
+
   D3D12CommandProcessor& command_processor = command_processor_;
   ID3D12Device* device = command_processor.GetD3D12Provider().GetDevice();
   DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
@@ -1062,7 +1141,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
   command_list.D3DSetComputeRootDescriptorTable(2, inputs_descriptors[1].second);
   command_list.D3DSetComputeRootDescriptorTable(3, inputs_descriptors[2].second);
   command_list.D3DDispatch(group_count_x, group_count_y, 1);
-  Texture& dlss_output = upscale ? upscaled_ : output_;
+  Texture& dlss_output = upscale ? pic.upscaled : output_;
   Transition(depth_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(motion_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(dlss_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1093,8 +1172,8 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     command_list.D3DSetComputeRootDescriptorTable(3, debug_descriptors[2].second);
     command_list.D3DDispatch(group_count_x, group_count_y, 1);
   } else if (backend == Backend::kFsr) {
-    if (!RecordFsr(color, color_desc.Format, valid_width, valid_height, output_width, output_height, upscale,
-                   reset, dlss_output.resource.Get())) {
+    if (!RecordFsr(color, color_desc.Format, valid_width, valid_height, output_width, output_height,
+                   upscale, reset, dlss_output.resource.Get(), picture_index)) {
       return color_state;
     }
   } else {
@@ -1142,8 +1221,10 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     command_list.ExternalCallback([this, create, upscale, preset, quality, color, depth_resource,
                                    motion_resource, output_resource, width, height, valid_width,
                                    valid_height, output_width, output_height, jitter_x, jitter_y,
-                                   reset](ID3D12GraphicsCommandList* d3d_command_list) {
-      dlss_output_valid_ = false;
+                                   reset,
+                                   picture_index](ID3D12GraphicsCommandList* d3d_command_list) {
+      bool& output_valid = pictures_[picture_index].output_valid;
+      output_valid = false;
       if (create) {
         // The preset of every mode, as which one NGX reads isn't documented.
         for (const char* preset_parameter : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
@@ -1213,7 +1294,7 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
         }
         return;
       }
-      dlss_output_valid_ = true;
+      output_valid = true;
     });
     command_processor.InvalidateStateAfterExternalCommands();
 #endif
@@ -1227,11 +1308,11 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     if (!command_processor.RequestOneUseSingleViewDescriptors(2, downsample_descriptors)) {
       return color_state;
     }
-    CreateTexture2DSrv(device, upscaled_.resource.Get(), output_format,
+    CreateTexture2DSrv(device, pic.upscaled.resource.Get(), output_format,
                        downsample_descriptors[0].first);
     CreateTexture2DUav(device, output_.resource.Get(), output_format,
                        downsample_descriptors[1].first);
-    Transition(upscaled_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(pic.upscaled, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(output_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     command_processor.SubmitBarriers();
     DownsampleConstants downsample_constants = {};
@@ -1269,12 +1350,12 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
   } else {
     // Only if DLSS made its output (a failure leaves the game's own scene).
-    command_list.ExternalCallback(
-        [this, copy_dest, copy_source, copy_box](ID3D12GraphicsCommandList* d3d_command_list) {
-          if (dlss_output_valid_) {
-            d3d_command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
-          }
-        });
+    command_list.ExternalCallback([this, copy_dest, copy_source, copy_box,
+                                   picture_index](ID3D12GraphicsCommandList* d3d_command_list) {
+      if (pictures_[picture_index].output_valid) {
+        d3d_command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, &copy_box);
+      }
+    });
   }
 
   if (upscale) {
@@ -1282,27 +1363,30 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
     D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
     rtv_desc.Format = output_format;
     rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    device->CreateRenderTargetView(upscaled_.resource.Get(), &rtv_desc,
-                                   hud_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+    const ui::d3d12::D3D12Provider& provider = command_processor.GetD3D12Provider();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = hud_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += picture_index * provider.GetRTVDescriptorSize();
+    device->CreateRenderTargetView(pic.upscaled.resource.Get(), &rtv_desc, rtv);
     D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
     dsv_desc.Format = depth_dsv_format;
     dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = hud_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    device->CreateDepthStencilView(hud_depth_.resource.Get(), &dsv_desc, dsv);
-    Transition(upscaled_, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Transition(hud_depth_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    dsv.ptr += picture_index * provider.GetDSVDescriptorSize();
+    device->CreateDepthStencilView(pic.hud_depth.resource.Get(), &dsv_desc, dsv);
+    Transition(pic.upscaled, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(pic.hud_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     command_processor.SubmitBarriers();
     command_list.D3DClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                                           0.0f, 0, 0, nullptr);
-    hud_state_ = HudState::kMirroring;
-    hud_render_target_ = color;
-    hud_color_format_ = output_format;
-    hud_depth_format_ = depth_dsv_format;
-    hud_width_ = output_width;
-    hud_height_ = output_height;
-    frame_render_width_ = width;
-    frame_render_height_ = height;
-    frame_upscaled_ = true;
+    pic.hud_state = HudState::kMirroring;
+    pic.hud_render_target = color;
+    pic.hud_color_format = output_format;
+    pic.hud_depth_format = depth_dsv_format;
+    pic.hud_width = output_width;
+    pic.hud_height = output_height;
+    pic.render_width = width;
+    pic.render_height = height;
+    pic.upscaled_frame = true;
   }
 
   frame_processed_ = true;
@@ -1316,7 +1400,8 @@ D3D12_RESOURCE_STATES D3D12Dlss::ProcessScene(ID3D12Resource* color, ID3D12Resou
 
 bool D3D12Dlss::RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint32_t width,
                           uint32_t height, uint32_t output_width, uint32_t output_height,
-                          bool upscale, bool reset, ID3D12Resource* output) {
+                          bool upscale, bool reset, ID3D12Resource* output,
+                          uint32_t picture_index) {
 #if defined(REX_HAS_FSR_SDK)
   D3D12CommandProcessor& command_processor = command_processor_;
   DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
@@ -1439,17 +1524,18 @@ bool D3D12Dlss::RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint3
   // The context as it is now (a new one may replace it before this runs).
   void* context = ffx_->context();
   const D3D12FfxUpscaler* ffx = ffx_.get();
-  command_list.ExternalCallback(
-      [this, ffx, context, params, upscale](ID3D12GraphicsCommandList* d3d_command_list) {
-        dlss_output_valid_ = ffx->Dispatch(context, d3d_command_list, params);
-        if (!dlss_output_valid_) {
-          if (upscale) {
-            DisableUpscaling(Backend::kFsr, "the dispatch failed");
-          } else {
-            DisableFsr();
-          }
-        }
-      });
+  command_list.ExternalCallback([this, ffx, context, params, upscale,
+                                 picture_index](ID3D12GraphicsCommandList* d3d_command_list) {
+    bool& output_valid = pictures_[picture_index].output_valid;
+    output_valid = ffx->Dispatch(context, d3d_command_list, params);
+    if (!output_valid) {
+      if (upscale) {
+        DisableUpscaling(Backend::kFsr, "the dispatch failed");
+      } else {
+        DisableFsr();
+      }
+    }
+  });
   // FidelityFX bound its own descriptor heap, and the pipeline is gone.
   command_processor.InvalidateStateAfterExternalCommands();
   return true;
@@ -1459,21 +1545,29 @@ bool D3D12Dlss::RecordFsr(ID3D12Resource* color, DXGI_FORMAT color_format, uint3
 }
 
 void D3D12Dlss::BindHudTargets(bool with_depth) {
-  Transition(upscaled_, D3D12_RESOURCE_STATE_RENDER_TARGET);
-  Transition(hud_depth_, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  Picture& pic = picture();
+  Transition(pic.upscaled, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  Transition(pic.hud_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
   command_processor_.SubmitBarriers();
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   D3D12_CPU_DESCRIPTOR_HANDLE rtv = hud_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  rtv.ptr += picture_ * provider.GetRTVDescriptorSize();
   D3D12_CPU_DESCRIPTOR_HANDLE dsv = hud_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  dsv.ptr += picture_ * provider.GetDSVDescriptorSize();
   command_processor_.GetDeferredCommandList().D3DOMSetRenderTargets(1, &rtv, FALSE,
                                                                     with_depth ? &dsv : nullptr);
 }
 
 void D3D12Dlss::InvalidateHud(const char* reason, uint64_t vertex_shader_hash,
                               uint64_t pixel_shader_hash) {
-  if (hud_state_ != HudState::kMirroring) {
+  if (picture().hud_state != HudState::kMirroring) {
     return;
   }
-  hud_state_ = HudState::kInvalid;
+  picture().hud_state = HudState::kInvalid;
+  if (DebugLogging()) {
+    REXGPU_INFO("DLSSDBG f{} HUD invalid: {} (vs {:016X}, ps {:016X})", debug_frame_, reason,
+                vertex_shader_hash, pixel_shader_hash);
+  }
   if (hud_invalid_logged_.size() < 64) {
     std::string key =
         fmt::format("{} (vs {:016X}, ps {:016X})", reason, vertex_shader_hash, pixel_shader_hash);
@@ -1485,32 +1579,50 @@ void D3D12Dlss::InvalidateHud(const char* reason, uint64_t vertex_shader_hash,
 
 D3D12_RESOURCE_STATES D3D12Dlss::FreezeHud(ID3D12Resource* color) {
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  if (hud_state_ != HudState::kMirroring) {
+  Picture& pic = picture();
+  if (DebugLogging()) {
+    REXGPU_INFO("DLSSDBG f{} first copy of the scene render target (picture {}, hud state {})",
+                debug_frame_, picture_, int(pic.hud_state));
+  }
+  if (pic.hud_state != HudState::kMirroring) {
     return color_state;
   }
-  if (!EnsureTexture(frozen_, hud_color_format_, frame_render_width_, frame_render_height_,
+  if (!EnsureTexture(pic.frozen, pic.hud_color_format, pic.render_width, pic.render_height,
                      "frozen frame", D3D12_RESOURCE_FLAG_NONE)) {
-    hud_state_ = HudState::kInvalid;
+    pic.hud_state = HudState::kInvalid;
     return color_state;
   }
-  hud_state_ = HudState::kFrozen;
-  Transition(frozen_, D3D12_RESOURCE_STATE_COPY_DEST);
+  pic.hud_state = HudState::kFrozen;
+  Transition(pic.frozen, D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.PushTransitionBarrier(color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
   color_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
   command_processor_.SubmitBarriers();
   D3D12_TEXTURE_COPY_LOCATION copy_dest;
-  copy_dest.pResource = frozen_.resource.Get();
+  copy_dest.pResource = pic.frozen.resource.Get();
   copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   copy_dest.SubresourceIndex = 0;
   D3D12_TEXTURE_COPY_LOCATION copy_source;
   copy_source.pResource = color;
   copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   copy_source.SubresourceIndex = 0;
-  D3D12_BOX copy_box = {0, 0, 0, frame_render_width_, frame_render_height_, 1};
+  D3D12_BOX copy_box = {0, 0, 0, pic.render_width, pic.render_height, 1};
   command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&copy_dest, 0, 0, 0,
                                                                    &copy_source, &copy_box);
-  Transition(frozen_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(pic.frozen, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   return color_state;
+}
+
+int32_t D3D12Dlss::PictureToPresent() const {
+  // A complete frame waiting for its swap (its next frame already drawn).
+  if (!pictures_to_present_.empty()) {
+    return pictures_to_present_.front();
+  }
+  // The current frame's swap.
+  if (frame_scene_drawn_ || frame_scene_taken_) {
+    return int32_t(picture_);
+  }
+  // No new frame: the game presents again what it presented last.
+  return picture_presented_;
 }
 
 bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
@@ -1529,15 +1641,27 @@ bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
   }
   // The upscaled picture is only usable once the copy of the render target
   // ended it, at the size presented now.
-  bool use_upscaled = hud_state_ == HudState::kFrozen && frame_upscaled_ &&
-                      hud_width_ == output_width &&
-                      hud_height_ == output_height && frame_render_width_ == frame_width &&
-                      frame_render_height_ == frame_height;
+  const int32_t picture_index = PictureToPresent();
+  Picture* pic = picture_index >= 0 ? &pictures_[picture_index] : nullptr;
+  bool use_upscaled = pic && pic->hud_state == HudState::kFrozen && pic->upscaled_frame &&
+                      pic->hud_width == output_width && pic->hud_height == output_height &&
+                      pic->render_width == frame_width && pic->render_height == frame_height;
   const uint32_t tiles_width = (frame_width + 7) / 8;
   const uint32_t tiles_height = (frame_height + 7) / 8;
   if (use_upscaled && !EnsureTexture(tiles_, DXGI_FORMAT_R32_UINT, tiles_width, tiles_height,
                                      "comparison")) {
     use_upscaled = false;
+  }
+  if (DebugLogging()) {
+    REXGPU_INFO(
+        "DLSSDBG f{} present {}x{} -> {}x{}: {} (picture {} of {}, {} waiting, hud state "
+        "{})",
+        debug_frame_, frame_width, frame_height, output_width, output_height,
+        use_upscaled ? "DLSS picture" : "frame stretched", picture_index,
+        !pictures_to_present_.empty()                ? "an earlier frame"
+        : (frame_scene_drawn_ || frame_scene_taken_) ? "this frame"
+                                                     : "the last frame",
+        pictures_to_present_.size(), pic ? int(pic->hud_state) : -1);
   }
 
   D3D12CommandProcessor& command_processor = command_processor_;
@@ -1552,9 +1676,10 @@ bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
   if (use_upscaled) {
     // Which tiles of the frame are the render target at the freeze.
     device->CreateShaderResourceView(frame, &frame_srv, descriptors[0].first);
-    CreateTexture2DSrv(device, frozen_.resource.Get(), hud_color_format_, descriptors[1].first);
+    CreateTexture2DSrv(device, pic->frozen.resource.Get(), pic->hud_color_format,
+                       descriptors[1].first);
     CreateTexture2DUav(device, tiles_.resource.Get(), DXGI_FORMAT_R32_UINT, descriptors[2].first);
-    Transition(frozen_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(pic->frozen, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(tiles_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     command_processor.SubmitBarriers();
     CompareConstants compare_constants = {};
@@ -1572,12 +1697,12 @@ bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
     command_list.D3DSetComputeRootDescriptorTable(3, descriptors[2].second);
     command_list.D3DDispatch(tiles_width, tiles_height, 1);
     Transition(tiles_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Transition(upscaled_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Transition(pic->upscaled, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   }
 
   // The picture presented.
-  CreateTexture2DSrv(device, use_upscaled ? upscaled_.resource.Get() : nullptr,
-                     use_upscaled ? hud_color_format_ : DXGI_FORMAT_R8G8B8A8_UNORM,
+  CreateTexture2DSrv(device, use_upscaled ? pic->upscaled.resource.Get() : nullptr,
+                     use_upscaled ? pic->hud_color_format : DXGI_FORMAT_R8G8B8A8_UNORM,
                      descriptors[3].first);
   device->CreateShaderResourceView(frame, &frame_srv, descriptors[4].first);
   CreateTexture2DSrv(device, use_upscaled ? tiles_.resource.Get() : nullptr, DXGI_FORMAT_R32_UINT,
@@ -1596,15 +1721,15 @@ bool D3D12Dlss::ComposeUpscaledOutput(ID3D12Resource* frame,
   present_constants.frame_texture_size_inv[1] = 1.0f / float(frame_desc.Height);
   present_constants.mode = use_upscaled ? (REXCVAR_GET(dlss_debug_view) == 3 ? 2 : 1) : 0;
   command_list.D3DSetComputeRootSignature(present_root_signature_.Get());
-  // Only the frame itself if DLSS didn't make its output in this frame.
-  command_list.ExternalCallback(
-      [this, present_constants](ID3D12GraphicsCommandList* d3d_command_list) mutable {
-        if (!dlss_output_valid_) {
-          present_constants.mode = 0;
-        }
-        d3d_command_list->SetComputeRoot32BitConstants(
-            0, sizeof(present_constants) / sizeof(uint32_t), &present_constants, 0);
-      });
+  // Only the frame itself if DLSS didn't make the picture's output.
+  command_list.ExternalCallback([this, present_constants, picture_index](
+                                    ID3D12GraphicsCommandList* d3d_command_list) mutable {
+    if (picture_index < 0 || !pictures_[picture_index].output_valid) {
+      present_constants.mode = 0;
+    }
+    d3d_command_list->SetComputeRoot32BitConstants(0, sizeof(present_constants) / sizeof(uint32_t),
+                                                   &present_constants, 0);
+  });
   // Work after external commands needs its pipeline set again.
   command_processor.InvalidateStateAfterExternalCommands();
   command_processor.SetExternalPipeline(present_pipeline_.Get());
@@ -1633,14 +1758,87 @@ void D3D12Dlss::OnDrawResolutionScaleChanged() {
   jitter_[1] = 0.0f;
   jitter_index_ = 0;
   lod_bias_ = 0;
-  ReleaseLater(upscaled_);
-  ReleaseLater(hud_depth_);
-  ReleaseLater(frozen_);
+  for (Picture& pic : pictures_) {
+    ReleaseLater(pic.upscaled);
+    ReleaseLater(pic.hud_depth);
+    ReleaseLater(pic.frozen);
+    pic.hud_state = HudState::kNone;
+    pic.upscaled_frame = false;
+    pic.hud_render_target = nullptr;
+  }
+  pictures_to_present_.clear();
+  picture_presented_ = -1;
   ReleaseLater(tiles_);
   ReleaseLater(present_);
 }
 
-void D3D12Dlss::EndFrame() {
+void D3D12Dlss::StartPicture(uint32_t picture_index) {
+  picture_ = picture_index;
+  Picture& pic = picture();
+  pic.hud_state = HudState::kNone;
+  pic.upscaled_frame = false;
+  pic.hud_render_target = nullptr;
+}
+
+void D3D12Dlss::FinishFrame() {
+  previous_processed_ = frame_processed_;
+  previous_camera_ = frame_camera_;
+  previous_camera_valid_ = frame_processed_ && frame_camera_valid_;
+
+  // Only jitter the next frame if DLSS ran in this one - in frames it doesn't
+  // see (menus without a 3D scene) the jitter would just make the picture
+  // wobble. Upscaling wants more phases: 8 * (output / render)^2.
+  const bool enabled = IsEnabled();
+  const Picture& pic = picture();
+  if (frame_processed_ && enabled && REXCVAR_GET(dlss_jitter)) {
+    uint32_t phases = kMinJitterPhases;
+    if (pic.upscaled_frame && pic.render_width) {
+      float ratio = float(pic.hud_width) / float(pic.render_width);
+      phases = std::max(phases, uint32_t(std::ceil(8.0f * ratio * ratio)));
+    }
+    if (phases != jitter_phases_) {
+      jitter_phases_ = phases;
+      jitter_index_ = 0;
+    }
+    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
+    if (REXCVAR_GET(dlss_debug_jitter_phase) >= 0) {
+      jitter_index_ = uint32_t(REXCVAR_GET(dlss_debug_jitter_phase)) % jitter_phases_;
+    }
+    jitter_[0] = Halton(jitter_index_ + 1, 2) - 0.5f;
+    jitter_[1] = Halton(jitter_index_ + 1, 3) - 0.5f;
+  } else {
+    jitter_[0] = 0.0f;
+    jitter_[1] = 0.0f;
+  }
+  // Upscaling: the textures sampled for the output resolution - the mip bias
+  // NVIDIA and AMD recommend, log2(render / output) - 1 (DLSS programming
+  // guide 3.5; texture_lod_bias adds to it). Without the -1, at 4K Quality the
+  // stage's rock and grass textures stayed visibly softer than with DLAA.
+  lod_bias_ = 0;
+  if (pic.upscaled_frame && enabled && pic.render_width && pic.hud_width) {
+    lod_bias_ = int32_t(
+        std::lround((std::log2(double(pic.render_width) / double(pic.hud_width)) - 1.0) * 32.0));
+  }
+
+  if (DebugLogging()) {
+    REXGPU_INFO(
+        "DLSSDBG f{} end: scene draws {} (+{} late), taken {}, processed {}, picture {} "
+        "hud state {}; next jitter {:.4f} {:.4f} ({} phases), lod bias {}/32",
+        debug_frame_, debug_scene_draws_, debug_late_scene_draws_, frame_scene_taken_,
+        frame_processed_, picture_, int(pic.hud_state), jitter_[0], jitter_[1], jitter_phases_,
+        lod_bias_);
+  }
+  ++debug_frame_;
+  debug_scene_draws_ = 0;
+  debug_late_scene_draws_ = 0;
+  frame_scene_drawn_ = false;
+  frame_scene_taken_ = false;
+  frame_processed_ = false;
+  frame_cameras_.clear();
+  frame_camera_valid_ = false;
+}
+
+bool D3D12Dlss::EndFrame() {
   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
   std::erase_if(resources_to_release_, [completed_submission](const auto& resource) {
     return resource.first <= completed_submission;
@@ -1681,47 +1879,45 @@ void D3D12Dlss::EndFrame() {
     previous_backend_ = backend;
   }
 
-  previous_processed_ = frame_processed_;
-  previous_camera_ = frame_camera_;
-  previous_camera_valid_ = frame_processed_ && frame_camera_valid_;
-
-  // Only jitter the next frame if DLSS ran in this one - in frames it doesn't
-  // see (menus without a 3D scene) the jitter would just make the picture
-  // wobble. Upscaling wants more phases: 8 * (output / render)^2.
-  const bool enabled = IsEnabled();
-  if (frame_processed_ && enabled && REXCVAR_GET(dlss_jitter)) {
-    uint32_t phases = kMinJitterPhases;
-    if (frame_upscaled_ && frame_render_width_) {
-      float ratio = float(hud_width_) / float(frame_render_width_);
-      phases = std::max(phases, uint32_t(std::ceil(8.0f * ratio * ratio)));
+  const bool debug_logging = DebugLogging();
+  bool frame_ended = true;
+  if (!pictures_to_present_.empty() || frame_scene_drawn_ || frame_scene_taken_) {
+    swaps_without_frame_ = 0;
+  }
+  if (!pictures_to_present_.empty()) {
+    // The swap of a frame that ended at the next frame's first scene draw - the
+    // current frame goes on.
+    picture_presented_ = pictures_to_present_.front();
+    pictures_to_present_.erase(pictures_to_present_.begin());
+    frame_ended = false;
+    if (debug_logging) {
+      REXGPU_INFO("DLSSDBG f{} swap of an earlier frame (picture {})", debug_frame_,
+                  picture_presented_);
     }
-    if (phases != jitter_phases_) {
-      jitter_phases_ = phases;
-      jitter_index_ = 0;
-    }
-    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
-    jitter_[0] = Halton(jitter_index_ + 1, 2) - 0.5f;
-    jitter_[1] = Halton(jitter_index_ + 1, 3) - 0.5f;
+  } else if (frame_scene_drawn_ || frame_scene_taken_) {
+    // The current frame's swap. Its picture stays until the next frame's own is
+    // complete (a swap without a new frame shows it again).
+    const bool upscaled = picture().upscaled_frame;
+    picture_presented_ = upscaled ? int32_t(picture_) : -1;
+    FinishFrame();
+    StartPicture(upscaled ? (picture_ + 1) % kPictureCount : picture_);
   } else {
-    jitter_[0] = 0.0f;
-    jitter_[1] = 0.0f;
+    // No scene drawn since the last swap: the history and the jitter go on -
+    // for a few swaps (a game presenting a frame twice), not across a menu or
+    // a loading screen.
+    if (++swaps_without_frame_ >= kMaxSwapsWithoutFrame) {
+      previous_processed_ = false;
+      previous_camera_valid_ = false;
+    }
+    if (debug_logging) {
+      REXGPU_INFO("DLSSDBG f{} swap without a new frame (picture {} shown again)", debug_frame_,
+                  picture_presented_);
+    }
   }
-  // Upscaling: textures sharper by the render to output ratio (NVIDIA's mip
-  // bias, the rest of it being texture_lod_bias).
-  lod_bias_ = 0;
-  if (frame_upscaled_ && enabled && frame_render_width_ && hud_width_) {
-    lod_bias_ = int32_t(
-        std::lround(std::log2(double(frame_render_width_) / double(hud_width_)) * 32.0));
+  if (debug_logging) {
+    REXCVAR_SET(dlss_debug_log, REXCVAR_GET(dlss_debug_log) - 1);
   }
-
-  frame_scene_drawn_ = false;
-  frame_scene_taken_ = false;
-  frame_processed_ = false;
-  frame_upscaled_ = false;
-  frame_cameras_.clear();
-  frame_camera_valid_ = false;
-  hud_state_ = HudState::kNone;
-  hud_render_target_ = nullptr;
+  return frame_ended;
 }
 
 }  // namespace rex::graphics::d3d12
